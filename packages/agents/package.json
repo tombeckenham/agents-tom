@@ -166,6 +166,16 @@
       "import": "./dist/chat/index.js",
       "require": "./dist/chat/index.js"
     },
+    "./chat/agui-types": {
+      "types": "./dist/chat/agui-types.d.ts",
+      "import": "./dist/chat/agui-types.js",
+      "require": "./dist/chat/agui-types.js"
+    },
+    "./agui-chat-agent": {
+      "types": "./dist/agui-chat-agent.d.ts",
+      "import": "./dist/agui-chat-agent.js",
+      "require": "./dist/agui-chat-agent.js"
+    },
     "./ai-chat-agent": {
       "types": "./dist/ai-chat-agent.d.ts",
       "import": "./dist/ai-chat-agent.js",
