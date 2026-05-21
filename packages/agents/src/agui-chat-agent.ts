@@ -1,0 +1,2390 @@
+/**
+ * AGUIChatAgent — canonical chat agent for the Cloudflare Agents SDK.
+ *
+ * Behavior-identical port of `AIChatAgent` (packages/ai-chat/src/index.ts) on
+ * the AG-UI canonical shape. Persistence rows are `AGUIMessage[]` with a
+ * `_v` schema marker; CF_AGENT_USE_CHAT_RESPONSE bodies carry AG-UI SSE
+ * (`data: {...AGUIEvent JSON}\n\n`); the `onChatMessage` hook returns a
+ * `Response` whose body is AG-UI SSE.
+ *
+ * The class extends `Agent` directly and has zero dependency on the `ai`
+ * package. Format-agnostic primitives (`TurnQueue`, `AbortRegistry`,
+ * `ContinuationState`, `ResumableStream`, `SubmitConcurrencyController`,
+ * lifecycle types) are reused verbatim from `agents/chat`. AG-UI
+ * primitives (`agui-message-builder`, `agui-sanitize`, `agui-migration`,
+ * `agui-stream-accumulator`, `agui-agent-tools`) handle every shape-aware
+ * concern.
+ */
+
+import { nanoid } from "nanoid";
+import {
+  Agent,
+  __DO_NOT_USE_WILL_BREAK__agentContext as agentContext,
+  type AgentContext,
+  type AgentToolStoredChunk,
+  type Connection,
+  type ConnectionContext,
+  type WSMessage
+} from "./index";
+import { AbortRegistry } from "./chat/abort-registry";
+import {
+  type AGUIAgentToolEvent,
+  applyAGUIAgentToolEvent,
+  createAGUIAgentToolEventState
+} from "./chat/agui-agent-tools";
+import {
+  applyEventToSnapshot,
+  createInitialSnapshot,
+  type SnapshotState
+} from "./chat/agui-message-builder";
+import {
+  autoTransformAGUIMessages,
+  isPersistedAGUIMessage
+} from "./chat/agui-migration";
+import { reconcileMessages } from "./chat/agui-message-reconciler";
+import {
+  byteLength as aguiByteLength,
+  enforceRowSizeLimit,
+  isEmptyReasoningMessage,
+  ROW_MAX_BYTES,
+  sanitizeAGUIMessage
+} from "./chat/agui-sanitize";
+import {
+  type AGUIChunkAction,
+  AGUIStreamAccumulator
+} from "./chat/agui-stream-accumulator";
+import {
+  type AGUIEvent,
+  type AGUIMessage,
+  type AssistantMessage,
+  CF_TOOL_APPROVAL_DECISION,
+  type CFToolApprovalDecisionValue,
+  PERSISTED_MESSAGE_SCHEMA_VERSION,
+  type ToolMessage,
+  type UserMessage
+} from "./chat/agui-types";
+import type { ClientToolSchema } from "./chat/client-tools";
+import {
+  ContinuationState,
+  type ContinuationConnection
+} from "./chat/continuation-state";
+import type {
+  MessageConcurrency,
+  SaveMessagesOptions,
+  SaveMessagesResult
+} from "./chat/lifecycle";
+import { CHAT_MESSAGE_TYPES } from "./chat/protocol";
+import { ResumableStream } from "./chat/resumable-stream";
+import {
+  type SubmitConcurrencyDecision,
+  SubmitConcurrencyController
+} from "./chat/submit-concurrency";
+import { TurnQueue, type TurnResult } from "./chat/turn-queue";
+
+// ----------------------------------------------------------------------------
+// Wire envelope (AG-UI-shape body, same MessageType discriminators)
+// ----------------------------------------------------------------------------
+
+/**
+ * Outgoing wire envelope structurally identical to the legacy `OutgoingMessage`
+ * union except that `CF_AGENT_CHAT_MESSAGES` carries `AGUIMessage[]` and
+ * `CF_AGENT_MESSAGE_UPDATED` carries an `AGUIMessage`. The
+ * `CF_AGENT_USE_CHAT_RESPONSE` body is the AG-UI SSE `data: …` line.
+ */
+type OutgoingAGUIMessage =
+  | { type: typeof CHAT_MESSAGE_TYPES.CHAT_CLEAR }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.CHAT_MESSAGES;
+      messages: readonly AGUIMessage[];
+    }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE;
+      id: string;
+      body: string;
+      done: boolean;
+      error?: boolean;
+      continuation?: boolean;
+      replay?: boolean;
+      replayComplete?: boolean;
+    }
+  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUMING; id: string }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.MESSAGE_UPDATED;
+      message: AGUIMessage;
+    }
+  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE };
+
+/**
+ * Incoming wire envelope mirroring `IncomingMessage` from `ai-chat/types.ts`
+ * but parameterized over `AGUIMessage` for the `CHAT_MESSAGES` variant.
+ */
+type IncomingAGUIMessage =
+  | { type: typeof CHAT_MESSAGE_TYPES.CHAT_CLEAR }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST;
+      id: string;
+      init: Pick<
+        RequestInit,
+        | "method"
+        | "keepalive"
+        | "headers"
+        | "body"
+        | "redirect"
+        | "integrity"
+        | "credentials"
+        | "mode"
+        | "referrer"
+        | "referrerPolicy"
+        | "window"
+      >;
+    }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.CHAT_MESSAGES;
+      messages: AGUIMessage[];
+    }
+  | { type: typeof CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL; id: string }
+  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK; id: string }
+  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.TOOL_RESULT;
+      toolCallId: string;
+      toolName: string;
+      output: unknown;
+      state?: "output-available" | "output-error";
+      errorText?: string;
+      autoContinue?: boolean;
+      clientTools?: ClientToolSchema[];
+    }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.TOOL_APPROVAL;
+      toolCallId: string;
+      approved: boolean;
+      autoContinue?: boolean;
+    };
+
+// ----------------------------------------------------------------------------
+// Public hook types (lifecycle on the AG-UI surface)
+// ----------------------------------------------------------------------------
+
+/**
+ * AG-UI analogue of `ChatResponseResult`. A turn can produce an assistant
+ * message and zero or more tool messages, so the hook surfaces
+ * `messages: AGUIMessage[]` instead of a single `message`.
+ */
+export type AGUIChatResponseResult = {
+  messages: AGUIMessage[];
+  requestId: string;
+  continuation: boolean;
+  status: "completed" | "error" | "aborted";
+  error?: string;
+};
+
+/**
+ * Options passed to {@link AGUIChatAgent.onChatMessage}. Mirrors
+ * `OnChatMessageOptions` from the legacy package.
+ */
+export type OnChatMessageOptions = {
+  requestId: string;
+  abortSignal?: AbortSignal;
+  clientTools?: ClientToolSchema[];
+  body?: Record<string, unknown>;
+  continuation?: boolean;
+};
+
+/**
+ * Onfinish callback shape — protocol-agnostic. The legacy class typed this
+ * via `StreamTextOnFinishCallback<ToolSet>` from the `ai` package; AG-UI
+ * has no such dependency, so we accept any thenable / void return.
+ */
+export type AGUIOnFinishCallback = (result: unknown) => void | Promise<void>;
+
+// ----------------------------------------------------------------------------
+// Internal helpers
+// ----------------------------------------------------------------------------
+
+type ChatRequestTrigger = "submit-message" | "regenerate-message";
+
+const TIMED_OUT = Symbol("timed-out");
+const decoder = new TextDecoder();
+
+function sendIfOpen(connection: Connection, message: string): boolean {
+  try {
+    connection.send(message);
+    return true;
+  } catch (error) {
+    if (isWebSocketClosedSendError(error)) return false;
+    throw error;
+  }
+}
+
+function isWebSocketClosedSendError(error: unknown): boolean {
+  return (
+    error instanceof TypeError &&
+    error.message.includes("WebSocket send() after close")
+  );
+}
+
+/**
+ * Wrap an `AGUIMessage` with the `_v` schema-version marker for persistence.
+ * Lives next to the class because both the constructor (load path) and
+ * `persistMessages` (write path) need it.
+ */
+function wrapPersistedShape(
+  message: AGUIMessage
+): AGUIMessage & { readonly _v: typeof PERSISTED_MESSAGE_SCHEMA_VERSION } {
+  return { ...message, _v: PERSISTED_MESSAGE_SCHEMA_VERSION };
+}
+
+/**
+ * Decide whether the SSE response should be parsed as AG-UI events or as
+ * a plaintext stream. Anything announcing `text/event-stream` is SSE;
+ * everything else is wrapped in a synthetic TEXT_MESSAGE run.
+ */
+function isSSEResponse(response: Response): boolean {
+  const ct = response.headers.get("content-type") ?? "";
+  return ct.includes("text/event-stream");
+}
+
+/**
+ * Parse one SSE `data: …` payload into an `AGUIEvent`. Returns `null` for
+ * non-data lines, the `[DONE]` sentinel, or malformed JSON.
+ */
+export function parseAGUIEventLine(line: string): AGUIEvent | null {
+  if (!line.startsWith("data: ")) return null;
+  const payload = line.slice(6);
+  if (payload === "[DONE]") return null;
+  try {
+    return JSON.parse(payload) as AGUIEvent;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Serialize an `AGUIEvent` into one SSE `data: …\n\n` frame body, matching
+ * the framing the reducer expects. The trailing newline pair is included so
+ * callers can concatenate frames into a single SSE stream.
+ */
+export function encodeAGUIEventLine(event: AGUIEvent): string {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+// ============================================================================
+// AGUIChatAgent
+// ============================================================================
+
+/**
+ * Canonical chat agent. Extend this class and override {@link onChatMessage}
+ * to produce an AG-UI SSE `Response`.
+ */
+export class AGUIChatAgent<
+  Env extends Cloudflare.Env = Cloudflare.Env,
+  State = unknown,
+  Props extends Record<string, unknown> = Record<string, unknown>
+> extends Agent<Env, State, Props> {
+  private _abortRegistry: AbortRegistry;
+
+  protected _resumableStream!: ResumableStream;
+
+  // Current in-flight assistant + tool messages produced by `_reply`. Used
+  // to apply tool results / approvals to a turn that has not yet persisted.
+  private _streamingMessages: AGUIMessage[] | null = null;
+  private _streamingAssistantId: string | null = null;
+
+  private _pendingChatResponseResults: AGUIChatResponseResult[] = [];
+  private _insideResponseHook = false;
+  private _pendingInteractionPromise: Promise<boolean> | null = null;
+
+  // Set when an approval CUSTOM event arrives mid-stream and we eagerly
+  // persist the assistant turn so a page refresh sees the approval modal.
+  private _approvalPersistedAssistantId: string | null = null;
+
+  private _turnQueue = new TurnQueue();
+
+  /**
+   * When `true`, chat turns are wrapped in `runFiber` for durable
+   * execution. Mirrors `AIChatAgent.chatRecovery`.
+   */
+  chatRecovery = false;
+
+  private _mergeQueuedUserStartIndexByEpoch = new Map<number, number>();
+  private _submitConcurrency = new SubmitConcurrencyController({
+    defaultDebounceMs: AGUIChatAgent.MESSAGE_DEBOUNCE_MS
+  });
+
+  private _pendingResumeConnections: Set<string> = new Set();
+  private _continuation = new ContinuationState();
+
+  private _agentToolForwarders = new Map<
+    string,
+    Set<(chunk: AgentToolStoredChunk) => void>
+  >();
+  private _agentToolClosers = new Map<string, Set<() => void>>();
+  private _agentToolLastErrors = new Map<string, string>();
+  private _agentToolPreTurnAssistantIds = new Map<string, Set<string>>();
+  private _agentToolLiveSequences = new Map<string, number>();
+  private _agentToolActiveRunId: string | null = null;
+
+  protected _lastClientTools: ClientToolSchema[] | undefined;
+  protected _lastBody: Record<string, unknown> | undefined;
+
+  /** JSON cache for incremental persistence (skip SQL writes for unchanged rows). */
+  private _persistedMessageCache: Map<string, string> = new Map();
+
+  private static AUTO_CONTINUATION_COALESCE_MS = 10;
+  private static MESSAGE_DEBOUNCE_MS = 750;
+
+  maxPersistedMessages: number | undefined = undefined;
+  messageConcurrency: MessageConcurrency = "queue";
+  waitForMcpConnections: boolean | { timeout: number } = { timeout: 10_000 };
+
+  /**
+   * Authoritative message list. Mutable for backwards compatibility, but
+   * write-through `persistMessages` is preferred.
+   */
+  messages: AGUIMessage[] = [];
+
+  static readonly CHAT_FIBER_NAME = "__cf_internal_chat_turn";
+
+  override broadcast(
+    msg: string | ArrayBuffer | ArrayBufferView,
+    without?: string[]
+  ): void {
+    // Intercept CF_AGENT_USE_CHAT_RESPONSE frames and forward to active
+    // agent-tool runs so a parent agent reconstructing a child's stream
+    // can fan-in via `agui-agent-tools`.
+    if (this._agentToolForwarders.size > 0 && typeof msg === "string") {
+      try {
+        const parsed = JSON.parse(msg) as {
+          type?: unknown;
+          body?: unknown;
+          error?: unknown;
+        };
+        if (parsed.type === CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE) {
+          if (parsed.error === true && typeof parsed.body === "string") {
+            const runIds =
+              this._agentToolActiveRunId !== null
+                ? [this._agentToolActiveRunId]
+                : [...this._agentToolForwarders.keys()];
+            for (const runId of runIds) {
+              this._agentToolLastErrors.set(runId, parsed.body);
+            }
+          } else if (
+            typeof parsed.body === "string" &&
+            parsed.body.length > 0
+          ) {
+            const entries =
+              this._agentToolActiveRunId !== null
+                ? [
+                    [
+                      this._agentToolActiveRunId,
+                      this._agentToolForwarders.get(
+                        this._agentToolActiveRunId
+                      ) ?? new Set<(chunk: AgentToolStoredChunk) => void>()
+                    ] as const
+                  ]
+                : [...this._agentToolForwarders.entries()];
+            for (const [runId, forwarders] of entries) {
+              const sequence = this._agentToolLiveSequences.get(runId) ?? 0;
+              this._agentToolLiveSequences.set(runId, sequence + 1);
+              const chunk: AgentToolStoredChunk = {
+                sequence,
+                body: parsed.body
+              };
+              for (const forward of forwarders) forward(chunk);
+            }
+          }
+        }
+      } catch {
+        // non-chat frames pass through unchanged
+      }
+    }
+    super.broadcast(msg, without);
+  }
+
+  constructor(ctx: AgentContext, env: Env) {
+    super(ctx, env);
+    this.sql`create table if not exists cf_ai_chat_agent_messages (
+			id text primary key,
+			message text not null,
+			created_at datetime default current_timestamp
+		)`;
+
+    this.sql`create table if not exists cf_ai_chat_request_context (
+			key text primary key,
+			value text not null
+		)`;
+
+    this._restoreRequestContext();
+
+    this._resumableStream = new ResumableStream(this.sql.bind(this));
+
+    const rawMessages = this._loadMessagesFromDb();
+    this.messages = autoTransformAGUIMessages(rawMessages);
+
+    this._abortRegistry = new AbortRegistry();
+
+    const _onConnect = this.onConnect.bind(this);
+    this.onConnect = async (
+      connection: Connection,
+      cctx: ConnectionContext
+    ) => {
+      if (this._cf_requestTargetsSubAgent(cctx.request)) {
+        return _onConnect(connection, cctx);
+      }
+      if (this._resumableStream.hasActiveStream()) {
+        this._notifyStreamResuming(connection);
+      }
+      return _onConnect(connection, cctx);
+    };
+
+    const _onClose = this.onClose.bind(this);
+    this.onClose = async (
+      connection: Connection,
+      code: number,
+      reason: string,
+      wasClean: boolean
+    ) => {
+      this._pendingResumeConnections.delete(connection.id);
+      this._continuation.awaitingConnections.delete(connection.id);
+      if (this._continuation.pending?.connectionId === connection.id) {
+        this._continuation.pending = null;
+      }
+      if (this._continuation.activeConnectionId === connection.id) {
+        this._continuation.activeConnectionId = null;
+      }
+      return _onClose(connection, code, reason, wasClean);
+    };
+
+    const _onMessage = this.onMessage.bind(this);
+    this.onMessage = async (connection: Connection, message: WSMessage) => {
+      if (this._cf_connectionTargetsSubAgent(connection)) {
+        return _onMessage(connection, message);
+      }
+      if (typeof message === "string") {
+        const data = this._tryParseIncoming(message);
+        if (data) {
+          const handled = await this._handleIncoming(connection, data);
+          if (handled) return;
+        }
+      }
+      return _onMessage(connection, message);
+    };
+
+    const _onRequest = this.onRequest.bind(this);
+    this.onRequest = async (request: Request) => {
+      return this._tryCatchChat(async () => {
+        const url = new URL(request.url);
+        if (url.pathname.split("/").pop() === "get-messages") {
+          return Response.json(this._loadMessagesFromDb());
+        }
+        return _onRequest(request);
+      });
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Public hook surface
+  // ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Override to handle a chat turn. Return a `Response` whose body is
+   * AG-UI SSE (`Content-Type: text/event-stream`, each event encoded as
+   * `data: {…AGUIEvent JSON}\n\n`).
+   */
+  async onChatMessage(
+    _onFinish: AGUIOnFinishCallback,
+    _options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    throw new Error(
+      "received a chat message, override onChatMessage and return a Response carrying AG-UI SSE to send to the client"
+    );
+  }
+
+  /**
+   * Fires after a chat turn completes, outside the turn lock. Default no-op.
+   */
+  protected onChatResponse(
+    _result: AGUIChatResponseResult
+  ): void | Promise<void> {}
+
+  /**
+   * Subclass hook to transform a message before persistence (after the
+   * built-in sanitizer). Default identity.
+   */
+  protected sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
+    return message;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Incoming protocol dispatch
+  // ──────────────────────────────────────────────────────────────────
+
+  private _tryParseIncoming(raw: string): IncomingAGUIMessage | null {
+    try {
+      return JSON.parse(raw) as IncomingAGUIMessage;
+    } catch {
+      return null;
+    }
+  }
+
+  private async _handleIncoming(
+    connection: Connection,
+    data: IncomingAGUIMessage
+  ): Promise<boolean> {
+    switch (data.type) {
+      case CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST:
+        return this._handleChatRequest(connection, data);
+      case CHAT_MESSAGE_TYPES.CHAT_CLEAR:
+        return this._handleChatClear(connection);
+      case CHAT_MESSAGE_TYPES.CHAT_MESSAGES:
+        return this._handleChatMessages(connection, data);
+      case CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL:
+        this._abortRegistry.cancel(data.id);
+        this._emit("message:cancel", { requestId: data.id });
+        return true;
+      case CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST:
+        return this._handleResumeRequest(connection);
+      case CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK:
+        return this._handleResumeAck(connection, data.id);
+      case CHAT_MESSAGE_TYPES.TOOL_RESULT:
+        return this._handleToolResult(connection, data);
+      case CHAT_MESSAGE_TYPES.TOOL_APPROVAL:
+        return this._handleToolApproval(connection, data);
+      default:
+        return false;
+    }
+  }
+
+  private async _handleChatRequest(
+    connection: Connection,
+    data: Extract<
+      IncomingAGUIMessage,
+      { type: typeof CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST }
+    >
+  ): Promise<boolean> {
+    if (data.init.method !== "POST") return true;
+    const { body } = data.init;
+    if (!body) {
+      console.warn(
+        "[AGUIChatAgent] Received chat request with empty body, ignoring"
+      );
+      return true;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(body as string);
+    } catch {
+      console.warn(
+        "[AGUIChatAgent] Received chat request with invalid JSON body, ignoring"
+      );
+      return true;
+    }
+
+    const {
+      messages,
+      clientTools,
+      trigger: _trigger,
+      ...customBody
+    } = parsed as {
+      messages: unknown[];
+      clientTools?: ClientToolSchema[];
+      trigger?: string;
+      [key: string]: unknown;
+    };
+
+    const chatMessageId = data.id;
+    const transformedMessages = autoTransformAGUIMessages(messages ?? []);
+    const requestTrigger: ChatRequestTrigger =
+      _trigger === "regenerate-message"
+        ? "regenerate-message"
+        : "submit-message";
+    const requestClientTools = clientTools?.length ? clientTools : undefined;
+    const requestBody =
+      Object.keys(customBody).length > 0 ? customBody : undefined;
+    const epoch = this._turnQueue.generation;
+    const concurrencyDecision =
+      this._getSubmitConcurrencyDecision(requestTrigger);
+
+    if (concurrencyDecision.action === "drop") {
+      this._rollbackDroppedSubmit(connection);
+      this._completeSkippedRequest(connection, chatMessageId);
+      return true;
+    }
+
+    const releasePendingEnqueue = this._submitConcurrency.beginEnqueue();
+    try {
+      this._broadcastChatMessage(
+        {
+          messages: transformedMessages,
+          type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES
+        },
+        [connection.id]
+      );
+      await this.persistMessages(transformedMessages, [connection.id], {
+        _deleteStaleRows: true
+      });
+      if (concurrencyDecision.strategy === "merge") {
+        await this._mergeQueuedUserMessages(epoch);
+      }
+    } finally {
+      releasePendingEnqueue();
+    }
+
+    await this._runExclusiveChatTurn(
+      chatMessageId,
+      async () => {
+        if (
+          this._submitConcurrency.isSuperseded(
+            concurrencyDecision.submitSequence
+          )
+        ) {
+          this._completeSkippedRequest(connection, chatMessageId);
+          return;
+        }
+        if (concurrencyDecision.debounceUntilMs !== null) {
+          await this._submitConcurrency.waitForTimestamp(
+            concurrencyDecision.debounceUntilMs
+          );
+          if (this._turnQueue.generation !== epoch) {
+            this._completeSkippedRequest(connection, chatMessageId);
+            return;
+          }
+          if (
+            this._submitConcurrency.isSuperseded(
+              concurrencyDecision.submitSequence
+            )
+          ) {
+            this._completeSkippedRequest(connection, chatMessageId);
+            return;
+          }
+        }
+        if (concurrencyDecision.strategy === "merge") {
+          await this._mergeQueuedUserMessages(epoch);
+          if (this._turnQueue.generation !== epoch) {
+            this._completeSkippedRequest(connection, chatMessageId);
+            return;
+          }
+          if (
+            this._submitConcurrency.isSuperseded(
+              concurrencyDecision.submitSequence
+            )
+          ) {
+            this._completeSkippedRequest(connection, chatMessageId);
+            return;
+          }
+        }
+
+        if (this.waitForMcpConnections) {
+          const timeout =
+            typeof this.waitForMcpConnections === "object"
+              ? this.waitForMcpConnections.timeout
+              : undefined;
+          await this.mcp.waitForConnections(
+            timeout != null ? { timeout } : undefined
+          );
+        }
+
+        this._setRequestContext(requestClientTools, requestBody);
+        this._emit("message:request");
+
+        const abortSignal = this._abortRegistry.getSignal(chatMessageId);
+
+        return this._tryCatchChat(async () => {
+          return agentContext.run(
+            {
+              agent: this,
+              connection,
+              request: undefined,
+              email: undefined
+            },
+            async () => {
+              const chatTurnBody = async () => {
+                try {
+                  const response = await this.onChatMessage(
+                    async (_finishResult) => {},
+                    {
+                      requestId: chatMessageId,
+                      abortSignal,
+                      clientTools: requestClientTools,
+                      body: requestBody,
+                      continuation: false
+                    }
+                  );
+                  if (response) {
+                    await this._reply(
+                      chatMessageId,
+                      response,
+                      [connection.id],
+                      { chatMessageId }
+                    );
+                  } else {
+                    console.warn(
+                      `[AGUIChatAgent] onChatMessage returned no response for chatMessageId: ${chatMessageId}`
+                    );
+                    this._broadcastChatMessage(
+                      {
+                        body: "",
+                        done: true,
+                        id: chatMessageId,
+                        type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE
+                      },
+                      [connection.id]
+                    );
+                  }
+                } finally {
+                  this._abortRegistry.remove(chatMessageId);
+                }
+              };
+              if (this.chatRecovery) {
+                await this.runFiber(
+                  `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${chatMessageId}`,
+                  async () => {
+                    await chatTurnBody();
+                  }
+                );
+              } else {
+                await chatTurnBody();
+              }
+            }
+          );
+        });
+      },
+      {
+        epoch,
+        onStale: () => this._completeSkippedRequest(connection, chatMessageId)
+      }
+    );
+    return true;
+  }
+
+  private _handleChatClear(connection: Connection): boolean {
+    this.resetTurnState();
+    this.sql`delete from cf_ai_chat_agent_messages`;
+    this._resumableStream.clearAll();
+    this._pendingResumeConnections.clear();
+    this._lastClientTools = undefined;
+    this._lastBody = undefined;
+    this._persistRequestContext();
+    this._persistedMessageCache.clear();
+    this.messages = [];
+    this._broadcastChatMessage({ type: CHAT_MESSAGE_TYPES.CHAT_CLEAR }, [
+      connection.id
+    ]);
+    this._emit("message:clear");
+    return true;
+  }
+
+  private async _handleChatMessages(
+    connection: Connection,
+    data: Extract<
+      IncomingAGUIMessage,
+      { type: typeof CHAT_MESSAGE_TYPES.CHAT_MESSAGES }
+    >
+  ): Promise<boolean> {
+    const transformedMessages = autoTransformAGUIMessages(data.messages);
+    await this.persistMessages(transformedMessages, [connection.id]);
+    return true;
+  }
+
+  private _handleResumeRequest(connection: Connection): boolean {
+    if (this._resumableStream.hasActiveStream()) {
+      if (
+        this._continuation.activeRequestId ===
+          this._resumableStream.activeRequestId &&
+        this._continuation.activeConnectionId !== null &&
+        this._continuation.activeConnectionId !== connection.id
+      ) {
+        sendIfOpen(
+          connection,
+          JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE })
+        );
+      } else {
+        this._notifyStreamResuming(connection);
+      }
+    } else if (
+      this._continuation.pending !== null &&
+      this._continuation.pending.connectionId === connection.id
+    ) {
+      this._continuation.awaitingConnections.set(connection.id, connection);
+    } else {
+      sendIfOpen(
+        connection,
+        JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE })
+      );
+    }
+    return true;
+  }
+
+  private _handleResumeAck(connection: Connection, requestId: string): boolean {
+    this._pendingResumeConnections.delete(connection.id);
+    if (
+      this._resumableStream.hasActiveStream() &&
+      this._resumableStream.activeRequestId === requestId
+    ) {
+      const orphanedStreamId = this._resumableStream.replayChunks(
+        connection,
+        this._resumableStream.activeRequestId
+      );
+      if (orphanedStreamId) {
+        this._persistOrphanedStream(orphanedStreamId);
+      }
+    } else if (this._resumableStream.hasActiveStream()) {
+      // Ignore ACKs for a different active stream
+    } else if (
+      !this._resumableStream.replayCompletedChunksByRequestId(
+        connection,
+        requestId
+      )
+    ) {
+      sendIfOpen(
+        connection,
+        JSON.stringify({
+          body: "",
+          done: true,
+          id: requestId,
+          type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+          replay: true
+        })
+      );
+    }
+    return true;
+  }
+
+  private _handleToolResult(
+    connection: Connection,
+    data: Extract<
+      IncomingAGUIMessage,
+      { type: typeof CHAT_MESSAGE_TYPES.TOOL_RESULT }
+    >
+  ): boolean {
+    if (data.clientTools?.length) {
+      this._lastClientTools = data.clientTools;
+      this._persistRequestContext();
+    }
+    this._emit("tool:result", {
+      toolCallId: data.toolCallId,
+      toolName: data.toolName
+    });
+
+    // In the AG-UI shape, tool results are first-class `ToolMessage`s. We
+    // upsert / append a tool message and persist immediately so subsequent
+    // turns see it.
+    const applyPromise = this._applyToolResult(
+      data.toolCallId,
+      data.output,
+      data.state === "output-error" ? data.errorText : undefined
+    );
+    this._pendingInteractionPromise = applyPromise;
+    applyPromise
+      .finally(() => {
+        if (this._pendingInteractionPromise === applyPromise) {
+          this._pendingInteractionPromise = null;
+        }
+      })
+      .catch(() => {});
+
+    if (data.autoContinue) {
+      this._enqueueAutoContinuation(
+        connection,
+        data.clientTools ?? this._lastClientTools,
+        this._lastBody,
+        "[AGUIChatAgent] Tool continuation failed:",
+        applyPromise
+      );
+    }
+    return true;
+  }
+
+  private _handleToolApproval(
+    connection: Connection,
+    data: Extract<
+      IncomingAGUIMessage,
+      { type: typeof CHAT_MESSAGE_TYPES.TOOL_APPROVAL }
+    >
+  ): boolean {
+    this._emit("tool:approval", {
+      toolCallId: data.toolCallId,
+      approved: data.approved
+    });
+    const approvalPromise = this._applyToolApproval(
+      data.toolCallId,
+      data.approved
+    );
+    this._pendingInteractionPromise = approvalPromise;
+    approvalPromise
+      .finally(() => {
+        if (this._pendingInteractionPromise === approvalPromise) {
+          this._pendingInteractionPromise = null;
+        }
+      })
+      .catch(() => {});
+
+    if (data.autoContinue) {
+      this._enqueueAutoContinuation(
+        connection,
+        this._lastClientTools,
+        this._lastBody,
+        "[AGUIChatAgent] Tool approval continuation failed:",
+        approvalPromise
+      );
+    }
+    return true;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Tool-result / tool-approval state transitions (AG-UI shape)
+  // ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Apply a client-supplied tool result. In the AG-UI shape a `ToolMessage`
+   * is the canonical carrier — we upsert it (first-write-wins for terminal
+   * states) and broadcast the updated tool message.
+   */
+  private async _applyToolResult(
+    toolCallId: string,
+    output: unknown,
+    errorText?: string
+  ): Promise<boolean> {
+    const existing = this._findToolMessageByCallId(toolCallId);
+    if (existing) {
+      // First-write-wins — duplicate frames / second-tab races are no-ops.
+      return true;
+    }
+
+    // Locate the assistant that owns the call so the new tool message can
+    // be inserted immediately after it. Falls back to append if the
+    // assistant is not found (e.g. agent issued a tool message without a
+    // matching assistant turn — uncommon but legal).
+    const assistantIdx = this._findAssistantIndexByToolCall(toolCallId);
+    const toolMessage: ToolMessage = {
+      id: `tool-${nanoid()}`,
+      role: "tool",
+      toolCallId,
+      content:
+        errorText !== undefined
+          ? JSON.stringify({ error: errorText })
+          : typeof output === "string"
+            ? output
+            : JSON.stringify(output ?? null),
+      ...(errorText !== undefined && { error: errorText })
+    };
+
+    const next = [...this.messages];
+    if (assistantIdx >= 0) {
+      next.splice(assistantIdx + 1, 0, toolMessage);
+    } else {
+      next.push(toolMessage);
+    }
+    await this.persistMessages(next);
+    this._broadcastChatMessage({
+      type: CHAT_MESSAGE_TYPES.MESSAGE_UPDATED,
+      message: toolMessage
+    });
+    return true;
+  }
+
+  /**
+   * Apply a tool-approval decision by broadcasting a CF custom AG-UI event
+   * and persisting the current message snapshot so the decision survives
+   * hibernation. The approval custom event is also fed into any in-flight
+   * accumulator so the next continuation turn sees it.
+   */
+  private async _applyToolApproval(
+    toolCallId: string,
+    approved: boolean
+  ): Promise<boolean> {
+    const value: CFToolApprovalDecisionValue = {
+      toolCallId,
+      approvalId: `approval-${nanoid()}`,
+      approved,
+      decidedAt: Date.now()
+    };
+    const event: AGUIEvent = {
+      type: "CUSTOM",
+      name: CF_TOOL_APPROVAL_DECISION,
+      value
+    };
+    // Stream the decision so live clients see it; persistence runs in the
+    // continuation turn that consumes the decision.
+    const body = encodeAGUIEventLine(event).trim();
+    this._broadcastChatMessage({
+      body,
+      done: false,
+      id: `approval-${toolCallId}`,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE
+    });
+    // Persist current snapshot so a refresh between approval and the
+    // continuation turn does not lose the decision state.
+    if (this.messages.length > 0) {
+      await this.persistMessages(this.messages);
+    }
+    return true;
+  }
+
+  private _findToolMessageByCallId(
+    toolCallId: string
+  ): ToolMessage | undefined {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role === "tool" && m.toolCallId === toolCallId) return m;
+    }
+    return undefined;
+  }
+
+  private _findAssistantIndexByToolCall(toolCallId: string): number {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role !== "assistant" || !m.toolCalls) continue;
+      for (const tc of m.toolCalls) {
+        if (tc.id === toolCallId) return i;
+      }
+    }
+    return -1;
+  }
+
+  private _findLastAssistantMessage(): AssistantMessage | undefined {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role === "assistant") return m;
+    }
+    return undefined;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Persistence
+  // ──────────────────────────────────────────────────────────────────
+
+  private _loadMessagesFromDb(): unknown[] {
+    const rows =
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      [];
+    this._persistedMessageCache.clear();
+    return rows
+      .map((row) => {
+        try {
+          const messageStr = row.message as string;
+          const parsed = JSON.parse(messageStr) as unknown;
+          const id =
+            parsed && typeof parsed === "object" && "id" in parsed
+              ? (parsed as { id: unknown }).id
+              : undefined;
+          if (typeof id === "string") {
+            this._persistedMessageCache.set(id, messageStr);
+          }
+          return parsed;
+        } catch (error) {
+          console.error(`Failed to parse message ${row.id}:`, error);
+          return null;
+        }
+      })
+      .filter((m): m is unknown => m !== null);
+  }
+
+  async persistMessages(
+    messages: AGUIMessage[],
+    excludeBroadcastIds: string[] = [],
+    options?: { _deleteStaleRows?: boolean }
+  ) {
+    const mergedMessages = reconcileMessages(messages, this.messages, (msg) =>
+      this._sanitizeMessageForPersistence(msg)
+    );
+
+    for (const message of mergedMessages) {
+      if (isEmptyReasoningMessage(message)) continue;
+      const sanitized = this._sanitizeMessageForPersistence(message);
+      const safe = enforceRowSizeLimit(sanitized);
+      const persisted = wrapPersistedShape(safe);
+      const json = JSON.stringify(persisted);
+
+      if (this._persistedMessageCache.get(safe.id) === json) continue;
+      if (aguiByteLength(json) > ROW_MAX_BYTES) {
+        console.warn(
+          `[AGUIChatAgent] Skipping persist of ${safe.id}: row exceeds size limit after enforcement`
+        );
+        continue;
+      }
+      this.sql`
+				insert into cf_ai_chat_agent_messages (id, message)
+				values (${safe.id}, ${json})
+				on conflict(id) do update set message = excluded.message
+			`;
+      this._persistedMessageCache.set(safe.id, json);
+    }
+
+    if (options?._deleteStaleRows) {
+      const serverIds = new Set(this.messages.map((m) => m.id));
+      const isSubsetOfServer = mergedMessages.every((m) => serverIds.has(m.id));
+      if (isSubsetOfServer) {
+        const keepIds = new Set(mergedMessages.map((m) => m.id));
+        const allDbRows =
+          this.sql<{ id: string }>`select id from cf_ai_chat_agent_messages` ||
+          [];
+        for (const row of allDbRows) {
+          if (!keepIds.has(row.id)) {
+            this
+              .sql`delete from cf_ai_chat_agent_messages where id = ${row.id}`;
+            this._persistedMessageCache.delete(row.id);
+          }
+        }
+      }
+    }
+
+    if (this.maxPersistedMessages != null) {
+      this._enforceMaxPersistedMessages();
+    }
+
+    const persistedRows = this._loadMessagesFromDb();
+    this.messages = autoTransformAGUIMessages(persistedRows);
+    this._broadcastChatMessage(
+      {
+        messages: mergedMessages,
+        type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES
+      },
+      excludeBroadcastIds
+    );
+  }
+
+  /** Subclass-hookable sanitizer composing the built-in pipeline + user hook. */
+  private _sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
+    const base = sanitizeAGUIMessage(message);
+    return this.sanitizeMessageForPersistence(base);
+  }
+
+  private _enforceMaxPersistedMessages() {
+    if (this.maxPersistedMessages == null) return;
+    const countResult = this.sql<{ cnt: number }>`
+			select count(*) as cnt from cf_ai_chat_agent_messages
+		`;
+    const count = countResult?.[0]?.cnt ?? 0;
+    if (count <= this.maxPersistedMessages) return;
+    const excess = count - this.maxPersistedMessages;
+    const toDelete = this.sql<{ id: string }>`
+			select id from cf_ai_chat_agent_messages
+			order by created_at asc
+			limit ${excess}
+		`;
+    if (toDelete && toDelete.length > 0) {
+      for (const row of toDelete) {
+        this.sql`delete from cf_ai_chat_agent_messages where id = ${row.id}`;
+        this._persistedMessageCache.delete(row.id);
+      }
+    }
+  }
+
+  private _restoreRequestContext() {
+    const rows =
+      this.sql<{ key: string; value: string }>`
+				select key, value from cf_ai_chat_request_context
+			` || [];
+    for (const row of rows) {
+      try {
+        if (row.key === "lastBody") {
+          this._lastBody = JSON.parse(row.value);
+        } else if (row.key === "lastClientTools") {
+          this._lastClientTools = JSON.parse(row.value);
+        }
+      } catch {
+        // corrupted row — next request overwrites
+      }
+    }
+  }
+
+  private _persistRequestContext() {
+    if (this._lastBody) {
+      this.sql`
+				insert or replace into cf_ai_chat_request_context (key, value)
+				values ('lastBody', ${JSON.stringify(this._lastBody)})
+			`;
+    } else {
+      this.sql`delete from cf_ai_chat_request_context where key = 'lastBody'`;
+    }
+    if (this._lastClientTools) {
+      this.sql`
+				insert or replace into cf_ai_chat_request_context (key, value)
+				values ('lastClientTools', ${JSON.stringify(this._lastClientTools)})
+			`;
+    } else {
+      this
+        .sql`delete from cf_ai_chat_request_context where key = 'lastClientTools'`;
+    }
+  }
+
+  private _setRequestContext(
+    clientTools?: ClientToolSchema[],
+    body?: Record<string, unknown>
+  ) {
+    this._lastClientTools = clientTools?.length ? clientTools : undefined;
+    this._lastBody = body && Object.keys(body).length > 0 ? body : undefined;
+    this._persistRequestContext();
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Broadcast helpers
+  // ──────────────────────────────────────────────────────────────────
+
+  private _broadcastChatMessage(
+    message: OutgoingAGUIMessage,
+    exclude?: string[]
+  ) {
+    const allExclusions = [
+      ...(exclude || []),
+      ...this._pendingResumeConnections
+    ];
+    this.broadcast(JSON.stringify(message), allExclusions);
+  }
+
+  private _completeSkippedRequest(connection: Connection, requestId: string) {
+    this._sendDirectMessage(connection, {
+      body: "",
+      done: true,
+      id: requestId,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE
+    });
+  }
+
+  private _rollbackDroppedSubmit(connection: Connection) {
+    this._sendDirectMessage(connection, {
+      messages: this._messagesForClientSync(),
+      type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES
+    });
+  }
+
+  private _sendDirectMessage(
+    connection: Connection,
+    message: OutgoingAGUIMessage
+  ): void {
+    try {
+      connection.send(JSON.stringify(message));
+    } catch {
+      // connection closed before reply
+    }
+  }
+
+  private _messagesForClientSync(): readonly AGUIMessage[] {
+    if (!this._streamingMessages || this._streamingMessages.length === 0) {
+      return this.messages;
+    }
+    const streaming = this._streamingMessages;
+    const merged: AGUIMessage[] = this.messages.map(
+      (m) => streaming.find((sm) => sm.id === m.id) ?? m
+    );
+    for (const sm of streaming) {
+      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+    }
+    return merged;
+  }
+
+  private _notifyStreamResuming(connection: Connection) {
+    if (!this._resumableStream.hasActiveStream()) return;
+    const sent = sendIfOpen(
+      connection,
+      JSON.stringify({
+        type: CHAT_MESSAGE_TYPES.STREAM_RESUMING,
+        id: this._resumableStream.activeRequestId
+      })
+    );
+    if (sent) {
+      this._pendingResumeConnections.add(connection.id);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Turn queue / concurrency
+  // ──────────────────────────────────────────────────────────────────
+
+  private _getSubmitConcurrencyDecision(
+    trigger: ChatRequestTrigger
+  ): SubmitConcurrencyDecision {
+    const decision = this._submitConcurrency.decide({
+      concurrency: this.messageConcurrency,
+      isSubmitMessage: trigger === "submit-message",
+      queuedTurns: this._turnQueue.queuedCount()
+    });
+    if (decision.strategy === "merge") {
+      if (
+        !this._mergeQueuedUserStartIndexByEpoch.has(this._turnQueue.generation)
+      ) {
+        this._mergeQueuedUserStartIndexByEpoch.set(
+          this._turnQueue.generation,
+          this.messages.length
+        );
+      }
+    }
+    return decision;
+  }
+
+  private async _mergeQueuedUserMessages(
+    epoch = this._turnQueue.generation
+  ): Promise<void> {
+    const merged = this._getMergedQueuedUserMessages(epoch);
+    if (!merged) return;
+    await this.persistMessages(merged, [], { _deleteStaleRows: true });
+  }
+
+  private _getMergedQueuedUserMessages(epoch: number): AGUIMessage[] | null {
+    const queuedUserStart = this._mergeQueuedUserStartIndexByEpoch.get(epoch);
+    if (queuedUserStart === undefined) return null;
+
+    let queuedUserEnd = queuedUserStart;
+    while (this.messages[queuedUserEnd]?.role === "user") {
+      queuedUserEnd++;
+    }
+    if (
+      queuedUserEnd === queuedUserStart &&
+      queuedUserStart < this.messages.length
+    ) {
+      console.warn(
+        `[AGUIChatAgent] merge: expected user messages at index ${queuedUserStart} ` +
+          `but found role="${this.messages[queuedUserStart]?.role}"; skipping merge`
+      );
+    }
+    const queuedUserMessages = this.messages.slice(
+      queuedUserStart,
+      queuedUserEnd
+    );
+    if (queuedUserMessages.length < 2) return null;
+
+    return [
+      ...this.messages.slice(0, queuedUserStart),
+      AGUIChatAgent._mergeUserMessages(queuedUserMessages),
+      ...this.messages.slice(queuedUserEnd)
+    ];
+  }
+
+  private static _mergeUserMessages(messages: AGUIMessage[]): UserMessage {
+    // AG-UI `UserMessage.content` is either string or InputContent[]. We
+    // concatenate text content; multimodal content is preserved by
+    // concatenating the arrays.
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== "user") {
+      throw new Error("cannot merge an empty user-message list");
+    }
+    let textBuf = "";
+    const multimodal: AGUIMessage[] = [];
+    for (const m of messages) {
+      if (m.role !== "user") continue;
+      if (typeof m.content === "string") {
+        if (textBuf.length > 0) textBuf += "\n\n";
+        textBuf += m.content;
+      } else {
+        multimodal.push(m);
+      }
+    }
+    if (multimodal.length === 0) {
+      return { id: last.id, role: "user", content: textBuf };
+    }
+    // At least one multimodal — flatten everything into an InputContent[].
+    const out: UserMessage["content"] = [];
+    if (textBuf.length > 0) out.push({ type: "text", text: textBuf });
+    for (const m of multimodal) {
+      if (m.role !== "user" || typeof m.content === "string") continue;
+      for (const ic of m.content) out.push(ic);
+    }
+    return { id: last.id, role: "user", content: out };
+  }
+
+  private async _runExclusiveChatTurn<T>(
+    requestId: string,
+    fn: () => Promise<T>,
+    options?: { epoch?: number; onStale?: () => void }
+  ): Promise<T> {
+    const generation = options?.epoch;
+    let result: TurnResult<T>;
+    try {
+      result = await this._turnQueue.enqueue(requestId, fn, { generation });
+    } finally {
+      const gen = generation ?? this._turnQueue.generation;
+      if (this._turnQueue.queuedCount(gen) === 0) {
+        this._mergeQueuedUserStartIndexByEpoch.delete(gen);
+      }
+      if (
+        this._pendingChatResponseResults.length > 0 &&
+        !this._insideResponseHook
+      ) {
+        this._insideResponseHook = true;
+        try {
+          await this.keepAliveWhile(async () => {
+            while (this._pendingChatResponseResults.length > 0) {
+              const chatResult = this._pendingChatResponseResults.shift()!;
+              try {
+                await this.onChatResponse(chatResult);
+              } catch (hookError) {
+                console.error(
+                  "[AGUIChatAgent] onChatResponse threw:",
+                  hookError
+                );
+              }
+            }
+          });
+        } finally {
+          this._insideResponseHook = false;
+        }
+      }
+    }
+    if (result!.status === "stale") {
+      options?.onStale?.();
+      return undefined as T;
+    }
+    return result!.value;
+  }
+
+  private async _tryCatchChat<T>(fn: () => T | Promise<T>) {
+    try {
+      return await fn();
+    } catch (e) {
+      throw this.onError(e);
+    }
+  }
+
+  protected resetTurnState(): void {
+    this._mergeQueuedUserStartIndexByEpoch.delete(this._turnQueue.generation);
+    this._turnQueue.reset();
+    this._abortRegistry.destroyAll();
+    this._submitConcurrency.reset();
+    this._pendingInteractionPromise = null;
+    this._continuation.sendResumeNone();
+    this._continuation.clearAll();
+    this._pendingChatResponseResults.length = 0;
+  }
+
+  protected abortRequest(requestId: string, reason?: unknown): void {
+    this._abortRegistry.cancel(requestId, reason);
+  }
+
+  protected abortAllRequests(): void {
+    this._abortRegistry.destroyAll();
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Auto-continuation
+  // ──────────────────────────────────────────────────────────────────
+
+  private _mergeAutoContinuationPrerequisite(
+    current: Promise<boolean> | null,
+    next?: Promise<boolean>
+  ): Promise<boolean> | null {
+    if (!next) return current;
+    if (!current) return next;
+    return Promise.all([current, next]).then(([a, b]) => a && b);
+  }
+
+  private _storeDeferredAutoContinuation(
+    connection: Connection,
+    clientTools: ClientToolSchema[] | undefined,
+    body: Record<string, unknown> | undefined,
+    errorPrefix: string,
+    prerequisite?: Promise<boolean>
+  ) {
+    const existing = this._continuation.deferred;
+    this._continuation.deferred = {
+      connection,
+      connectionId: connection.id,
+      clientTools,
+      body,
+      errorPrefix,
+      prerequisite: this._mergeAutoContinuationPrerequisite(
+        existing?.prerequisite ?? null,
+        prerequisite
+      )
+    };
+  }
+
+  private _activateDeferredAutoContinuation() {
+    const pending = this._continuation.activateDeferred(() => nanoid());
+    if (!pending) return;
+    this._queueAutoContinuation(pending.requestId);
+  }
+
+  private _clearAllAutoContinuationState(sendNone = false) {
+    this._clearPendingAutoContinuation(sendNone);
+    this._continuation.clearDeferred();
+  }
+
+  private _clearPendingAutoContinuation(sendNone = false) {
+    if (sendNone) this._continuation.sendResumeNone();
+    this._continuation.clearPending();
+  }
+
+  private _flushAwaitingStreamStartConnections() {
+    if (!this._resumableStream.hasActiveStream()) return;
+    this._continuation.flushAwaitingConnections((c: ContinuationConnection) =>
+      this._notifyStreamResuming(c as Connection)
+    );
+  }
+
+  private _enqueueAutoContinuation(
+    connection: Connection,
+    clientTools: ClientToolSchema[] | undefined,
+    body: Record<string, unknown> | undefined,
+    errorPrefix: string,
+    prerequisite?: Promise<boolean>
+  ) {
+    if (this._continuation.pending) {
+      if (this._continuation.pending.pastCoalesce) {
+        this._storeDeferredAutoContinuation(
+          connection,
+          clientTools,
+          body,
+          errorPrefix,
+          prerequisite
+        );
+        return;
+      }
+      this._continuation.pending.connection = connection;
+      this._continuation.pending.connectionId = connection.id;
+      this._continuation.awaitingConnections.set(connection.id, connection);
+      this._continuation.pending.clientTools = clientTools;
+      this._continuation.pending.body = body;
+      this._continuation.pending.errorPrefix = errorPrefix;
+      this._continuation.pending.prerequisite =
+        this._mergeAutoContinuationPrerequisite(
+          this._continuation.pending.prerequisite,
+          prerequisite
+        );
+      return;
+    }
+    const requestId = nanoid();
+    this._continuation.pending = {
+      connection,
+      connectionId: connection.id,
+      requestId,
+      clientTools,
+      body,
+      errorPrefix,
+      prerequisite: this._mergeAutoContinuationPrerequisite(null, prerequisite),
+      pastCoalesce: false
+    };
+    this._continuation.awaitingConnections.set(connection.id, connection);
+    this._queueAutoContinuation(requestId);
+  }
+
+  private async _awaitPendingAutoContinuationPrerequisite(): Promise<boolean> {
+    while (true) {
+      const prerequisite = this._continuation.pending?.prerequisite;
+      if (!prerequisite) return true;
+      const applied = await prerequisite;
+      if (!applied) return false;
+      await new Promise((resolve) =>
+        setTimeout(resolve, AGUIChatAgent.AUTO_CONTINUATION_COALESCE_MS)
+      );
+      if (this._continuation.pending?.prerequisite === prerequisite)
+        return true;
+    }
+  }
+
+  private _queueAutoContinuation(requestId: string) {
+    const epoch = this._turnQueue.generation;
+    this._runExclusiveChatTurn(
+      requestId,
+      async () => {
+        const dispose = await this.keepAlive();
+        try {
+          const applied =
+            await this._awaitPendingAutoContinuationPrerequisite();
+          if (!applied) {
+            this._clearAllAutoContinuationState(true);
+            return;
+          }
+          const connection = this._continuation.pending
+            ?.connection as Connection | null;
+          if (!connection) {
+            this._clearAllAutoContinuationState(true);
+            return;
+          }
+          const clientTools = this._continuation.pending?.clientTools;
+          const body = this._continuation.pending?.body;
+          if (this._continuation.pending) {
+            this._continuation.pending.pastCoalesce = true;
+          }
+          const abortSignal = this._abortRegistry.getSignal(requestId);
+
+          return this._tryCatchChat(async () => {
+            return agentContext.run(
+              {
+                agent: this,
+                connection,
+                request: undefined,
+                email: undefined
+              },
+              async () => {
+                const autoBody = async () => {
+                  try {
+                    const response = await this.onChatMessage(
+                      async (_finishResult) => {},
+                      {
+                        requestId,
+                        abortSignal,
+                        clientTools,
+                        body,
+                        continuation: true
+                      }
+                    );
+                    if (response) {
+                      await this._reply(requestId, response, [], {
+                        continuation: true,
+                        chatMessageId: requestId
+                      });
+                      this._activateDeferredAutoContinuation();
+                    } else {
+                      this._clearPendingAutoContinuation(true);
+                      this._activateDeferredAutoContinuation();
+                    }
+                  } finally {
+                    this._abortRegistry.remove(requestId);
+                  }
+                };
+                if (this.chatRecovery) {
+                  await this.runFiber(
+                    `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
+                    async () => {
+                      await autoBody();
+                    }
+                  );
+                } else {
+                  await autoBody();
+                }
+              }
+            );
+          });
+        } finally {
+          dispose();
+        }
+      },
+      {
+        epoch,
+        onStale: () => this._clearAllAutoContinuationState(true)
+      }
+    ).catch((error) => {
+      const errorPrefix =
+        this._continuation.pending?.errorPrefix ??
+        "[AGUIChatAgent] Auto-continuation failed:";
+      this._clearAllAutoContinuationState(true);
+      console.error(errorPrefix, error);
+    });
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // _reply — consume the SSE Response, persist final message list
+  // ──────────────────────────────────────────────────────────────────
+
+  private async _reply(
+    id: string,
+    response: Response,
+    excludeBroadcastIds: string[] = [],
+    options: { continuation?: boolean; chatMessageId?: string } = {}
+  ) {
+    const { continuation = false, chatMessageId } = options;
+    const abortSignal = chatMessageId
+      ? this._abortRegistry.getExistingSignal(chatMessageId)
+      : undefined;
+
+    return this.keepAliveWhile(() =>
+      this._tryCatchChat(async () => {
+        if (!response.body) {
+          this._clearPendingAutoContinuation(true);
+          this._broadcastChatMessage({
+            body: "",
+            done: true,
+            id,
+            type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+            ...(continuation && { continuation: true })
+          });
+          this._activateDeferredAutoContinuation();
+          return;
+        }
+
+        const streamId = this._startStream(id);
+        const reader = response.body.getReader();
+
+        // Seed the accumulator from the last assistant message when this
+        // turn is a continuation — matches the legacy class's cloning
+        // behavior.
+        const seed: AGUIMessage[] = continuation
+          ? this._continuationSeed()
+          : [];
+        const accumulator = new AGUIStreamAccumulator({
+          existingMessages: seed
+        });
+        this._streamingMessages = [...seed];
+        this._streamingAssistantId =
+          seed.find((m): m is AssistantMessage => m.role === "assistant")?.id ??
+          null;
+
+        const streamCompleted = { value: false };
+        let streamEndStatus: "completed" | "aborted" = "completed";
+        let earlyPersistedAssistantId: string | null = null;
+
+        try {
+          if (isSSEResponse(response)) {
+            streamEndStatus = await this._streamSSEReply(
+              id,
+              streamId,
+              reader,
+              accumulator,
+              continuation,
+              abortSignal
+            );
+          } else {
+            streamEndStatus = await this._sendPlaintextReply(
+              id,
+              streamId,
+              reader,
+              accumulator,
+              continuation,
+              abortSignal
+            );
+          }
+        } catch (error) {
+          if (!streamCompleted.value) {
+            this._markStreamError(streamId);
+            this._broadcastChatMessage({
+              body: error instanceof Error ? error.message : "Stream error",
+              done: true,
+              error: true,
+              id,
+              type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+              ...(continuation && { continuation: true })
+            });
+            this._emit("message:error", {
+              error: error instanceof Error ? error.message : String(error)
+            });
+            this._pendingChatResponseResults.push({
+              messages: [...accumulator.messages],
+              requestId: id,
+              continuation,
+              status: "error",
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+          throw error;
+        } finally {
+          reader.releaseLock();
+          this._streamingMessages = null;
+          this._streamingAssistantId = null;
+          earlyPersistedAssistantId = this._approvalPersistedAssistantId;
+          this._approvalPersistedAssistantId = null;
+          if (chatMessageId) {
+            this._abortRegistry.remove(chatMessageId);
+            if (streamCompleted.value) this._emit("message:response");
+          }
+        }
+
+        streamCompleted.value = true;
+
+        if (accumulator.messages.length > 0) {
+          await this._persistStreamResult(
+            accumulator.messages,
+            excludeBroadcastIds,
+            {
+              continuation,
+              earlyPersistedAssistantId
+            }
+          );
+        }
+
+        this._pendingChatResponseResults.push({
+          messages: [...accumulator.messages],
+          requestId: id,
+          continuation,
+          status: streamEndStatus
+        });
+      })
+    );
+  }
+
+  /**
+   * Compute the continuation seed: the last assistant message cloned, plus
+   * any tool messages that follow it. Mirrors `_createStreamingAssistantMessage`
+   * for the AG-UI shape, but produces an array because tool messages are
+   * standalone in AG-UI.
+   */
+  private _continuationSeed(): AGUIMessage[] {
+    const lastAssistantIdx = (() => {
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        if (this.messages[i].role === "assistant") return i;
+      }
+      return -1;
+    })();
+    if (lastAssistantIdx === -1) {
+      return [
+        {
+          id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+          role: "assistant"
+        }
+      ];
+    }
+    return this.messages.slice(lastAssistantIdx).map((m) => structuredClone(m));
+  }
+
+  private async _streamSSEReply(
+    id: string,
+    streamId: string,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    accumulator: AGUIStreamAccumulator,
+    continuation: boolean,
+    abortSignal?: AbortSignal
+  ): Promise<"completed" | "aborted"> {
+    if (abortSignal && !abortSignal.aborted) {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          reader.cancel().catch(() => {});
+        },
+        { once: true }
+      );
+    }
+
+    let buffer = "";
+    while (true) {
+      if (abortSignal?.aborted) break;
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch (readError) {
+        if (abortSignal?.aborted) break;
+        throw readError;
+      }
+      const { done, value } = readResult;
+      if (done) {
+        if (abortSignal?.aborted) break;
+        if (buffer.length > 0) {
+          this._consumeSSELine(buffer, accumulator, streamId, id, continuation);
+        }
+        this._completeStream(streamId);
+        this._broadcastChatMessage({
+          body: "",
+          done: true,
+          id,
+          type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+          ...(continuation && { continuation: true })
+        });
+        return "completed";
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      // SSE events are separated by `\n\n`; split on single newlines for
+      // `data: …` line handling and keep a tail-buffer for partial lines.
+      let nlIdx = buffer.indexOf("\n");
+      while (nlIdx !== -1) {
+        const line = buffer.slice(0, nlIdx);
+        buffer = buffer.slice(nlIdx + 1);
+        if (line.length > 0) {
+          this._consumeSSELine(line, accumulator, streamId, id, continuation);
+        }
+        nlIdx = buffer.indexOf("\n");
+      }
+    }
+
+    if (!abortSignal?.aborted) {
+      return "completed";
+    }
+    this._completeStream(streamId);
+    this._broadcastChatMessage({
+      body: "",
+      done: true,
+      id,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      ...(continuation && { continuation: true })
+    });
+    return "aborted";
+  }
+
+  private _consumeSSELine(
+    line: string,
+    accumulator: AGUIStreamAccumulator,
+    streamId: string,
+    id: string,
+    continuation: boolean
+  ): void {
+    const event = parseAGUIEventLine(line);
+    if (!event) return;
+    const action = accumulator.applyEvent(event);
+
+    // Mirror live state for tool-result / approval application.
+    this._streamingMessages = [...accumulator.messages];
+    const liveAssistant = accumulator.messages.find(
+      (m): m is AssistantMessage => m.role === "assistant"
+    );
+    if (liveAssistant) this._streamingAssistantId = liveAssistant.id;
+
+    // Eagerly persist the assistant turn when an approval request lands so
+    // a refresh between request and decision keeps the modal state.
+    if (action.kind === "approval" && this._streamingAssistantId) {
+      this._persistApprovalSnapshot(accumulator.messages);
+    }
+
+    // Store & broadcast every event regardless of action — clients drive
+    // their UI from the raw event stream.
+    const body = JSON.stringify(event);
+    this._storeStreamChunk(streamId, body);
+    this._broadcastChatMessage({
+      body,
+      done: false,
+      id,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      ...(continuation && { continuation: true })
+    });
+    // Action is consumed for side-effects only (approval persist above);
+    // no other action requires explicit handling here. `unknown` and
+    // `noop` are intentionally not differentiated past this point.
+    void action;
+  }
+
+  /**
+   * Synthesize TEXT_MESSAGE_START / CONTENT / END events from a plaintext
+   * Response body so non-SSE producers (`generateText`, raw `fetch`) flow
+   * through the same AG-UI lifecycle as SSE producers.
+   */
+  private async _sendPlaintextReply(
+    id: string,
+    streamId: string,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    accumulator: AGUIStreamAccumulator,
+    continuation: boolean,
+    abortSignal?: AbortSignal
+  ): Promise<"completed" | "aborted"> {
+    const messageId =
+      this._streamingAssistantId ??
+      `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    this._emitSynthetic(
+      { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
+      accumulator,
+      streamId,
+      id,
+      continuation
+    );
+
+    if (abortSignal && !abortSignal.aborted) {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          reader.cancel().catch(() => {});
+        },
+        { once: true }
+      );
+    }
+
+    while (true) {
+      if (abortSignal?.aborted) break;
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch (readError) {
+        if (abortSignal?.aborted) break;
+        throw readError;
+      }
+      const { done, value } = readResult;
+      if (done) {
+        if (abortSignal?.aborted) break;
+        this._emitSynthetic(
+          { type: "TEXT_MESSAGE_END", messageId },
+          accumulator,
+          streamId,
+          id,
+          continuation
+        );
+        this._completeStream(streamId);
+        this._broadcastChatMessage({
+          body: "",
+          done: true,
+          id,
+          type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+          ...(continuation && { continuation: true })
+        });
+        return "completed";
+      }
+      const chunk = decoder.decode(value);
+      if (chunk.length > 0) {
+        this._emitSynthetic(
+          { type: "TEXT_MESSAGE_CONTENT", messageId, delta: chunk },
+          accumulator,
+          streamId,
+          id,
+          continuation
+        );
+      }
+    }
+
+    this._emitSynthetic(
+      { type: "TEXT_MESSAGE_END", messageId },
+      accumulator,
+      streamId,
+      id,
+      continuation
+    );
+    this._completeStream(streamId);
+    this._broadcastChatMessage({
+      body: "",
+      done: true,
+      id,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      ...(continuation && { continuation: true })
+    });
+    return "aborted";
+  }
+
+  private _emitSynthetic(
+    event: AGUIEvent,
+    accumulator: AGUIStreamAccumulator,
+    streamId: string,
+    id: string,
+    continuation: boolean
+  ): void {
+    accumulator.applyEvent(event);
+    const body = JSON.stringify(event);
+    this._storeStreamChunk(streamId, body);
+    this._broadcastChatMessage({
+      body,
+      done: false,
+      id,
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      ...(continuation && { continuation: true })
+    });
+  }
+
+  private _persistApprovalSnapshot(messages: readonly AGUIMessage[]): void {
+    // Direct SQL insert (no broadcast) — clients already have the data
+    // from the live event stream; broadcasting would double-render.
+    for (const m of messages) {
+      if (isEmptyReasoningMessage(m)) continue;
+      const sanitized = this._sanitizeMessageForPersistence(m);
+      const safe = enforceRowSizeLimit(sanitized);
+      const persisted = wrapPersistedShape(safe);
+      const json = JSON.stringify(persisted);
+      this.sql`
+				insert into cf_ai_chat_agent_messages (id, message)
+				values (${safe.id}, ${json})
+				on conflict(id) do update set message = excluded.message
+			`;
+      this._persistedMessageCache.set(safe.id, json);
+    }
+    const last = messages.find(
+      (m): m is AssistantMessage => m.role === "assistant"
+    );
+    if (last) this._approvalPersistedAssistantId = last.id;
+  }
+
+  private async _persistStreamResult(
+    streamedMessages: readonly AGUIMessage[],
+    excludeBroadcastIds: string[],
+    _options: {
+      continuation: boolean;
+      earlyPersistedAssistantId: string | null;
+    }
+  ): Promise<void> {
+    // `streamedMessages` is the full snapshot the reducer produced for this
+    // turn (assistant + tool messages, potentially seeded from the previous
+    // assistant turn on continuation). Merge into the persisted list by id.
+    const merged: AGUIMessage[] = [];
+    for (const m of this.messages) {
+      const replacement = streamedMessages.find((sm) => sm.id === m.id);
+      merged.push(replacement ?? m);
+    }
+    for (const sm of streamedMessages) {
+      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+    }
+    await this.persistMessages(merged, excludeBroadcastIds);
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Orphaned-stream recovery (port from AIChatAgent on AG-UI shape)
+  // ──────────────────────────────────────────────────────────────────
+
+  protected _persistOrphanedStream(streamId: string) {
+    const chunks = this._resumableStream.getStreamChunks(streamId);
+    if (!chunks.length) return;
+    const snapshot: SnapshotState = createInitialSnapshot();
+    for (const chunk of chunks) {
+      try {
+        const event = JSON.parse(chunk.body) as AGUIEvent;
+        applyEventToSnapshot(snapshot, event);
+      } catch {
+        // skip malformed chunks
+      }
+    }
+    if (snapshot.messages.length === 0) return;
+    const merged: AGUIMessage[] = [];
+    for (const m of this.messages) {
+      const replacement = snapshot.messages.find((sm) => sm.id === m.id);
+      merged.push(replacement ?? m);
+    }
+    for (const sm of snapshot.messages) {
+      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+    }
+    // Fire-and-forget; the caller (ACK handler) does not await.
+    this.persistMessages(merged).catch((err) =>
+      console.error(
+        "[AGUIChatAgent] _persistOrphanedStream persist failed",
+        err
+      )
+    );
+  }
+
+  // ── Resumable stream delegates (parity with AIChatAgent) ───────────
+
+  protected get _activeStreamId(): string | null {
+    return this._resumableStream?.activeStreamId ?? null;
+  }
+  protected get _activeRequestId(): string | null {
+    return this._resumableStream?.activeRequestId ?? null;
+  }
+  protected _startStream(requestId: string): string {
+    const streamId = this._resumableStream.start(requestId);
+    if (this._continuation.pending?.requestId === requestId) {
+      this._continuation.activatePending();
+      this._flushAwaitingStreamStartConnections();
+      this._activateDeferredAutoContinuation();
+    }
+    return streamId;
+  }
+  protected _completeStream(streamId: string) {
+    const completedRequestId = this._resumableStream.activeRequestId;
+    this._resumableStream.complete(streamId);
+    this._pendingResumeConnections.clear();
+    if (completedRequestId === this._continuation.activeRequestId) {
+      this._continuation.activeRequestId = null;
+      this._continuation.activeConnectionId = null;
+    }
+  }
+  protected _storeStreamChunk(streamId: string, body: string) {
+    this._resumableStream.storeChunk(streamId, body);
+  }
+  protected _flushChunkBuffer() {
+    this._resumableStream.flushBuffer();
+  }
+  protected _markStreamError(streamId: string) {
+    this._resumableStream.markError(streamId);
+    this._pendingResumeConnections.clear();
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Programmatic entry points
+  // ──────────────────────────────────────────────────────────────────
+
+  async saveMessages(
+    messages:
+      | AGUIMessage[]
+      | ((
+          currentMessages: readonly AGUIMessage[]
+        ) => AGUIMessage[] | Promise<AGUIMessage[]>),
+    options?: SaveMessagesOptions
+  ): Promise<SaveMessagesResult> {
+    const requestId = nanoid();
+    const clientTools = this._lastClientTools;
+    const body = this._lastBody;
+    const epoch = this._turnQueue.generation;
+    let status: SaveMessagesResult["status"] = "completed";
+    let wasAborted = false;
+
+    await this._runExclusiveChatTurn(
+      requestId,
+      async () => {
+        const resolved =
+          typeof messages === "function"
+            ? await messages(this.messages)
+            : messages;
+        if (this._turnQueue.generation !== epoch) {
+          status = "skipped";
+          return;
+        }
+        await this.persistMessages(resolved);
+        if (this._turnQueue.generation !== epoch) {
+          status = "skipped";
+          return;
+        }
+        wasAborted = await this._runProgrammaticChatTurn(
+          requestId,
+          clientTools,
+          body,
+          options?.signal
+        );
+      },
+      { epoch }
+    );
+    if (this._turnQueue.generation !== epoch && status === "completed") {
+      status = "skipped";
+    } else if (wasAborted && status === "completed") {
+      status = "aborted";
+    }
+    return { requestId, status };
+  }
+
+  private async _runProgrammaticChatTurn(
+    requestId: string,
+    clientTools?: ClientToolSchema[],
+    body?: Record<string, unknown>,
+    externalSignal?: AbortSignal
+  ): Promise<boolean> {
+    this._setRequestContext(clientTools, body);
+    let wasAborted = false;
+    await this._tryCatchChat(async () => {
+      return agentContext.run(
+        {
+          agent: this,
+          connection: undefined,
+          request: undefined,
+          email: undefined
+        },
+        async () => {
+          const abortSignal = this._abortRegistry.getSignal(requestId);
+          const detachExternal = this._abortRegistry.linkExternal(
+            requestId,
+            externalSignal
+          );
+          try {
+            const programmaticBody = async () => {
+              const response = await this.onChatMessage(() => {}, {
+                requestId,
+                abortSignal,
+                clientTools,
+                body,
+                continuation: false
+              });
+              if (response) {
+                await this._reply(requestId, response, [], {
+                  chatMessageId: requestId
+                });
+              }
+            };
+            if (this.chatRecovery) {
+              await this.runFiber(
+                `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
+                async () => {
+                  await programmaticBody();
+                }
+              );
+            } else {
+              await programmaticBody();
+            }
+          } finally {
+            if (abortSignal?.aborted) wasAborted = true;
+            detachExternal();
+            this._abortRegistry.remove(requestId);
+          }
+        }
+      );
+    });
+    return wasAborted;
+  }
+
+  protected async continueLastTurn(
+    body?: Record<string, unknown>,
+    options?: SaveMessagesOptions
+  ): Promise<SaveMessagesResult> {
+    if (!this._findLastAssistantMessage()) {
+      return { requestId: "", status: "skipped" };
+    }
+    const requestId = nanoid();
+    const clientTools = this._lastClientTools;
+    const resolvedBody = body ?? this._lastBody;
+    const epoch = this._turnQueue.generation;
+    let status: SaveMessagesResult["status"] = "completed";
+    let wasAborted = false;
+
+    await this._runExclusiveChatTurn(
+      requestId,
+      async () => {
+        if (this._turnQueue.generation !== epoch) {
+          status = "skipped";
+          return;
+        }
+        this._setRequestContext(clientTools, resolvedBody);
+        const turnBody = async () => {
+          await this._tryCatchChat(async () => {
+            return agentContext.run(
+              {
+                agent: this,
+                connection: undefined,
+                request: undefined,
+                email: undefined
+              },
+              async () => {
+                const abortSignal = this._abortRegistry.getSignal(requestId);
+                const detachExternal = this._abortRegistry.linkExternal(
+                  requestId,
+                  options?.signal
+                );
+                try {
+                  const response = await this.onChatMessage(() => {}, {
+                    requestId,
+                    abortSignal,
+                    clientTools,
+                    body: resolvedBody,
+                    continuation: true
+                  });
+                  if (response) {
+                    await this._reply(requestId, response, [], {
+                      continuation: true,
+                      chatMessageId: requestId
+                    });
+                  }
+                } finally {
+                  if (abortSignal?.aborted) wasAborted = true;
+                  detachExternal();
+                  this._abortRegistry.remove(requestId);
+                }
+              }
+            );
+          });
+        };
+        if (this.chatRecovery) {
+          await this.runFiber(
+            `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
+            async () => {
+              await turnBody();
+            }
+          );
+        } else {
+          await turnBody();
+        }
+      },
+      { epoch }
+    );
+    if (this._turnQueue.generation !== epoch && status === "completed") {
+      status = "skipped";
+    } else if (wasAborted && status === "completed") {
+      status = "aborted";
+    }
+    return { requestId, status };
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Cleanup
+  // ──────────────────────────────────────────────────────────────────
+
+  async destroy() {
+    this._abortRegistry.destroyAll();
+    this._resumableStream.destroy();
+    await super.destroy();
+  }
+}
+
+// Re-export shared types so subclasses can `import` everything from one place.
+export type {
+  AGUIMessage,
+  AssistantMessage,
+  ToolMessage,
+  UserMessage
+} from "./chat/agui-types";
+export type { ClientToolSchema } from "./chat/client-tools";
+export type {
+  MessageConcurrency,
+  SaveMessagesOptions,
+  SaveMessagesResult
+} from "./chat/lifecycle";
+
+// Re-exports for adapter packages that wrap sub-agent forwarding.
+export {
+  applyAGUIAgentToolEvent,
+  createAGUIAgentToolEventState,
+  type AGUIAgentToolEvent
+};
+
+// Test-friendly named exports (pure-logic helpers exercised by the
+// `__tests__` suite).
+export {
+  encodeAGUIEventLine as _aguiEncodeEventLine,
+  parseAGUIEventLine as _aguiParseEventLine,
+  wrapPersistedShape as _aguiWrapPersistedShape
+};
