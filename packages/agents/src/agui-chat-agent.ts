@@ -1007,9 +1007,8 @@ export class AGUIChatAgent<
     };
     // Stream the decision so live clients see it; persistence runs in the
     // continuation turn that consumes the decision.
-    const body = encodeAGUIEventLine(event).trim();
     this._broadcastChatMessage({
-      body,
+      body: JSON.stringify(event),
       done: false,
       id: `approval-${toolCallId}`,
       type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE

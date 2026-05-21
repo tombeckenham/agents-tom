@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   autoTransformAGUIMessages,
+  isCleanAGUIMessage,
   isLegacyUIMessage,
   isPersistedAGUIMessage,
   migrateUIMessageToAGUI
@@ -234,5 +235,38 @@ describe("agui-migration", () => {
       { id: "u9", role: "user", content: "hi" },
       { id: "a9", role: "assistant", content: "yo" }
     ]);
+  });
+
+  it("isCleanAGUIMessage accepts plain AG-UI shapes without _v or parts", () => {
+    expect(isCleanAGUIMessage({ id: "u1", role: "user", content: "hi" })).toBe(
+      true
+    );
+    expect(
+      isCleanAGUIMessage({ id: "a1", role: "assistant", content: "hi" })
+    ).toBe(true);
+    expect(
+      isCleanAGUIMessage({
+        id: "t1",
+        role: "tool",
+        toolCallId: "tc",
+        content: "{}"
+      })
+    ).toBe(true);
+    expect(isCleanAGUIMessage({ id: "x", role: "user", parts: [] })).toBe(
+      false
+    );
+    expect(isCleanAGUIMessage({ id: "x", role: "bogus" })).toBe(false);
+    expect(isCleanAGUIMessage({ role: "user", content: "hi" })).toBe(false);
+    expect(isCleanAGUIMessage(null)).toBe(false);
+  });
+
+  it("autoTransformAGUIMessages accepts wire-incoming clean AG-UI rows without warning", () => {
+    const wire = [
+      { id: "u-wire", role: "user", content: "hello" },
+      { id: "a-wire", role: "assistant", content: "world" }
+    ];
+    const result = autoTransformAGUIMessages(wire);
+    expect(result).toEqual(wire);
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 });

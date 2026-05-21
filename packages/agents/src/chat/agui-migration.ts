@@ -26,6 +26,7 @@ import {
   type AGUIInputContent,
   type AGUIInputContentSource,
   type AGUIMessage,
+  type AGUIRole,
   type AssistantMessage,
   type DeveloperMessage,
   PERSISTED_MESSAGE_SCHEMA_VERSION,
@@ -35,6 +36,16 @@ import {
   type ToolMessage,
   type UserMessage
 } from "./agui-types";
+
+const AGUI_ROLES = new Set<AGUIRole>([
+  "user",
+  "assistant",
+  "system",
+  "tool",
+  "developer",
+  "reasoning",
+  "activity"
+]);
 
 // ----------------------------------------------------------------------------
 // Persisted envelope shape (top-level `_v` marker)
@@ -85,16 +96,34 @@ export function isLegacyUIMessage(value: unknown): boolean {
   return true;
 }
 
+/**
+ * True when `value` is already a clean `AGUIMessage`: an `id`-bearing object
+ * with an AG-UI `role` and no legacy `parts[]` array. Used for wire-incoming
+ * payloads from native AG-UI clients, which never carry the persistence `_v`
+ * marker. Excludes legacy UIMessage rows (those carry `parts`) so they still
+ * flow through `migrateUIMessageToAGUI`.
+ */
+export function isCleanAGUIMessage(value: unknown): boolean {
+  if (!isObject(value)) return false;
+  if (typeof value.id !== "string") return false;
+  if (typeof value.role !== "string") return false;
+  if (!AGUI_ROLES.has(value.role as AGUIRole)) return false;
+  if (Array.isArray(value.parts)) return false;
+  return true;
+}
+
 // ----------------------------------------------------------------------------
 // Top-level loader
 // ----------------------------------------------------------------------------
 
 /**
- * Per-row transform run on every persisted message read out of
- * `cf_ai_chat_agent_messages`. Already-AG-UI rows pass through
- * (with the `_v` marker stripped); legacy `UIMessage` rows get
- * one-shot migrated; unrecognized rows are skipped with a warning
- * (no fallback fabrication — surface the corruption).
+ * Per-row transform run on every message that flows into the agent — both
+ * persisted rows loaded from `cf_ai_chat_agent_messages` and wire-incoming
+ * payloads from clients. Persisted rows carry the `_v` marker and pass
+ * through (marker stripped); legacy v5 `UIMessage` rows get one-shot
+ * migrated; clean AG-UI rows (from native AG-UI clients) pass through
+ * unchanged. Unrecognized rows are skipped with a warning — no fallback
+ * fabrication.
  */
 export function autoTransformAGUIMessages(
   rawMessages: unknown[]
@@ -111,8 +140,12 @@ export function autoTransformAGUIMessages(
       }
       continue;
     }
+    if (isCleanAGUIMessage(raw)) {
+      out.push(raw as AGUIMessage);
+      continue;
+    }
     console.warn(
-      "[agents/chat/agui-migration] Skipping unrecognized persisted message row",
+      "[agents/chat/agui-migration] Skipping unrecognized message row",
       raw
     );
   }
