@@ -121,6 +121,11 @@
       "import": "./dist/mcp/do-oauth-client-provider.js",
       "require": "./dist/mcp/do-oauth-client-provider.js"
     },
+    "./mcp/tanstack-ai": {
+      "types": "./dist/mcp/tanstack-ai.d.ts",
+      "import": "./dist/mcp/tanstack-ai.js",
+      "require": "./dist/mcp/tanstack-ai.js"
+    },
     "./observability": {
       "types": "./dist/observability/index.d.ts",
       "import": "./dist/observability/index.js",

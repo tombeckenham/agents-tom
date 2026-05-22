@@ -14,6 +14,7 @@ import type {
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
 import { type RetryOptions, tryN } from "../retries";
 import type { ToolSet } from "ai";
+import { toolDefinition, type ServerTool } from "@tanstack/ai";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import { Emitter, type Event, DisposableStore } from "../core/events";
@@ -1378,6 +1379,72 @@ export class MCPClientManager {
       }
     }
     return Object.fromEntries(entries);
+  }
+
+  /**
+   * @param filter - Optional filter to scope results to specific servers
+   * @returns an array of TanStack AI {@link ServerTool}s. Each MCP tool is
+   *   projected into a `toolDefinition(...).server(handler)` where the handler
+   *   dispatches to `callTool` against the right MCP server and rethrows
+   *   tool-side errors as plain `Error` objects.
+   */
+  getServerTools(filter?: MCPServerFilter): ServerTool[] {
+    const connections = this.filterConnections(filter);
+
+    for (const [id, conn] of Object.entries(connections)) {
+      if (
+        conn.connectionState !== MCPConnectionState.READY &&
+        conn.connectionState !== MCPConnectionState.AUTHENTICATING
+      ) {
+        console.warn(
+          `[getServerTools] WARNING: Reading tools from connection ${id} in state "${conn.connectionState}". Tools may not be loaded yet.`
+        );
+      }
+    }
+
+    const tools: ServerTool[] = [];
+    for (const tool of getNamespacedData(connections, "tools")) {
+      try {
+        // Mirror the namespacing used by getAITools so callers that surface
+        // both surfaces side-by-side (e.g. observability) see identical keys.
+        const toolKey = `tool_${tool.serverId.replace(/-/g, "")}_${tool.name}`;
+        const inputSchema = tool.inputSchema
+          ? z.fromJSONSchema(
+              tool.inputSchema as Parameters<typeof z.fromJSONSchema>[0]
+            )
+          : z.fromJSONSchema({ type: "object" });
+
+        const serverTool = toolDefinition({
+          name: toolKey,
+          description: tool.description ?? "",
+          inputSchema
+        }).server(async (args: unknown) => {
+          const result = await this.callTool({
+            arguments: args as Record<string, unknown> | undefined,
+            name: tool.name,
+            serverId: tool.serverId
+          });
+          if (result.isError) {
+            const content = result.content as
+              | Array<{ type: string; text?: string }>
+              | undefined;
+            const textContent = content?.[0];
+            const message =
+              textContent?.type === "text" && textContent.text
+                ? textContent.text
+                : "Tool call failed";
+            throw new Error(message);
+          }
+          return result;
+        });
+        tools.push(serverTool);
+      } catch (e) {
+        console.warn(
+          `[getServerTools] Skipping tool "${tool.name}" from "${tool.serverId}": ${e}`
+        );
+      }
+    }
+    return tools;
   }
 
   /**

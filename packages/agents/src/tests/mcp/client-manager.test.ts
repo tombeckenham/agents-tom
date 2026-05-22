@@ -2594,6 +2594,199 @@ describe("MCPClientManager OAuth Integration", () => {
     });
   });
 
+  describe("getServerTools() integration", () => {
+    it("returns TanStack ServerTools that dispatch to callTool", async () => {
+      const id = "tanstack-server";
+      manager.registerServer(id, {
+        url: "http://example.com/mcp",
+        name: "TanStack MCP",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+
+      const conn = manager.mcpConnections[id];
+      conn.init = vi.fn().mockImplementation(async () => {
+        conn.connectionState = "ready";
+        conn.tools = [
+          {
+            name: "echo_tool",
+            description: "Echoes its input",
+            inputSchema: {
+              type: "object",
+              properties: {
+                message: { type: "string", description: "Text to echo" }
+              },
+              required: ["message"]
+            }
+          }
+        ];
+      });
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "echoed" }]
+      });
+
+      await manager.connectToServer(id);
+
+      const tools = manager.getServerTools();
+      expect(tools).toHaveLength(1);
+
+      const tool = tools[0];
+      expect(tool.name).toBe(`tool_${id.replace(/-/g, "")}_echo_tool`);
+      expect(tool.description).toBe("Echoes its input");
+      expect(tool.inputSchema).toBeDefined();
+      expect(tool.__toolSide).toBe("server");
+
+      const execute = tool.execute as (args: {
+        message: string;
+      }) => Promise<unknown>;
+      const result = await execute({ message: "hi" });
+      expect(result).toEqual({ content: [{ type: "text", text: "echoed" }] });
+      expect(conn.client.callTool).toHaveBeenCalledWith(
+        { name: "echo_tool", arguments: { message: "hi" } },
+        undefined,
+        undefined
+      );
+    });
+
+    it("aggregates tools from multiple servers", async () => {
+      manager.registerServer("server-a", {
+        url: "http://a.example.com/mcp",
+        name: "A",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+      const connA = manager.mcpConnections["server-a"];
+      connA.init = vi.fn().mockImplementation(async () => {
+        connA.connectionState = "ready";
+        connA.tools = [
+          {
+            name: "tool_a",
+            description: "Tool A",
+            inputSchema: { type: "object", properties: {} }
+          }
+        ];
+      });
+      connA.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "A" }]
+      });
+      await manager.connectToServer("server-a");
+
+      manager.registerServer("server-b", {
+        url: "http://b.example.com/mcp",
+        name: "B",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+      const connB = manager.mcpConnections["server-b"];
+      connB.init = vi.fn().mockImplementation(async () => {
+        connB.connectionState = "ready";
+        connB.tools = [
+          {
+            name: "tool_b",
+            description: "Tool B",
+            inputSchema: { type: "object", properties: {} }
+          }
+        ];
+      });
+      connB.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "B" }]
+      });
+      await manager.connectToServer("server-b");
+
+      const tools = manager.getServerTools();
+      const names = tools.map((t) => t.name).sort();
+      expect(names).toEqual(["tool_servera_tool_a", "tool_serverb_tool_b"]);
+    });
+
+    it("rethrows MCP tool errors with the text payload", async () => {
+      const id = "error-server";
+      manager.registerServer(id, {
+        url: "http://example.com/mcp",
+        name: "Error",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+      const conn = manager.mcpConnections[id];
+      conn.init = vi.fn().mockImplementation(async () => {
+        conn.connectionState = "ready";
+        conn.tools = [
+          {
+            name: "boom",
+            description: "Always fails",
+            inputSchema: { type: "object", properties: {} }
+          }
+        ];
+      });
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        isError: true,
+        content: [{ type: "text", text: "permission denied" }]
+      });
+      await manager.connectToServer(id);
+
+      const [tool] = manager.getServerTools();
+      const execute = tool.execute as (
+        args: Record<string, unknown>
+      ) => Promise<unknown>;
+      await expect(execute({})).rejects.toThrow("permission denied");
+    });
+
+    it("filters by serverId", async () => {
+      manager.registerServer("server-x", {
+        url: "http://x.example.com/mcp",
+        name: "X",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+      const connX = manager.mcpConnections["server-x"];
+      connX.init = vi.fn().mockImplementation(async () => {
+        connX.connectionState = "ready";
+        connX.tools = [
+          {
+            name: "x_tool",
+            description: "X tool",
+            inputSchema: { type: "object", properties: {} }
+          }
+        ];
+      });
+      connX.client.callTool = vi
+        .fn()
+        .mockResolvedValue({ content: [{ type: "text", text: "x" }] });
+      await manager.connectToServer("server-x");
+
+      manager.registerServer("server-y", {
+        url: "http://y.example.com/mcp",
+        name: "Y",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+      const connY = manager.mcpConnections["server-y"];
+      connY.init = vi.fn().mockImplementation(async () => {
+        connY.connectionState = "ready";
+        connY.tools = [
+          {
+            name: "y_tool",
+            description: "Y tool",
+            inputSchema: { type: "object", properties: {} }
+          }
+        ];
+      });
+      connY.client.callTool = vi
+        .fn()
+        .mockResolvedValue({ content: [{ type: "text", text: "y" }] });
+      await manager.connectToServer("server-y");
+
+      const filtered = manager.getServerTools({ serverId: "server-x" });
+      expect(filtered).toHaveLength(1);
+      expect(filtered[0].name).toBe("tool_serverx_x_tool");
+    });
+  });
+
   describe("clearAuthUrl()", () => {
     it("should clear auth_url after successful OAuth", async () => {
       const serverId = "oauth-server-clearauth";
