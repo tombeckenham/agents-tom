@@ -21,7 +21,7 @@ so the existing `AIChatAgent` keeps working until cutover.
 | 5     | `@cloudflare/ai-chat-vercel` adapter package                        | ✅ Done (4 test files, 44 tests)                                                             |
 | 6     | `@cloudflare/ai-chat-tanstack` adapter package                      | ✅ Done (3 test files, 17 tests) + `packages/agents/src/mcp/tanstack-ai.ts`                  |
 | —     | Sync with upstream `cloudflare/agents` main                         | ✅ Done — merged 245 commits (AI SDK v7, MCP SDK v2, npm → pnpm)                             |
-| 7     | Migrate examples and tests                                          | ⏸ Pending                                                                                    |
+| 7     | Examples + migration fixtures                                       | ✅ Done — two runnable examples, plus `toUIMessages` / `toModelMessages` and fixture tests   |
 
 ## Sidecar files landed
 
@@ -48,6 +48,33 @@ Plus the canonical class and the two adapter packages:
   `useChat` through a `stream()` connection adapter.
 - `packages/agents/src/mcp/tanstack-ai.ts` — `getServerTools()` off
   `MCPClientManager`, mirroring the `agents/browser/tanstack-ai.ts` pattern.
+
+## Inbound message projections
+
+Phase 7 surfaced a gap: `AGUIChatAgent.messages` is canonical AG-UI, but
+every adapter needs it in its own provider's input shape before it can call
+a model. Each adapter now owns that projection, and the asymmetry between
+them is the clearest evidence for the RFC's central claim.
+
+- `@cloudflare/ai-chat-vercel` → `toUIMessages(messages)`. Has real work to
+  do: AG-UI keeps tool results as standalone `role: "tool"` messages, while
+  `UIMessage` folds them onto the tool part of the assistant turn that
+  issued the call, matched by `toolCallId`.
+- `@cloudflare/ai-chat-tanstack` → `toModelMessages(messages)`. A field
+  rename and a role fold. TanStack's `ModelMessage` already carries
+  `role` / `content` / `toolCalls` / `toolCallId` with AG-UI's meanings, and
+  its `ContentPart` union is structurally identical to `AGUIInputContent`
+  apart from the text variant's field name.
+
+## Examples
+
+- `examples/agui-chat-vercel` — the `examples/ai-chat` agent on the AG-UI
+  path. Three changed lines on the server, one on the client.
+- `examples/agui-chat-tanstack` — the same agent via `@tanstack/ai`, where
+  the server-side projection disappears entirely.
+
+Both typecheck. Neither has been run end-to-end: they need a Workers AI
+binding, which the sandbox they were written in does not have.
 
 ## Format-agnostic primitives reused as-is
 
@@ -76,10 +103,10 @@ Measured after the upstream sync:
 
 | Suite            | Command                                                                              | Result                      |
 | ---------------- | ------------------------------------------------------------------------------------ | --------------------------- |
-| Chat sidecars    | `cd packages/agents && vitest run --config src/chat/__tests__/vitest.config.ts`      | 32 files, 597 tests passing |
+| Chat sidecars    | `cd packages/agents && vitest run --config src/chat/__tests__/vitest.config.ts`      | 33 files, 613 tests passing |
 | Agents (workers) | `cd packages/agents && vitest run --project workers`                                 | 90 files, 1745 tests        |
-| Vercel adapter   | `cd packages/ai-chat-vercel && vitest run --config src/__tests__/vitest.config.ts`   | 4 files, 44 tests passing   |
-| TanStack adapter | `cd packages/ai-chat-tanstack && vitest run --config src/__tests__/vitest.config.ts` | 3 files, 17 tests passing   |
+| Vercel adapter   | `cd packages/ai-chat-vercel && vitest run --config src/__tests__/vitest.config.ts`   | 5 files, 58 tests passing   |
+| TanStack adapter | `cd packages/ai-chat-tanstack && vitest run --config src/__tests__/vitest.config.ts` | 4 files, 27 tests passing   |
 
 Typecheck is clean across `agents`, `ai-chat`, `ai-chat-vercel` and
 `ai-chat-tanstack`. Note that `agents` must be built (`pnpm --filter agents
@@ -106,14 +133,20 @@ wall of spurious "Cannot find module" cascades.
 
 ## Open work — next session
 
-1. **Phase 7 — examples + tests**. Migrate `examples/playground` to the Vercel
-   adapter. Add a TanStack example. Validate the legacy-row migration against
-   representative fixtures.
-2. **Cutover planning**. Phases 1–6 are still strictly sidecar — nothing in the
-   existing `AIChatAgent` path has been modified. Decide when
+1. **Run the examples for real.** Both typecheck but neither has been
+   executed — they need a Workers AI binding. Until someone runs them, the
+   end-to-end claim (streaming, tool round trips, reconnect/resume) rests on
+   unit tests alone.
+2. **`examples/playground` is deliberately untouched.** The original Phase 7
+   brief said to migrate it, but converting the repo's flagship demo would
+   break the sidecar rule this branch has followed throughout, and would
+   remove the last in-repo proof that the legacy `AIChatAgent` path still
+   works. It belongs in the cutover step, not here.
+3. **Cutover planning**. Everything so far is strictly sidecar — nothing in
+   the existing `AIChatAgent` path has been modified. Decide when
    `AGUIChatAgent` becomes the default and what the deprecation window for
    `AIChatAgent` looks like.
-3. **Upstream drift**. Re-merge `cloudflare/agents` main periodically; the
+4. **Upstream drift**. Re-merge `cloudflare/agents` main periodically; the
    surface that actually collides is small (`packages/agents/package.json`
    exports, `scripts/build.ts` entries, `src/mcp/client.ts` imports).
 

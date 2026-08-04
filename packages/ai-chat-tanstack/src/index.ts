@@ -19,6 +19,8 @@ export {
   type OutgoingAGUIWireMessage
 } from "./types";
 
+export { toModelMessages } from "./to-model-messages";
+
 import type { AGUIEvent } from "agents/chat/agui-types";
 
 /**

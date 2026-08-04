@@ -31,6 +31,8 @@ export {
   type OutgoingAGUIWireMessage
 } from "./types";
 
+export { toUIMessages } from "./to-ui-messages";
+
 import {
   projectChunkStreamToAGUISSE,
   type ChunkToEventProjectorOptions
