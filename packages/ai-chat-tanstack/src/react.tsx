@@ -48,7 +48,13 @@ export {
   type WebSocketChatTransportOptions
 } from "./ws-chat-transport";
 
-export type UseAgentChatOptions = Omit<UseChatOptions, "connection"> & {
+// TanStack's `ChatTransport` is an exclusive union — supplying `connection`
+// requires `fetcher` to be absent. This adapter always drives the WebSocket
+// connection itself, so `fetcher` is omitted from the public surface too.
+export type UseAgentChatOptions = Omit<
+  UseChatOptions,
+  "connection" | "fetcher"
+> & {
   agent: AgentConnection & {
     agent?: string;
     name?: string;

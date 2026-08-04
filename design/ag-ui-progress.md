@@ -10,17 +10,18 @@ so the existing `AIChatAgent` keeps working until cutover.
 
 ## Status snapshot
 
-| Phase | What | Status |
-|---|---|---|
-| 1 | Discovery: map UIMessage/UIMessageChunk coupling | ✅ Done — `design/discovery-uimessage-coupling.md` |
-| 2 | Discovery: AG-UI type surface | ✅ Done — `design/discovery-agui-types.md` |
-| 2.5 | Implement `packages/agents/src/chat/agui-types.ts` | ✅ Done (694 LOC, typechecks clean) |
-| 3a | Sidecar refactors: builder, sanitize, reconciler, migration | ✅ Done (52 new tests) |
-| 3b | Sidecar refactors: stream-accumulator, agent-tools, broadcast-state | ✅ Done (291 chat tests passing) |
-| 4 | Canonical `AGUIChatAgent` class | 🟡 **In flight when laptop closed**. File written at `packages/agents/src/agui-chat-agent.ts` (~2400 LOC). Agent had not reported completion — tests not written, verification not run. |
-| 5 | `@cloudflare/ai-chat-vercel` adapter package | ⏸ Pending |
-| 6 | `@cloudflare/ai-chat-tanstack` adapter package | ⏸ Pending |
-| 7 | Migrate examples and tests | ⏸ Pending |
+| Phase | What                                                                | Status                                                                                       |
+| ----- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1     | Discovery: map UIMessage/UIMessageChunk coupling                    | ✅ Done — `design/discovery-uimessage-coupling.md`                                           |
+| 2     | Discovery: AG-UI type surface                                       | ✅ Done — `design/discovery-agui-types.md`                                                   |
+| 2.5   | Implement `packages/agents/src/chat/agui-types.ts`                  | ✅ Done (694 LOC, typechecks clean)                                                          |
+| 3a    | Sidecar refactors: builder, sanitize, reconciler, migration         | ✅ Done (52 new tests)                                                                       |
+| 3b    | Sidecar refactors: stream-accumulator, agent-tools, broadcast-state | ✅ Done                                                                                      |
+| 4     | Canonical `AGUIChatAgent` class                                     | ✅ Done — `packages/agents/src/agui-chat-agent.ts` + `src/__tests__/agui-chat-agent.test.ts` |
+| 5     | `@cloudflare/ai-chat-vercel` adapter package                        | ✅ Done (4 test files, 44 tests)                                                             |
+| 6     | `@cloudflare/ai-chat-tanstack` adapter package                      | ✅ Done (3 test files, 17 tests) + `packages/agents/src/mcp/tanstack-ai.ts`                  |
+| —     | Sync with upstream `cloudflare/agents` main                         | ✅ Done — merged 245 commits (AI SDK v7, MCP SDK v2, npm → pnpm)                             |
+| 7     | Migrate examples and tests                                          | ⏸ Pending                                                                                    |
 
 ## Sidecar files landed
 
@@ -35,9 +36,18 @@ All under `packages/agents/src/chat/`:
 - `agui-agent-tools.ts` + tests (7) — sub-agent forwarding reducer keyed by runId.
 - `agui-broadcast-state.ts` + tests (~7) — `aguiBroadcastTransition` state machine for broadcasting on new-connection joins.
 
-Plus in flight:
+Plus the canonical class and the two adapter packages:
 
-- `packages/agents/src/agui-chat-agent.ts` — the canonical class (untested when committed).
+- `packages/agents/src/agui-chat-agent.ts` — the canonical `AGUIChatAgent`,
+  with tests at `packages/agents/src/__tests__/agui-chat-agent.test.ts`.
+- `packages/ai-chat-vercel/` — `@cloudflare/ai-chat-vercel`. Server-side
+  `UIMessageChunk` ⇄ `AGUIEvent` projection plus a `WebSocketChatTransport`
+  and `useAgentChat` for `@ai-sdk/react`.
+- `packages/ai-chat-tanstack/` — `@cloudflare/ai-chat-tanstack`. Near-identity
+  server projection plus a `useAgentChat` wrapping `@tanstack/ai-react`'s
+  `useChat` through a `stream()` connection adapter.
+- `packages/agents/src/mcp/tanstack-ai.ts` — `getServerTools()` off
+  `MCPClientManager`, mirroring the `agents/browser/tanstack-ai.ts` pattern.
 
 ## Format-agnostic primitives reused as-is
 
@@ -56,24 +66,49 @@ Confirmed by Phase 1 coupling map: these need no changes.
 
 - **Vendor structural AG-UI types** in `agents` itself (Workers-friendly, zero runtime cost); depend on `@ag-ui/core` only in adapter packages.
 - **Persisted row shape = AG-UI `Message`** with top-level `_v: "v6_agui_message"` marker; legacy v5 `UIMessage` rows are detected and lazily migrated by `autoTransformAGUIMessages` on load.
-- **Wire body = AG-UI SSE** (camelCase JSON, exactly what `@ag-ui/encoder.encode()` produces). CF_AGENT_* envelope unchanged.
+- **Wire body = AG-UI SSE** (camelCase JSON, exactly what `@ag-ui/encoder.encode()` produces). `CF_AGENT_*` envelope unchanged.
 - **Tool approval** rides on `CUSTOM` events: `cf.agents.tool_approval.request` / `decision` / `expired`.
 - **Replay** keeps the raw event log; adds an optional `MESSAGES_SNAPSHOT` prefix on reconnect for efficiency.
 
 ## Test baseline
 
-`cd packages/agents && npx vitest run --config src/chat/__tests__/vitest.config.ts`:
-**18 test files, 291 tests passing.** Pre-AG-UI baseline was 210 tests in 11 files.
+Measured after the upstream sync:
+
+| Suite            | Command                                                                              | Result                      |
+| ---------------- | ------------------------------------------------------------------------------------ | --------------------------- |
+| Chat sidecars    | `cd packages/agents && vitest run --config src/chat/__tests__/vitest.config.ts`      | 32 files, 597 tests passing |
+| Agents (workers) | `cd packages/agents && vitest run --project workers`                                 | 90 files, 1745 tests        |
+| Vercel adapter   | `cd packages/ai-chat-vercel && vitest run --config src/__tests__/vitest.config.ts`   | 4 files, 44 tests passing   |
+| TanStack adapter | `cd packages/ai-chat-tanstack && vitest run --config src/__tests__/vitest.config.ts` | 3 files, 17 tests passing   |
+
+Typecheck is clean across `agents`, `ai-chat`, `ai-chat-vercel` and
+`ai-chat-tanstack`. Note that `agents` must be built (`pnpm --filter agents
+build`) before typechecking anything that self-imports `agents`, or you get a
+wall of spurious "Cannot find module" cascades.
+
+## Environment notes
+
+- The repo is on **pnpm** now, not npm. `agent-think` depends on a
+  `pkg.pr.new` preview build that some sandboxed networks block; if
+  `pnpm install` dies on it, scope the install with
+  `--filter "agents..." --filter "@cloudflare/ai-chat-vercel..."` etc.
+- Adapter peer ranges track upstream `@cloudflare/ai-chat`:
+  `ai@^6 || ^7`, `@ai-sdk/react@^3 || ^4`, `agents@>=0.17.1 <1.0.0`. The
+  TanStack adapter tracks the workspace pins: `@tanstack/ai@0.38.0`,
+  `ai-react@0.16.0`, `ai-client@0.19.0`.
 
 ## Open work — next session
 
-1. **Verify Phase 4 (`agui-chat-agent.ts`)**: run `bun tsgo --noEmit` from repo root and confirm no new type errors. If the file fails to compile, the simplest recovery is to delete it and re-spawn the Phase 4 agent (see prompt below) — the rest of the branch is independent.
-2. **Write Phase 4 tests**: the agent was supposed to also write `packages/agents/src/__tests__/agui-chat-agent.test.ts`. Check whether it exists; if not, spawn a follow-up agent to write tests covering: SQL setup, persistence with `_v` marker, legacy row migration on load, `_reply` with AG-UI SSE, chat-clear/cancel/resume wire handling, tool approval CUSTOM round-trip, auto-continuation.
-3. **Phase 5 — Vercel adapter** (`@cloudflare/ai-chat-vercel`). Goal: existing users flip one import and keep working. Two halves:
-   - Server: helper that wraps `streamText().toUIMessageStreamResponse()` and projects `UIMessageChunk` → `AGUIEvent` SSE so `AGUIChatAgent.onChatMessage` accepts it. Use the projection tables in `discovery-agui-types.md` §§ "UIMessageChunk → AG-UI Event".
-   - Client: `WebSocketChatTransport` that subscribes to AG-UI frames and projects to `UIMessageChunk` for `@ai-sdk/react`'s `useChat`. Mirror the existing `packages/ai-chat/src/ws-chat-transport.ts` structure but invert the direction. Plus a `useAgentChat` hook that preserves the current public API.
-4. **Phase 6 — TanStack adapter** (`@cloudflare/ai-chat-tanstack`). Server projection is near-identity (TanStack's `chat()` already emits AG-UI). Client: `useAgentChat` wrapping `@tanstack/ai-react`'s `useChat` with a `stream()` connection adapter backed by the WS frame parser. Plus `packages/agents/src/mcp/tanstack-ai.ts` exporting `getServerTools()` from `MCPClientManager` (mirror the existing `agents/browser/tanstack-ai.ts` pattern).
-5. **Phase 7 — examples + tests**. Migrate `examples/playground` to the Vercel adapter. Add a TanStack example. Validate the legacy-row migration against representative fixtures.
+1. **Phase 7 — examples + tests**. Migrate `examples/playground` to the Vercel
+   adapter. Add a TanStack example. Validate the legacy-row migration against
+   representative fixtures.
+2. **Cutover planning**. Phases 1–6 are still strictly sidecar — nothing in the
+   existing `AIChatAgent` path has been modified. Decide when
+   `AGUIChatAgent` becomes the default and what the deprecation window for
+   `AIChatAgent` looks like.
+3. **Upstream drift**. Re-merge `cloudflare/agents` main periodically; the
+   surface that actually collides is small (`packages/agents/package.json`
+   exports, `scripts/build.ts` entries, `src/mcp/client.ts` imports).
 
 ## Continuation prompt (paste into Claude Code on the next machine)
 
@@ -87,37 +122,20 @@ else, read these in order:
 3. design/discovery-uimessage-coupling.md (coupling map)
 4. design/discovery-agui-types.md (AG-UI type surface and projection tables)
 
-Phases 1-3 are complete (8 AG-UI sidecars under packages/agents/src/chat/
-plus agui-types.ts; 291 chat tests passing). Phase 4 (the canonical
-AGUIChatAgent class at packages/agents/src/agui-chat-agent.ts, ~2400 LOC)
-was mid-flight when committed - the file is on disk but was never
-verified or tested.
+Phases 1-6 are complete and the branch has been merged up to
+cloudflare/agents main (AI SDK v7, MCP SDK v2, npm -> pnpm). Everything
+typechecks and every suite listed under "Test baseline" passes.
 
-Your first job: verify Phase 4.
+Your first job: re-establish the baseline before changing anything.
 
   cd /path/to/agents-tom
   git status
+  pnpm install                     # see "Environment notes" if this fails
+  pnpm --filter agents build       # required before any typecheck
   bun tsgo --noEmit
-  cd packages/agents && npx vitest run --config src/chat/__tests__/vitest.config.ts
+  cd packages/agents && vitest run --config src/chat/__tests__/vitest.config.ts
 
-Confirm 291 chat tests still pass. Then check whether
-packages/agents/src/agui-chat-agent.ts compiles and whether
-packages/agents/src/__tests__/agui-chat-agent.test.ts exists.
-
-- If the file compiles and tests exist: run them, fix any failures.
-- If the file compiles but no tests exist: spawn a backend-engineer agent
-  to write tests covering: SQL setup, persistence with _v marker, legacy
-  v5 row migration on load, _reply with AG-UI SSE, chat-clear/cancel/resume
-  wire handling, tool approval CUSTOM round-trip, auto-continuation.
-- If the file does NOT compile: delete it and re-spawn the Phase 4 agent
-  using the brief from this conversation (the previous agent's prompt is
-  in the git history of design/ag-ui-progress.md if you need it, but the
-  shorter spec is: extend Agent directly, no `ai` package dep, use only
-  agui-* primitives from packages/agents/src/chat/, sidecar to the
-  existing AIChatAgent, preserve all CF_AGENT_* wire envelope handling).
-
-Once Phase 4 is green, continue with Phase 5 (Vercel adapter package).
-See `Open work — next session` in this file for the brief.
+Then continue with Phase 7 - see "Open work - next session" above.
 
 Conventions to keep:
 - No `any`. No fallback code that hides errors. No comments explaining

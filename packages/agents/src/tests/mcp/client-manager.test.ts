@@ -3640,7 +3640,6 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(result).toEqual({ content: [{ type: "text", text: "echoed" }] });
       expect(conn.client.callTool).toHaveBeenCalledWith(
         { name: "echo_tool", arguments: { message: "hi" } },
-        undefined,
         undefined
       );
     });

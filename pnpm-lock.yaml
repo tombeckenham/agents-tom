@@ -3982,6 +3982,59 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
 
+  packages/ai-chat-tanstack:
+    dependencies:
+      agents:
+        specifier: '>=0.17.1 <1.0.0'
+        version: link:../agents
+      nanoid:
+        specifier: ^5.1.11
+        version: 5.1.16
+    devDependencies:
+      '@tanstack/ai':
+        specifier: 0.38.0
+        version: 0.38.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai-client':
+        specifier: 0.19.0
+        version: 0.19.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai-react':
+        specifier: 0.16.0
+        version: 0.16.0(@opentelemetry/api@1.9.1)(@tanstack/ai@0.38.0(@opentelemetry/api@1.9.1))(@types/react@19.2.17)(react@19.2.7)
+      '@types/react':
+        specifier: ^19.2.14
+        version: 19.2.17
+      react:
+        specifier: ^19.2.6
+        version: 19.2.7
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+
+  packages/ai-chat-vercel:
+    dependencies:
+      '@ai-sdk/react':
+        specifier: ^3.0.0 || ^4.0.0
+        version: 4.0.19(react@19.2.7)(zod@4.4.3)
+      agents:
+        specifier: '>=0.17.1 <1.0.0'
+        version: link:../agents
+      nanoid:
+        specifier: ^5.1.11
+        version: 5.1.16
+    devDependencies:
+      '@types/react':
+        specifier: ^19.2.14
+        version: 19.2.17
+      ai:
+        specifier: ^7.0.0
+        version: 7.0.18(zod@4.4.3)
+      react:
+        specifier: ^19.2.6
+        version: 19.2.7
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+
   packages/codemode:
     dependencies:
       '@types/json-schema':
