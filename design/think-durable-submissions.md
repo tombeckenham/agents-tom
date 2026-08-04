@@ -10,8 +10,8 @@ Related:
 - [think.md](./think.md) — overall Think architecture
 - [think-sessions.md](./think-sessions.md) — Session-backed message storage
 - [docs/think/programmatic-submissions.md](../docs/think/programmatic-submissions.md) — user-facing API guide
-- [server-driven-messages.md](../docs/server-driven-messages.md) — lighter-weight server message patterns
-- [workflows.md](../docs/workflows.md) — durable multi-step orchestration
+- [server-driven-messages.md](../docs/agents/server-driven-messages.md) — lighter-weight server message patterns
+- [workflows.md](../docs/agents/workflows.md) — durable multi-step orchestration
 
 ## Problem
 
@@ -160,10 +160,13 @@ avoid unsafe replay:
 
 1. `submitMessages()` serializes and sanitizes the messages, inserts a
    `pending` row, emits `submission:create`, emits the initial `pending` status,
-   schedules an idempotent `_drainThinkSubmissions` alarm, and starts an
-   in-memory drain.
-2. `_drainSubmissions()` claims the oldest `pending` row by conditionally
-   updating it to `running`.
+   and schedules an idempotent `_drainThinkSubmissions` alarm. It does not start
+   model work inside the short acceptance invocation.
+2. The awaited `_drainThinkSubmissions` alarm owns `_drainSubmissions()`, which
+   claims the oldest `pending` row by conditionally updating it to `running`.
+   Keeping execution inside that alarm invocation also gives tracing spans the
+   correct lifecycle owner; no `invoke_agent` span crosses an invocation
+   boundary.
 3. `_runSubmission()` calls the same programmatic turn path used by
    `saveMessages()`, with the submission id as the request id.
 4. `_runProgrammaticMessagesTurn()` appends submitted messages to Session,

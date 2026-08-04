@@ -14,6 +14,17 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sawActiveResponseError(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls.some((args) =>
+    args.some((arg) =>
+      arg instanceof Error
+        ? arg.message.includes("Cannot read properties of undefined")
+        : typeof arg === "string" &&
+          arg.includes("Cannot read properties of undefined")
+    )
+  );
+}
+
 function createAgent({
   name,
   url,
@@ -1440,6 +1451,61 @@ describe("useAgentChat setMessages", () => {
     expect(lastSent.messages.length).toBe(1);
     expect(lastSent.messages[0].id).toBe("arr-1");
   });
+
+  it("should keep setMessages local when server sync is disabled", async () => {
+    const sentMessages: string[] = [];
+    const agent = createAgent({
+      name: "set-messages-local-test",
+      url: "ws://localhost:3000/agents/chat/set-messages-local-test?_pk=abc",
+      send: (data: string) => sentMessages.push(data)
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        syncMessagesToServer: false
+      });
+      chatInstance = chat;
+      return <div data-testid="messages-count">{chat.messages.length}</div>;
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    await act(async () => {
+      chatInstance!.setMessages([
+        {
+          id: "local-1",
+          role: "user",
+          parts: [{ type: "text", text: "Local only" }]
+        }
+      ]);
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("messages-count"))
+      .toHaveTextContent("1");
+
+    const chatMessagesSent = sentMessages
+      .map((m) => JSON.parse(m))
+      .filter((m) => m.type === "cf_agent_chat_messages");
+
+    expect(chatMessagesSent).toHaveLength(0);
+  });
 });
 
 describe("useAgentChat clearHistory", () => {
@@ -2163,6 +2229,290 @@ describe("useAgentChat tool continuation status (issue #1157)", () => {
     await expect
       .element(screen.getByTestId("status"))
       .toHaveTextContent("ready");
+  });
+
+  it("surfaces isRecovering from CF_AGENT_CHAT_RECOVERING, cleared on resolve (#1620)", async () => {
+    const { agent, target } = createAgentWithTarget({
+      name: "recovering-status",
+      url: "ws://localhost:3000/agents/chat/recovering-status?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: () => Promise.resolve([]),
+        resume: false
+      });
+      return <div data-testid="recovering">{String(chat.isRecovering)}</div>;
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(50);
+      return screen;
+    });
+
+    await expect
+      .element(screen.getByTestId("recovering"))
+      .toHaveTextContent("false");
+
+    // Server reports the turn is being recovered → the hook surfaces it.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_chat_recovering",
+        recovering: true,
+        id: "root-1"
+      });
+      await sleep(10);
+    });
+    await expect
+      .element(screen.getByTestId("recovering"))
+      .toHaveTextContent("true");
+
+    // Recovery resolves → cleared (so a "recovering…" indicator can't stick).
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_chat_recovering",
+        recovering: false,
+        id: "root-1"
+      });
+      await sleep(10);
+    });
+    await expect
+      .element(screen.getByTestId("recovering"))
+      .toHaveTextContent("false");
+  });
+
+  it("defers tool continuation resume until the active request settles", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "tool-cont-single-flight",
+      url: "ws://localhost:3000/agents/chat/tool-cont-single-flight?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+    let sendPromise: Promise<void> | undefined;
+
+    const sentTypes = () =>
+      sentMessages.map((message) => JSON.parse(message).type as string);
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false,
+        onToolCall: ({ toolCall, addToolOutput }) => {
+          addToolOutput({
+            toolCallId: toolCall.toolCallId,
+            output: { lat: 51.5, lng: -0.1 }
+          });
+        }
+      });
+      chatInstance = chat;
+      return <div data-testid="status">{chat.status}</div>;
+    };
+
+    await act(async () => {
+      render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+    });
+
+    await act(async () => {
+      sendPromise = chatInstance!.sendMessage({ text: "Where am I?" });
+      await sleep(10);
+    });
+
+    const request = sentMessages
+      .map((message) => JSON.parse(message))
+      .find((message) => message.type === "cf_agent_use_chat_request");
+    expect(request).toBeDefined();
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: request.id,
+        body: JSON.stringify({
+          type: "tool-input-available",
+          toolCallId: "tc-single-flight",
+          toolName: "getLocation",
+          input: { city: "London" }
+        }),
+        done: false
+      });
+      await sleep(20);
+    });
+
+    expect(sentTypes()).toContain("cf_agent_tool_result");
+    expect(sentTypes()).not.toContain("cf_agent_stream_resume_request");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: request.id,
+        body: "",
+        done: true
+      });
+      await sendPromise;
+      await sleep(20);
+    });
+
+    expect(sentTypes()).toContain("cf_agent_stream_resume_request");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "server-cont-single-flight"
+      });
+      await sleep(5);
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "server-cont-single-flight",
+        continuation: true,
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+
+    expect(sawActiveResponseError(consoleErrorSpy)).toBe(false);
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("uses the fallback path for early tool continuation announcements", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "tool-cont-early-resuming",
+      url: "ws://localhost:3000/agents/chat/tool-cont-early-resuming?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+    let sendPromise: Promise<void> | undefined;
+
+    const sentTypes = () =>
+      sentMessages.map((message) => JSON.parse(message).type as string);
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false,
+        onToolCall: ({ toolCall, addToolOutput }) => {
+          addToolOutput({
+            toolCallId: toolCall.toolCallId,
+            output: { lat: 51.5, lng: -0.1 }
+          });
+        }
+      });
+      chatInstance = chat;
+      return (
+        <div>
+          <div data-testid="status">{chat.status}</div>
+          <div data-testid="isToolContinuation">
+            {String(chat.isToolContinuation)}
+          </div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    await act(async () => {
+      sendPromise = chatInstance!.sendMessage({ text: "Where am I?" });
+      await sleep(10);
+    });
+
+    const request = sentMessages
+      .map((message) => JSON.parse(message))
+      .find((message) => message.type === "cf_agent_use_chat_request");
+    expect(request).toBeDefined();
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: request.id,
+        body: JSON.stringify({
+          type: "tool-input-available",
+          toolCallId: "tc-early-resume",
+          toolName: "getLocation",
+          input: { city: "London" }
+        }),
+        done: false
+      });
+      await sleep(20);
+    });
+
+    expect(sentTypes()).toContain("cf_agent_tool_result");
+    expect(sentTypes()).not.toContain("cf_agent_stream_resume_request");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "server-cont-early"
+      });
+      await sleep(5);
+    });
+
+    expect(sentTypes()).toContain("cf_agent_stream_resume_ack");
+    expect(sentTypes()).not.toContain("cf_agent_stream_resume_request");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: request.id,
+        body: "",
+        done: true
+      });
+      await sendPromise;
+      await sleep(20);
+    });
+
+    expect(sentTypes()).not.toContain("cf_agent_stream_resume_request");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "server-cont-early",
+        continuation: true,
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("isToolContinuation"))
+      .toHaveTextContent("false");
+
+    expect(sawActiveResponseError(consoleErrorSpy)).toBe(false);
+    consoleErrorSpy.mockRestore();
   });
 
   it("should use transport-owned status for approval continuations", async () => {
@@ -4019,6 +4369,289 @@ describe("useAgentChat isServerStreaming / isStreaming (issue #1226)", () => {
       .toHaveTextContent("false");
   });
 
+  it("ACKs a duplicate CF_AGENT_STREAM_RESUMING only once per socket (#1733)", async () => {
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "double-resuming-dedupe",
+      url: "ws://localhost:3000/agents/chat/double-resuming-dedupe?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      return (
+        <div data-testid="isServerStreaming">
+          {String(chat.isServerStreaming)}
+        </div>
+      );
+    };
+
+    await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Settle the transport's initial resume attempt so the RESUMING frames
+    // below take the fallback path (the one that ACKs directly).
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resume_none" });
+      await sleep(10);
+    });
+
+    const ackCount = (id: string) =>
+      sentMessages.filter((m) => {
+        try {
+          const parsed = JSON.parse(m);
+          return (
+            parsed.type === "cf_agent_stream_resume_ack" && parsed.id === id
+          );
+        } catch {
+          return false;
+        }
+      }).length;
+
+    // The server notifies the same request from both onConnect and the
+    // RESUME_REQUEST handler — back to back, before any replay chunk.
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resuming", id: "req-dup" });
+      dispatch(target, { type: "cf_agent_stream_resuming", id: "req-dup" });
+      await sleep(10);
+    });
+
+    // Exactly ONE ACK — the duplicate offer must not trigger a second replay.
+    expect(ackCount("req-dup")).toBe(1);
+
+    // After the socket closes and reconnects, the server's fresh offer for
+    // the (still active) stream must be ACKed again — the dedupe is
+    // per-socket, not per-session.
+    await act(async () => {
+      target.dispatchEvent(new Event("close"));
+      await sleep(10);
+      dispatch(target, { type: "cf_agent_stream_resuming", id: "req-dup" });
+      await sleep(10);
+    });
+
+    expect(ackCount("req-dup")).toBe(2);
+  });
+
+  it("still hands a repeated offer to a waiting transport resolver after a fallback ACK (handoff)", async () => {
+    // A fallback-observed stream must still be able to become
+    // transport-owned: when resumeStream() is waiting on the handshake, a
+    // repeated STREAM_RESUMING for the already-ACKed id goes to the
+    // transport (which ACKs again — its replay is isolated from the
+    // broadcast accumulator), instead of being dropped by the #1733 dedupe.
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "fallback-then-transport-handoff",
+      url: "ws://localhost:3000/agents/chat/fallback-then-transport-handoff?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      chatInstance = chat;
+      return (
+        <div data-testid="isServerStreaming">
+          {String(chat.isServerStreaming)}
+        </div>
+      );
+    };
+
+    await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resume_none" });
+      await sleep(10);
+    });
+
+    const ackCount = (id: string) =>
+      sentMessages.filter((m) => {
+        try {
+          const parsed = JSON.parse(m);
+          return (
+            parsed.type === "cf_agent_stream_resume_ack" && parsed.id === id
+          );
+        } catch {
+          return false;
+        }
+      }).length;
+
+    // Fallback-observe the stream (first ACK).
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "req-handoff"
+      });
+      await sleep(10);
+    });
+    expect(ackCount("req-handoff")).toBe(1);
+
+    // While the transport is awaiting the handshake, the repeated offer is
+    // handed to it rather than deduped — second ACK comes from the
+    // transport resolver.
+    await act(async () => {
+      void chatInstance!.resumeStream();
+      await sleep(10);
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "req-handoff"
+      });
+      await sleep(10);
+    });
+    expect(ackCount("req-handoff")).toBe(2);
+  });
+
+  it("does not duplicate text parts when the stream buffer is replayed twice (#1733)", async () => {
+    // Simulates a server (or ordering) that replays the full chunk buffer
+    // twice for the same request. Every replayed `start` must rebuild the
+    // message from scratch instead of stacking a second step/text part.
+    const { agent, target } = createAgentWithTarget({
+      name: "double-replay-idempotent",
+      url: "ws://localhost:3000/agents/chat/double-replay-idempotent?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      const assistantMsg = chat.messages.find(
+        (m: UIMessage) => m.role === "assistant"
+      );
+      const textParts =
+        assistantMsg?.parts.filter(
+          (p: UIMessage["parts"][number]) => p.type === "text"
+        ) ?? [];
+      return (
+        <div>
+          <div data-testid="count">{chat.messages.length}</div>
+          <div data-testid="textPartCount">{textParts.length}</div>
+          <div data-testid="text">
+            {(textParts[textParts.length - 1] as { text?: string })?.text ?? ""}
+          </div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resume_none" });
+      await sleep(10);
+    });
+
+    // Fallback-observe the stream.
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resuming", id: "req-replay" });
+      await sleep(10);
+    });
+
+    const replayBuffer = (deltas: string[]) => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-replay",
+        body: '{"type":"start","messageId":"m-replay"}',
+        done: false,
+        replay: true
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-replay",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false,
+        replay: true
+      });
+      for (const delta of deltas) {
+        dispatch(target, {
+          type: "cf_agent_use_chat_response",
+          id: "req-replay",
+          body: JSON.stringify({ type: "text-delta", id: "t1", delta }),
+          done: false,
+          replay: true
+        });
+      }
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-replay",
+        body: "",
+        done: false,
+        replay: true,
+        replayComplete: true
+      });
+    };
+
+    // First replay pass.
+    await act(async () => {
+      replayBuffer(["Hello"]);
+      await sleep(10);
+    });
+
+    // Second replay pass of the same (now longer) buffer.
+    await act(async () => {
+      replayBuffer(["Hello", " world"]);
+      await sleep(10);
+    });
+
+    // Live tail + completion.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-replay",
+        body: '{"type":"text-delta","id":"t1","delta":"!"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-replay",
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("textPartCount"))
+      .toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("text"))
+      .toHaveTextContent("Hello world!");
+  });
+
   it("isServerStreaming resets when a fallback-observed stream later becomes transport-owned", async () => {
     const { agent, target } = createAgentWithTarget({
       name: "server-stream-fallback-to-transport",
@@ -4488,6 +5121,91 @@ describe("useAgentChat isServerStreaming / isStreaming (issue #1226)", () => {
     await expect
       .element(screen.getByTestId("isServerStreaming"))
       .toHaveTextContent("false");
+    await expect
+      .element(screen.getByTestId("isStreaming"))
+      .toHaveTextContent("false");
+  });
+});
+
+// Issue #1614: Previously, we derived "isStreaming" from the presence of
+// an input-available message part, and a definition of `onToolCall`. This caused
+// a problem because a server-side MCP tool call could remain in input-available
+// after an abort/reconnect, and if onToolCall was defined, the app would appear
+// to stay busy even though no client work was pending.
+describe("useAgentChat isStreaming with stale server-side (MCP) tool calls (issue #1614)", () => {
+  it("does not stay busy for a stale server-side tool call that onToolCall does not handle", async () => {
+    const agent = createAgent({
+      name: "mcp-tool-abort",
+      url: "ws://localhost:3000/agents/chat/mcp-tool-abort?_pk=abc",
+      send: () => {}
+    });
+
+    // A tool call the model made that is fulfilled SERVER-SIDE (e.g. via MCP).
+    // It sits in input-available while the server runs it.
+    const initialMessages: UIMessage[] = [
+      {
+        id: "msg-mcp-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-searchDatabase",
+            toolCallId: "mcp-call-1",
+            state: "input-available",
+            input: { query: "SELECT 1" }
+          }
+        ]
+      }
+    ];
+
+    // The app defines onToolCall for its OWN client tools (here, getLocation).
+    // It deliberately does not handle searchDatabase — that's the server's job.
+    const onToolCall = vi.fn(
+      async ({
+        toolCall,
+        addToolOutput
+      }: {
+        toolCall: { toolName: string; toolCallId: string };
+        addToolOutput: (r: { toolCallId: string; output: unknown }) => void;
+      }) => {
+        if (toolCall.toolName === "getLocation") {
+          addToolOutput({
+            toolCallId: toolCall.toolCallId,
+            output: { lat: 51.5, lng: -0.1 }
+          });
+        }
+        // searchDatabase (MCP) is intentionally not handled here.
+      }
+    );
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: () => Promise.resolve(initialMessages),
+        onToolCall
+      });
+      return (
+        <div>
+          <div data-testid="isStreaming">{String(chat.isStreaming)}</div>
+          <div data-testid="status">{chat.status}</div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(50);
+      return screen;
+    });
+
+    // A persisted server-side tool part by itself does not prove anything is
+    // still running after abort/reload. Without an active server stream or a
+    // pending client tool callback, the hook must not stay busy forever.
     await expect
       .element(screen.getByTestId("isStreaming"))
       .toHaveTextContent("false");
@@ -5137,6 +5855,268 @@ describe("useAgentChat overlapping submits (issue #1231)", () => {
       .toHaveTextContent("user,assistant,user,user");
   });
 
+  it("preserves a single-turn streamed assistant when a stale broadcast lands mid-stream", async () => {
+    // Regression: the originating tab rendered a turn's parts, then a
+    // mid-stream full-list broadcast (`cf_agent_chat_messages` — Think emits
+    // one after every tool result) replaced the live-streamed assistant with a
+    // behind-the-stream server snapshot, so its parts briefly vanished. Unlike
+    // the "multiple broadcasts" test above there is NO second submit here, so
+    // the ONLY thing that can arm streaming protection for this turn is the
+    // `start` chunk's messageId. Without that re-arm this clobbers.
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "single-turn-clobber",
+      url: "ws://localhost:3000/agents/chat/single-turn-clobber?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false
+      });
+      chatInstance = chat;
+
+      const assistantMessages = chat.messages.filter(
+        (m) => m.role === "assistant"
+      );
+      const firstAssistantText = assistantMessages[0]?.parts.find(
+        (p) => p.type === "text"
+      ) as { text?: string } | undefined;
+
+      return (
+        <div>
+          <div data-testid="assistant-count">{assistantMessages.length}</div>
+          <div data-testid="first-assistant-text">
+            {firstAssistantText?.text ?? ""}
+          </div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    let req!: Promise<unknown>;
+    await act(async () => {
+      req = chatInstance!.sendMessage({ text: "A" });
+      await sleep(10);
+    });
+
+    const reqId = sentMessages
+      .map((m) => JSON.parse(m) as Record<string, unknown>)
+      .find((m) => m.type === "cf_agent_use_chat_request")?.id;
+    expect(reqId).toBeTruthy();
+
+    // Stream a new (non-continuation) turn: the `start` chunk carries the
+    // server-allocated id (the message-id alignment fix), then partial text.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"start","messageId":"assistant-1"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"text-start","id":"t1"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"text-delta","id":"t1","delta":"One"}',
+        done: false
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One");
+
+    // Stale full-list broadcast: the assistant exists server-side but has no
+    // parts yet (the live stream is ahead). Must NOT clobber the live text.
+    const user1 = chatInstance!.messages.find((m) => m.role === "user")!;
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_chat_messages",
+        messages: [user1, { id: "assistant-1", role: "assistant", parts: [] }]
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("assistant-count"))
+      .toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One");
+
+    // Streaming resumes and appends to the SAME message.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"text-delta","id":"t1","delta":" two"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+    await act(async () => {
+      await req;
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("assistant-count"))
+      .toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One two");
+  });
+
+  it("preserves an OBSERVED (cross-tab) streamed assistant when a stale broadcast lands mid-stream", async () => {
+    // Cross-tab variant of the single-turn case: this tab never sends the
+    // request, so it builds the in-flight assistant via the broadcast
+    // accumulator (the request id is not in `localRequestIdsRef`). A stale
+    // `cf_agent_chat_messages` snapshot must not wipe the observed parts.
+    const { agent, target } = createAgentWithTarget({
+      name: "observer-clobber",
+      url: "ws://localhost:3000/agents/chat/observer-clobber?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false
+      });
+
+      const assistantMessages = chat.messages.filter(
+        (m) => m.role === "assistant"
+      );
+      const firstAssistantText = assistantMessages[0]?.parts.find(
+        (p) => p.type === "text"
+      ) as { text?: string } | undefined;
+
+      return (
+        <div>
+          <div data-testid="assistant-count">{assistantMessages.length}</div>
+          <div data-testid="role-order">
+            {chat.messages.map((m) => m.role).join(",")}
+          </div>
+          <div data-testid="first-assistant-text">
+            {firstAssistantText?.text ?? ""}
+          </div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Observe a stream owned by another tab: the start chunk carries the
+    // server id, then partial text.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-from-other-tab",
+        body: '{"type":"start","messageId":"obs-assistant"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-from-other-tab",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-from-other-tab",
+        body: '{"type":"text-delta","id":"t1","delta":"One"}',
+        done: false
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One");
+
+    // Stale full-list snapshot: the assistant exists server-side but with no
+    // parts yet. Must NOT clobber the observed text.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_chat_messages",
+        messages: [
+          { id: "u1", role: "user", parts: [{ type: "text", text: "Hi" }] },
+          { id: "obs-assistant", role: "assistant", parts: [] }
+        ]
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("assistant-count"))
+      .toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One");
+
+    // Stream resumes and appends to the SAME observed message.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-from-other-tab",
+        body: '{"type":"text-delta","id":"t1","delta":" two"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-from-other-tab",
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("assistant-count"))
+      .toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("first-assistant-text"))
+      .toHaveTextContent("One two");
+  });
+
   it("clears protection when CF_AGENT_CHAT_CLEAR arrives mid-stream", async () => {
     const { agent, target, sentMessages } = createAgentWithTarget({
       name: "clear-mid-stream",
@@ -5560,5 +6540,303 @@ describe("useAgentChat overlapping submits (issue #1231)", () => {
     await expect
       .element(screen.getByTestId("role-order"))
       .toHaveTextContent("user,user");
+  });
+
+  it("does not reorder a terminal snapshot that already has a later assistant (#1778)", async () => {
+    // Think HITL denial flow: the streaming assistant emits a tool that needs
+    // approval, so the turn pauses WITHOUT a `done` chunk and protection stays
+    // armed to that assistant. The user denies, and the server persists the
+    // denied tool message then appends a follow-up assistant response. Think
+    // broadcasts the full authoritative `cf_agent_chat_messages` snapshot
+    // (user, assistant-with-denied-tool, assistant-terminal-response). The
+    // protected-tail merge must NOT move the denied assistant to the end.
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "terminal-snapshot-order",
+      url: "ws://localhost:3000/agents/chat/terminal-snapshot-order?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false
+      });
+      chatInstance = chat;
+
+      return (
+        <div>
+          <div data-testid="role-order">
+            {chat.messages.map((m) => m.role).join(",")}
+          </div>
+          <div data-testid="ids">
+            {chat.messages.map((m) => m.id).join(",")}
+          </div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    await act(async () => {
+      chatInstance!.sendMessage({ text: "delete everything" });
+      await sleep(10);
+    });
+
+    const reqId = sentMessages
+      .map((m) => JSON.parse(m) as Record<string, unknown>)
+      .find((m) => m.type === "cf_agent_use_chat_request")?.id;
+
+    // Stream the assistant that carries the tool requiring approval. The turn
+    // pauses for the approval, so there is intentionally NO `done` chunk here —
+    // protection remains armed to `assistant-denied`.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"start","messageId":"assistant-denied"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"text-start","id":"t1"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: reqId,
+        body: '{"type":"text-delta","id":"t1","delta":"About to run a dangerous tool"}',
+        done: false
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("role-order"))
+      .toHaveTextContent("user,assistant");
+
+    const user1 = chatInstance!.messages.find((m) => m.role === "user")!;
+
+    // Authoritative snapshot after the user denies: the denied assistant is
+    // followed by a NEW terminal assistant explaining the denial.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_chat_messages",
+        messages: [
+          user1,
+          {
+            id: "assistant-denied",
+            role: "assistant",
+            parts: [
+              {
+                type: "tool-runDangerousThing",
+                toolCallId: "tc-1",
+                state: "output-error",
+                input: { command: "rm -rf /" },
+                errorText: "Denied by user"
+              }
+            ]
+          },
+          {
+            id: "assistant-terminal",
+            role: "assistant",
+            parts: [{ type: "text", text: "I won't run that — it was denied." }]
+          }
+        ]
+      });
+      await sleep(10);
+    });
+
+    // The transcript order must match the authoritative snapshot exactly, NOT
+    // move the protected (denied) assistant to the tail.
+    await expect
+      .element(screen.getByTestId("role-order"))
+      .toHaveTextContent("user,assistant,assistant");
+    await expect
+      .element(screen.getByTestId("ids"))
+      .toHaveTextContent(`${user1.id},assistant-denied,assistant-terminal`);
+  });
+});
+
+describe("useAgentChat transparent reconnect re-probe (#1784)", () => {
+  function createAgentWithTarget({ name, url }: { name: string; url: string }) {
+    const target = new EventTarget();
+    const sentMessages: string[] = [];
+    const agent = createAgent({
+      name,
+      url,
+      send: (data: string) => sentMessages.push(data)
+    });
+    (agent as unknown as Record<string, unknown>).addEventListener =
+      target.addEventListener.bind(target);
+    (agent as unknown as Record<string, unknown>).removeEventListener =
+      target.removeEventListener.bind(target);
+    return { agent, target, sentMessages };
+  }
+
+  function dispatch(target: EventTarget, data: Record<string, unknown>) {
+    target.dispatchEvent(
+      new MessageEvent("message", { data: JSON.stringify(data) })
+    );
+  }
+
+  const RESUME_REQUEST = "cf_agent_stream_resume_request";
+
+  it("re-probes on a close-to-open transition, but not a bare initial open", async () => {
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "reconnect-reprobe",
+      url: "ws://localhost:3000/agents/chat/reconnect-reprobe?_pk=abc"
+    });
+
+    const resumeRequests = () =>
+      sentMessages.filter(
+        (m) => (JSON.parse(m) as { type?: string }).type === RESUME_REQUEST
+      ).length;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: true
+      });
+      return <div data-testid="status">{chat.status}</div>;
+    };
+
+    await act(async () => {
+      render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(20);
+    });
+
+    // Settle any mount-time resume probe so the transport is no longer awaiting.
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resume_none",
+        reason: "idle"
+      });
+      await sleep(20);
+    });
+
+    const baseline = resumeRequests();
+
+    // A bare open with no observed close is the initial connect — no re-probe.
+    await act(async () => {
+      target.dispatchEvent(new Event("open"));
+      await sleep(20);
+    });
+    expect(resumeRequests()).toBe(baseline);
+
+    // A close→open is a transparent reconnect (e.g. 1006) that does NOT
+    // remount the component → the hook must re-probe so AI SDK status recovers.
+    await act(async () => {
+      target.dispatchEvent(new Event("close"));
+      target.dispatchEvent(new Event("open"));
+      await sleep(20);
+    });
+    expect(resumeRequests()).toBe(baseline + 1);
+  });
+
+  it("keeps the resume probe alive on STREAM_PENDING and still resolves a later STREAM_RESUMING", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { agent, target, sentMessages } = createAgentWithTarget({
+      name: "stream-pending-keepalive",
+      url: "ws://localhost:3000/agents/chat/stream-pending-keepalive?_pk=abc"
+    });
+
+    const sentTypes = () =>
+      sentMessages.map((m) => (JSON.parse(m) as { type?: string }).type);
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: true
+      });
+      return <div data-testid="status">{chat.status}</div>;
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(20);
+      return screen;
+    });
+
+    // Server says "accepted, not streaming yet" — the probe must NOT resolve to
+    // "no stream" and must keep waiting.
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_pending", id: "pending-1" });
+      await sleep(20);
+    });
+    // A pending frame must not produce an ACK or a RESUME_NONE-driven teardown.
+    expect(sentTypes()).not.toContain("cf_agent_stream_resume_ack");
+
+    // The stream finally starts; the still-open probe resolves into the normal
+    // resume handshake (ACK + replay).
+    await act(async () => {
+      dispatch(target, { type: "cf_agent_stream_resuming", id: "pending-1" });
+      await sleep(10);
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "pending-1",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "pending-1",
+        body: '{"type":"text-delta","id":"t1","delta":"Hello"}',
+        done: false
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("status"))
+      .toHaveTextContent("streaming");
+    expect(sentTypes()).toContain("cf_agent_stream_resume_ack");
+
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "pending-1",
+        body: "",
+        done: true
+      });
+      await sleep(10);
+    });
+
+    await expect
+      .element(screen.getByTestId("status"))
+      .toHaveTextContent("ready");
+    expect(sawActiveResponseError(consoleErrorSpy)).toBe(false);
+    consoleErrorSpy.mockRestore();
   });
 });

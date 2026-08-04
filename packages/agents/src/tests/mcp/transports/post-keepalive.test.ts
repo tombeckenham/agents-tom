@@ -1,41 +1,70 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import type {
+  EventId,
+  EventStore,
+  StreamId
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  LATEST_PROTOCOL_VERSION,
+  type JSONRPCMessage
+} from "@modelcontextprotocol/sdk/types.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import {
   WorkerTransport,
   type WorkerTransportOptions
 } from "../../../mcp/worker-transport";
-import { z } from "zod";
 
 /**
- * Tests for keepalive pings on both GET and POST SSE response streams.
- *
- * Both the GET and POST SSE handlers should set up a 30-second keepalive
- * interval that writes "event: ping" to prevent proxies and infrastructure
- * from closing idle connections during long-running operations.
+ * Regression tests for cloudflare/agents#1583 and the SDK v1.30 keepalive
+ * delegation. WorkerTransport must not add another timer around the SDK
+ * transport. Every SDK-owned SSE stream gets exactly one comment-frame
+ * keepalive, and the SDK owns its cleanup.
  */
-describe("WorkerTransport POST stream keepalive", () => {
+describe("WorkerTransport SSE keepalive", () => {
   let setIntervalSpy = vi.spyOn(globalThis, "setInterval");
 
-  const createSlowToolServer = () => {
+  const createServer = () => {
     const server = new McpServer(
       { name: "test-server", version: "1.0.0" },
       { capabilities: { tools: {} } }
     );
 
     server.registerTool(
-      "slow-tool",
+      "echo",
       {
-        description: "A tool that simulates a slow backend call",
+        description: "An echo tool",
         inputSchema: { message: z.string().describe("Test message") }
       },
       async ({ message }) => {
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        return { content: [{ text: `Done: ${message}`, type: "text" }] };
+        return { content: [{ text: `Echo: ${message}`, type: "text" }] };
       }
     );
 
     return server;
+  };
+
+  const createHangingServer = () => {
+    let release: (() => void) | undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const server = createServer();
+    server.registerTool(
+      "hang",
+      {
+        description: "Block until the test releases the tool",
+        inputSchema: {}
+      },
+      async () => {
+        await released;
+        return { content: [{ type: "text" as const, text: "done" }] };
+      }
+    );
+    return {
+      release: () => release?.(),
+      server
+    };
   };
 
   const setupTransport = async (
@@ -48,152 +77,201 @@ describe("WorkerTransport POST stream keepalive", () => {
   };
 
   const initializeSession = async (transport: WorkerTransport) => {
-    const initRequest = new Request("http://localhost/mcp", {
+    const response = await transport.handleRequest(
+      new Request("http://localhost/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream"
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "keepalive-test", version: "1.0.0" }
+          }
+        })
+      })
+    );
+    await response.text();
+  };
+
+  const longRunningIntervals = () =>
+    setIntervalSpy.mock.calls.filter((call) => {
+      const ms = call[1] as number | undefined;
+      return typeof ms === "number" && ms >= 5_000 && ms <= 120_000;
+    });
+
+  const mockEventStore = (): EventStore => ({
+    storeEvent: vi.fn(
+      async (_streamId: StreamId, _message: JSONRPCMessage) =>
+        `evt-${crypto.randomUUID()}`
+    ),
+    replayEventsAfter: vi.fn(async () => "_GET_stream" as StreamId),
+    getStreamIdForEventId: vi.fn(async (id: EventId) => id.split(":")[0])
+  });
+
+  const getRequest = (sessionId: string) =>
+    new Request("http://localhost/mcp", {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        "mcp-session-id": sessionId
+      }
+    });
+
+  const hangingPostRequest = (sessionId: string) =>
+    new Request("http://localhost/mcp", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream"
+        Accept: "application/json, text/event-stream",
+        "mcp-session-id": sessionId
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: { name: "keepalive-test", version: "1.0.0" }
-        }
+        id: 2,
+        method: "tools/call",
+        params: { name: "hang", arguments: {} }
       })
     });
-
-    const initResponse = await transport.handleRequest(initRequest);
-    if (initResponse.body) {
-      const reader = initResponse.body.getReader();
-      while (!(await reader.read()).done) {}
-    }
-  };
 
   beforeEach(() => {
     setIntervalSpy = vi.spyOn(globalThis, "setInterval");
   });
 
   afterEach(() => {
-    setIntervalSpy.mockRestore();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  it("GET SSE stream should set up a keepalive interval", async () => {
-    const server = createSlowToolServer();
-    const transport = await setupTransport(server, {
-      sessionIdGenerator: () => "test-session-get"
-    });
+  it.each([false, true])(
+    "delegates one GET keepalive to SDK v1.30 (eventStore=%s)",
+    async (withEventStore) => {
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      const sessionId = `get-${withEventStore}`;
+      const server = createServer();
+      const transport = await setupTransport(server, {
+        sessionIdGenerator: () => sessionId,
+        ...(withEventStore && { eventStore: mockEventStore() })
+      });
+      await initializeSession(transport);
+      setIntervalSpy.mockClear();
+      clearIntervalSpy.mockClear();
 
+      const response = await transport.handleRequest(getRequest(sessionId));
+      expect(response.status).toBe(200);
+
+      const intervals = longRunningIntervals();
+      expect(intervals).toHaveLength(1);
+      expect(intervals[0]?.[1]).toBe(15_000);
+      const timer = setIntervalSpy.mock.results.at(-1)?.value;
+
+      await transport.close();
+      expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+    }
+  );
+
+  it.each([false, true])(
+    "delegates one POST keepalive to SDK v1.30 (eventStore=%s)",
+    async (withEventStore) => {
+      const sessionId = `post-${withEventStore}`;
+      const { release, server } = createHangingServer();
+      const transport = await setupTransport(server, {
+        sessionIdGenerator: () => sessionId,
+        ...(withEventStore && { eventStore: mockEventStore() })
+      });
+      await initializeSession(transport);
+      setIntervalSpy.mockClear();
+
+      const response = await transport.handleRequest(
+        hangingPostRequest(sessionId)
+      );
+      expect(response.status).toBe(200);
+
+      const intervals = longRunningIntervals();
+      expect(intervals).toHaveLength(1);
+      expect(intervals[0]?.[1]).toBe(15_000);
+
+      const body = response.text();
+      release();
+      await body;
+      await server.close();
+    }
+  );
+
+  it("forwards keepAliveMs to the SDK transport", async () => {
+    const server = createServer();
+    const transport = await setupTransport(server, {
+      keepAliveMs: 7_000,
+      sessionIdGenerator: () => "custom-cadence"
+    });
     await initializeSession(transport);
     setIntervalSpy.mockClear();
 
-    const getRequest = new Request("http://localhost/mcp", {
-      method: "GET",
-      headers: {
-        Accept: "text/event-stream",
-        "mcp-session-id": "test-session-get"
-      }
-    });
-
-    const response = await transport.handleRequest(getRequest);
-    expect(response.status).toBe(200);
-    expect(response.headers.get("Content-Type")).toBe("text/event-stream");
-
-    const keepaliveCalls = setIntervalSpy.mock.calls.filter(
-      (call) => call[1] === 30000
+    const response = await transport.handleRequest(
+      getRequest("custom-cadence")
     );
-    expect(keepaliveCalls.length).toBeGreaterThanOrEqual(1);
+    expect(response.status).toBe(200);
+    expect(longRunningIntervals()).toHaveLength(1);
+    expect(longRunningIntervals()[0]?.[1]).toBe(7_000);
 
     await server.close();
   });
 
-  it("POST SSE stream should set up a keepalive interval", async () => {
-    const server = createSlowToolServer();
+  it("allows SDK keepalives to be disabled", async () => {
+    const server = createServer();
     const transport = await setupTransport(server, {
-      sessionIdGenerator: () => "test-session-post"
+      keepAliveMs: 0,
+      sessionIdGenerator: () => "disabled"
     });
-
     await initializeSession(transport);
     setIntervalSpy.mockClear();
 
-    const toolRequest = new Request("http://localhost/mcp", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "mcp-session-id": "test-session-post"
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/call",
-        params: {
-          name: "slow-tool",
-          arguments: { message: "test" }
+    const response = await transport.handleRequest(getRequest("disabled"));
+    expect(response.status).toBe(200);
+    expect(longRunningIntervals()).toEqual([]);
+
+    await server.close();
+  });
+
+  it("streams SDK comment-frame keepalives instead of named events", async () => {
+    const { release, server } = createHangingServer();
+    const transport = await setupTransport(server, {
+      sessionIdGenerator: () => "frame-session"
+    });
+    await initializeSession(transport);
+
+    vi.useFakeTimers();
+    try {
+      const response = await transport.handleRequest(
+        hangingPostRequest("frame-session")
+      );
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Expected an SSE response body");
+      const decoder = new TextDecoder();
+      let buffered = "";
+      const drain = (async () => {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffered += decoder.decode(value, { stream: true });
         }
-      })
-    });
+      })();
 
-    const response = await transport.handleRequest(toolRequest);
-    expect(response.status).toBe(200);
-    expect(response.headers.get("Content-Type")).toBe("text/event-stream");
+      await vi.advanceTimersByTimeAsync(16_000);
+      release();
+      await drain;
 
-    const keepaliveCalls = setIntervalSpy.mock.calls.filter(
-      (call) => call[1] === 30000
-    );
-    expect(keepaliveCalls.length).toBeGreaterThanOrEqual(1);
-
-    await server.close();
-  });
-
-  it("POST keepalive cleanup should clear the interval", async () => {
-    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-
-    const server = createSlowToolServer();
-    const transport = await setupTransport(server, {
-      sessionIdGenerator: () => "test-session-cleanup"
-    });
-
-    await initializeSession(transport);
-    setIntervalSpy.mockClear();
-    clearIntervalSpy.mockClear();
-
-    const toolRequest = new Request("http://localhost/mcp", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "mcp-session-id": "test-session-cleanup"
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 3,
-        method: "tools/call",
-        params: {
-          name: "slow-tool",
-          arguments: { message: "test" }
-        }
-      })
-    });
-
-    const response = await transport.handleRequest(toolRequest);
-    expect(response.status).toBe(200);
-
-    // Verify keepalive was set up
-    const keepaliveCalls = setIntervalSpy.mock.calls.filter(
-      (call) => call[1] === 30000
-    );
-    expect(keepaliveCalls.length).toBeGreaterThanOrEqual(1);
-
-    // Close the stream and verify the interval is cleaned up
-    transport.closeSSEStream(3);
-
-    expect(clearIntervalSpy).toHaveBeenCalled();
-
-    clearIntervalSpy.mockRestore();
-    await server.close();
+      expect(buffered).toContain(": keepalive\n\n");
+      expect(buffered).not.toContain("event: ping");
+      await server.close();
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
   });
 });

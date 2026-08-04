@@ -25,9 +25,11 @@ npm init -y
 Install dependencies:
 
 ```sh
-npm install @cloudflare/think @cloudflare/ai-chat agents ai @cloudflare/shell zod workers-ai-provider react react-dom
+npm install @cloudflare/think agents ai @cloudflare/shell zod react react-dom
 npm install -D wrangler @cloudflare/vite-plugin @cloudflare/workers-types @vitejs/plugin-react @tailwindcss/vite tailwindcss typescript vite
 ```
+
+Think bundles [`workers-ai-provider`](https://www.npmjs.com/package/workers-ai-provider), so you do not need to install or import it for the common case — `getModel()` can return a model id string (see below).
 
 ## 2. Configure wrangler
 
@@ -78,14 +80,14 @@ Create `src/server.ts`:
 
 ```typescript
 import { Think } from "@cloudflare/think";
-import { createWorkersAI } from "workers-ai-provider";
 import { routeAgentRequest } from "agents";
 
 export class MyAgent extends Think<Env> {
   getModel() {
-    return createWorkersAI({ binding: this.env.AI })(
-      "@cf/moonshotai/kimi-k2.6"
-    );
+    // A string is resolved through Think's built-in workers-ai-provider off the
+    // `AI` binding. Use a "@cf/..." id for Workers AI, or a "provider/model"
+    // slug like "openai/gpt-5.5" to route through AI Gateway.
+    return "@cf/moonshotai/kimi-k2.7-code";
   }
 
   getSystemPrompt() {
@@ -119,7 +121,7 @@ Create `src/client.tsx`:
 ```tsx
 import { createRoot } from "react-dom/client";
 import { useAgent } from "agents/react";
-import { useAgentChat } from "@cloudflare/ai-chat/react";
+import { useAgentChat } from "@cloudflare/think/react";
 
 function Chat() {
   const agent = useAgent({ agent: "MyAgent" });
@@ -194,16 +196,16 @@ npx vite dev
 
 Open the browser and send a message. The agent responds with streaming text, and workspace file tools are available to the model automatically.
 
+> **`setMessages` is display-only on Think.** Think is server-authoritative — its transcript is a projection of the Session tree, not a flat array the client owns. `useAgentChat` from `@cloudflare/think/react` therefore keeps `setMessages` local to the React view: edits update what's on screen but are **not** persisted and won't survive a refresh or reconnect (the server re-projects the authoritative history). To persist a clear, call `clearHistory()`. If you push a full transcript to Think anyway (for example, by using `@cloudflare/ai-chat/react` against a Think server), the server ignores it and logs a one-time dev warning.
+
 ## 6. Add persistent memory
 
 Override `configureSession` to give the model writable memory that survives restarts:
 
 ```typescript
 export class MyAgent extends Think<Env> {
-  getModel(): LanguageModel {
-    return createWorkersAI({ binding: this.env.AI })(
-      "@cf/moonshotai/kimi-k2.6"
-    );
+  getModel() {
+    return "@cf/moonshotai/kimi-k2.7-code";
   }
 
   configureSession(session: Session) {
@@ -227,7 +229,7 @@ Now the model sees a `MEMORY` section in its system prompt and gets a `set_conte
 
 When you use `configureSession`, the system prompt is built from context blocks rather than `getSystemPrompt()`. The `"soul"` block above acts as the system identity — it is read-only and always appears first. The `"memory"` block is writable, and the model proactively updates it when it learns something useful.
 
-See the [Sessions documentation](../sessions.md) for context blocks, compaction, search, skills, and multi-session support.
+See the [Sessions documentation](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md) for context blocks, compaction, search, skills, and multi-session support.
 
 ## 7. Add custom tools
 
@@ -238,7 +240,7 @@ import { tool } from "ai";
 import { z } from "zod";
 
 export class MyAgent extends Think<Env> {
-  getModel(): LanguageModel {
+  getModel() {
     /* ... */
   }
   configureSession(session: Session) {
@@ -269,8 +271,9 @@ Think merges tools from multiple sources automatically. On every turn, the model
 1. **Workspace tools** — read, write, edit, list, find, grep, delete (built-in)
 2. **Session tools** — set_context, load_context, search_context (from `configureSession`)
 3. **Your tools** — from `getTools()`
-4. **MCP tools** — from connected MCP servers (if any)
-5. **Client tools** — from the browser (if any)
+4. **Skill tools** — activate_skill, read_skill_resource, and optional run_skill_script (from `getSkills()`)
+5. **MCP tools** — from connected MCP servers (if any)
+6. **Client tools** — from the browser (if any)
 
 ## 8. Add lifecycle hooks
 
@@ -284,7 +287,7 @@ import type {
 } from "@cloudflare/think";
 
 export class MyAgent extends Think<Env> {
-  getModel(): LanguageModel {
+  getModel() {
     /* ... */
   }
 
@@ -308,4 +311,4 @@ See [Lifecycle Hooks](./lifecycle-hooks.md) for the full reference.
 - [Tools](./tools.md) — workspace tools, code execution, extensions
 - [Client Tools](./client-tools.md) — browser-side tools, approval flows, concurrency
 - [Sub-agents and Programmatic Turns](./sub-agents.md) — RPC streaming, scheduled turns, recovery
-- [Sessions](../sessions.md) — context blocks, compaction, search, multi-session
+- [Sessions](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md) — context blocks, compaction, search, multi-session

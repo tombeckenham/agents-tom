@@ -9,6 +9,11 @@ the turn and returns a submission record before inference runs.
 For a broader comparison with `chat()`, `saveMessages()`, and agent tools, see
 [Choosing a turn API](./index.md#choosing-a-turn-api).
 
+Declarative scheduled prompt tasks use the same durable submission path under
+the hood. Use `getScheduledTasks()` when the trigger is recurring and
+code-declared; use `submitMessages()` directly when an external caller or
+webhook creates one-off work.
+
 ## Why this exists
 
 Webhook handlers, RPC callers, and parent Workers often have strict timeout
@@ -114,6 +119,10 @@ submitted messages to the conversation `Session` only when the submission starts
 executing. This preserves FIFO turn semantics: later accepted submissions are
 not visible to the model until their own turn starts.
 
+If you cancel a submission before its messages have been applied, including one
+that has been claimed but is still waiting for its turn, those messages are not
+persisted to the conversation.
+
 If the chat is cleared or turn state is reset before a pending submission runs,
 that submission is marked `skipped`.
 
@@ -192,6 +201,6 @@ const submission = await this.agent.submitMessages(messages, {
 
 ## Example
 
-See [Think Durable Submissions](../../examples/think-submissions/README.md) for
+See [Think Durable Submissions](https://github.com/cloudflare/agents/tree/main/examples/think-submissions/README.md) for
 a full dashboard that shows immediate ACKs, idempotent retry, queue status, and
 cancellation.

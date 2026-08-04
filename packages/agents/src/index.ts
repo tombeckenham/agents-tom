@@ -1,10 +1,23 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type {
+  Prompt,
+  Resource,
+  ServerCapabilities,
+  SSEClientTransportOptions,
+  Tool
+} from "@modelcontextprotocol/client";
 import {
   __DO_NOT_USE_WILL_BREAK__agentContext as agentContext,
+  type AgentContextStore,
   type AgentEmail
 } from "./internal_context";
 export { __DO_NOT_USE_WILL_BREAK__agentContext } from "./internal_context";
+/**
+ * @internal — This is an internal implementation detail shared with the Think
+ * package so it can declare a turn's invocation boundary. Importing or relying
+ * on this symbol **will** break your code in a future release.
+ */
+export { withInvocationScope as __DO_NOT_USE_WILL_BREAK__withInvocationScope } from "./observability/tracing/tracer";
 import {
   SUB_PREFIX,
   parseSubAgentPath as _parseSubAgentPath
@@ -16,15 +29,7 @@ export {
   SUB_PREFIX
 } from "./sub-routing";
 export type { SubAgentPathMatch } from "./sub-routing";
-import type { SSEClientTransportOptions } from "@modelcontextprotocol/sdk/client/sse.js";
 import { signAgentHeaders } from "./email";
-
-import type {
-  Prompt,
-  Resource,
-  ServerCapabilities,
-  Tool
-} from "@modelcontextprotocol/sdk/types.js";
 import { parseCronExpression } from "cron-schedule";
 import { nanoid } from "nanoid";
 import { EmailMessage } from "cloudflare:email";
@@ -39,13 +44,27 @@ import {
   routePartykitRequest
 } from "partyserver";
 import { camelCaseToKebabCase, isInternalJsStubProp } from "./utils";
+export { camelCaseToKebabCase } from "./utils";
 import {
   type RetryOptions,
   tryN,
+  isDurableObjectCodeUpdateReset,
+  isDurableObjectMemoryLimitReset,
   isErrorRetryable,
+  isPlatformTransientError,
   validateRetryOptions
 } from "./retries";
-import { MCPClientManager, type MCPClientOAuthResult } from "./mcp/client";
+export {
+  isDurableObjectCodeUpdateReset,
+  isDurableObjectMemoryLimitReset,
+  isDurableObjectStorageReset,
+  isPlatformTransientError
+} from "./retries";
+import {
+  MCPClientManager,
+  normalizeServerId,
+  type MCPClientOAuthResult
+} from "./mcp/client";
 import type {
   WorkflowCallback,
   WorkflowTrackingRow,
@@ -54,34 +73,56 @@ import type {
   WorkflowEventPayload,
   WorkflowInfo,
   WorkflowQueryCriteria,
-  WorkflowPage
+  WorkflowPage,
+  AgentWorkflowOrigin
 } from "./workflow-types";
 import { MCPConnectionState } from "./mcp/client-connection";
 import {
   DurableObjectOAuthClientProvider,
   type AgentMcpOAuthProvider
 } from "./mcp/do-oauth-client-provider";
-import type { TransportType } from "./mcp/types";
+import type { McpClientOptions, TransportType } from "./mcp/types";
 import {
   genericObservability,
   type Observability,
   type ObservabilityEvent
 } from "./observability";
+import { tracer } from "./observability/tracing/cloudflare";
+import {
+  withInvocationScope,
+  writeSpanAttributes,
+  type InvocationScopeOptions,
+  type TraceAttributes
+} from "./observability/tracing/tracer";
 import { DisposableStore } from "./core/events";
 import { MessageType } from "./types";
 import { RPC_DO_PREFIX } from "./mcp/rpc";
 import type { McpAgent } from "./mcp";
+export {
+  AGENT_TOOL_PROGRESS_PART,
+  AGENT_TOOL_MILESTONE_PART
+} from "./agent-tool-types";
+import {
+  AGENT_TOOL_MILESTONE_PART,
+  AGENT_TOOL_PROGRESS_PART
+} from "./agent-tool-types";
 import type {
   AgentToolChildAdapter,
   AgentToolDisplayMetadata,
   AgentToolEvent,
   AgentToolEventMessage,
+  AgentToolInterruptedReason,
   AgentToolLifecycleResult,
+  AgentToolMilestone,
+  AgentToolProgress,
+  AgentToolProgressSnapshot,
   AgentToolRunInfo,
   AgentToolRunInspection,
   AgentToolRunStatus,
   AgentToolStoredChunk,
   ChatCapableAgentClass,
+  DetachedAgentToolConfig,
+  DetachedRunAgentToolResult,
   RunAgentToolOptions,
   RunAgentToolResult
 } from "./agent-tool-types";
@@ -92,14 +133,22 @@ export type {
   AgentToolEvent,
   AgentToolEventMessage,
   AgentToolEventState,
+  AgentToolFailure,
+  AgentToolInterruptedReason,
   AgentToolLifecycleResult,
+  AgentToolMilestone,
+  AgentToolProgress,
+  AgentToolProgressSnapshot,
   AgentToolRunInfo,
   AgentToolRunInspection,
+  AgentToolRunPart,
   AgentToolRunState,
   AgentToolRunStatus,
   AgentToolStoredChunk,
   AgentToolTerminalStatus,
   ChatCapableAgentClass,
+  DetachedAgentToolConfig,
+  DetachedRunAgentToolResult,
   RunAgentToolOptions,
   RunAgentToolResult
 } from "./agent-tool-types";
@@ -192,6 +241,40 @@ export type RPCResponse = {
       error: string;
     }
 );
+
+/**
+ * Enters an agent invocation: the context every handler reads, plus the span
+ * scope that stops invocation-bounded spans from outliving it. Scopes do not
+ * nest, so the outermost live entry point owns the boundary — pass
+ * `detached` for work that deliberately runs on past its caller.
+ */
+function runInInvocation<T>(
+  store: AgentContextStore,
+  body: () => T,
+  options?: InvocationScopeOptions
+): T {
+  return agentContext.run(store, () => withInvocationScope(body, options));
+}
+
+function isClosedWebSocketSendError(error: unknown): boolean {
+  return (
+    error instanceof TypeError &&
+    error.message.includes("WebSocket send() after close")
+  );
+}
+
+function sendRpcResponseIfOpen(
+  connection: Connection,
+  response: RPCResponse
+): boolean {
+  try {
+    connection.send(JSON.stringify(response));
+    return true;
+  } catch (error) {
+    if (isClosedWebSocketSendError(error)) return false;
+    throw error;
+  }
+}
 
 /**
  * Type guard for RPC request messages
@@ -567,13 +650,28 @@ type AgentToolRunStorageRow = {
   summary: string | null;
   output_json: string | null;
   error_message: string | null;
+  interrupted_reason: string | null;
+  child_still_running: number | null;
   display_metadata: string | null;
   display_order: number;
   started_at: number;
   completed_at: number | null;
+  // Detached ("background") run bookkeeping (rfc-detached-agent-tools).
+  detached: number;
+  detached_on_finish: string | null;
+  detached_notify_source?: string | null;
+  detached_max_budget_at: number | null;
+  finish_claimed_at: number | null;
+  finish_delivered_at: number | null;
+  give_up_claimed_at: number | null;
+  give_up_delivered_at: number | null;
+  detached_no_progress_budget_ms?: number | null;
+  last_progress_at?: number | null;
+  detached_on_milestones?: string | null;
 };
 
 type DeferredAgentToolFinish = () => Promise<void>;
+type DetachedReconcilePayload = { cadenceIndex?: number };
 
 export type ScheduleCriteria = {
   id?: string;
@@ -770,6 +868,8 @@ export type FiberRecoveryContext = {
    * started). Use `Date.now() - createdAt` to gate stale recoveries.
    */
   createdAt: number;
+  /** Why this recovery hook is running. */
+  recoveryReason: "interrupted";
   [key: string]: unknown;
 };
 
@@ -779,6 +879,16 @@ const _fiberALS = new AsyncLocalStorage<{
   stash: (data: unknown) => void;
 }>();
 
+type InternalFiberOptions = {
+  signal?: AbortSignal;
+  managed?: boolean;
+  initialSnapshot?: unknown;
+  wrapStash?: (data: unknown) => unknown;
+  beforeRunCleanup?: (
+    outcome: { ok: true } | { ok: false; error: unknown }
+  ) => void;
+};
+
 function getNextCronTime(cron: string) {
   const interval = parseCronExpression(cron);
   return interval.getNextDate();
@@ -786,6 +896,12 @@ function getNextCronTime(cron: string) {
 
 export type { TransportType } from "./mcp/types";
 export type { RetryOptions } from "./retries";
+export {
+  normalizeServerId,
+  MCP_SERVER_ID_MAX_LENGTH,
+  type MCPAITool,
+  type MCPAIToolSet
+} from "./mcp/client";
 export {
   DurableObjectOAuthClientProvider,
   type AgentMcpOAuthProvider,
@@ -828,6 +944,17 @@ export type MCPServer = {
  * Options for adding an MCP server
  */
 export type AddMcpServerOptions = {
+  /**
+   * Optional caller-supplied stable server id. When provided, this id is used
+   * for storage, restore, and tool-name namespacing instead of a generated
+   * `nanoid`. The value is normalized via {@link normalizeServerId} — for
+   * connector-style integrations this lets `addMcpServer` keep producing
+   * keys like `tool_github_create_pull_request`.
+   *
+   * Throws if an existing server already uses the same (normalized) id but a
+   * different name or url.
+   */
+  id?: string;
   /** OAuth callback host (auto-derived from request if omitted) */
   callbackHost?: string;
   /**
@@ -841,13 +968,19 @@ export type AddMcpServerOptions = {
   /** Agents routing prefix (default: "agents") */
   agentsPrefix?: string;
   /** MCP client options */
-  client?: ConstructorParameters<typeof Client>[1];
+  client?: McpClientOptions;
   /** Transport options */
   transport?: {
     /** Custom headers for authentication (e.g., bearer tokens, CF Access) */
     headers?: HeadersInit;
     /** Transport type: "sse", "streamable-http", or "auto" (default) */
     type?: TransportType;
+    /**
+     * Compatibility escape hatch for a trusted legacy authorization server
+     * whose RFC 8414 issuer does not match its metadata discovery URL.
+     * Security-weakening; leave false unless the server is explicitly known.
+     */
+    skipIssuerMetadataValidation?: boolean;
   };
   /** Retry options for connection and reconnection attempts */
   retry?: RetryOptions;
@@ -857,11 +990,134 @@ export type AddMcpServerOptions = {
  * Options for adding an MCP server via RPC (Durable Object binding)
  */
 export type AddRpcMcpServerOptions = {
+  /**
+   * Optional caller-supplied stable server id. When provided, this id is used
+   * for storage, restore, and tool-name namespacing instead of a generated
+   * `nanoid`. The value is normalized via {@link normalizeServerId}.
+   *
+   * Throws if an existing server already uses the same (normalized) id but a
+   * different name or url.
+   */
+  id?: string;
   /** Props to pass to the McpAgent instance */
   props?: Record<string, unknown>;
 };
 
 const DEFAULT_KEEP_ALIVE_INTERVAL_MS = 30_000;
+const DEFAULT_AGENT_TOOL_RECOVERY_TIMEOUT_MS = 2_000;
+const DEFAULT_AGENT_TOOL_RECOVERY_TOTAL_TIMEOUT_MS = 5_000;
+// Durable marker that this agent is condemned: written before teardown begins
+// (and by `_cf_scheduleDestroy`, which defers teardown to an alarm invocation
+// with its own execution budget, #1625). The final `deleteAll()` in `destroy()`
+// removes it, so "marker present" always means an unfinished teardown that the
+// next wake must complete instead of resuming normal work.
+//
+// Scope: the marker is only consulted on alarm-driven paths (`alarm()` and
+// `_scheduleNextAlarm()`). It deliberately does NOT gate request entrypoints
+// (`onRequest`/`onMessage`/RPC) — a request that lands between scheduling and
+// the teardown alarm runs normally and `_ensureSchema()` recreates tables. For
+// the MCP session-DELETE use case this is benign: the session id is unique and
+// is never addressed again after DELETE, so no further request reaches a
+// condemned session DO before its teardown alarm fires.
+const DESTROY_PENDING_KEY = "cf_agents_destroy_pending";
+// Delay before the deferred-teardown alarm fires (#1625). `_cf_scheduleDestroy`
+// is awaited by an HTTP handler (the MCP session-DELETE) that then returns its
+// response. The teardown alarm runs `destroy()`, which ends in
+// `ctx.abort("destroyed")` — and an immediate (`Date.now()`) alarm fires and
+// aborts the isolate fast enough to race the still-in-flight RPC response,
+// surfacing to the caller as a 500 instead of the intended 204 (observed
+// against a real deployment; the local test runtime does not exhibit it). A
+// small delay lets the response flush before the abort. Teardown latency of a
+// second is irrelevant for an already-abandoned session.
+const DESTROY_ALARM_DELAY_MS = 1_000;
+// Ceiling for the exponential backoff applied to the runFiber-recovery
+// follow-up alarm. A scan that makes NO forward progress (every pending orphan
+// row's recovery hook threw) but still has work pending backs off so a poison
+// fiber — or a `fiberRecoveryMaxAgeMs: 0` "retain forever" row whose hook keeps
+// throwing — does not wake the DO every `keepAliveIntervalMs` indefinitely (the
+// perpetual-heartbeat hazard #1707 guards against). A scan that DID make
+// progress (recovered ≥1 row, including a scan-deadline yield that drained
+// some) resets the backoff so legitimate multi-pass draining stays prompt.
+const FIBER_RECOVERY_MAX_BACKOFF_MS = 5 * 60_000;
+// Cap the doubling exponent so `base * 2 ** n` never overflows before the
+// `FIBER_RECOVERY_MAX_BACKOFF_MS` clamp applies.
+const FIBER_RECOVERY_BACKOFF_MAX_EXP = 20;
+// Re-attaching to a still-running child agent-tool run (parent recovery /
+// duplicate-runId re-issue) tails it to its REAL terminal result instead of
+// abandoning it as `interrupted` and re-running already-completed child work
+// (#1630). The budget is PROGRESS-KEYED, not a flat wall clock: it bounds how
+// long the parent waits with NO forward progress from the child, and resets
+// every time the child forwards a chunk. A child that keeps streaming toward
+// terminal is therefore never abandoned mid-flight (the previous flat 120s
+// budget abandoned healthy, still-advancing children); only a genuinely
+// silent/hung child seals `interrupted` after a full no-progress window.
+const DEFAULT_AGENT_TOOL_REATTACH_NO_PROGRESS_TIMEOUT_MS = 120_000;
+// Optional hard wall-clock ceiling on a single re-attach. Defaults to NO cap,
+// mirroring chat-recovery's `maxRecoveryWork: Infinity` (#1672): the SDK does
+// not impose an implicit wall-clock bound on a child that keeps making forward
+// progress — a re-attached parent follows a healthy, still-streaming child for
+// as long as it advances, exactly as it would on the live (never-evicted) path.
+// A hung/silent child is already bounded by the progress-keyed no-progress
+// budget above, and a content-runaway is bounded uniformly (live AND recovery)
+// by the child's own `maxRecoveryWork` / `shouldKeepRecovering` — not by a
+// parent-only timer that would fire only after an eviction. Integrators that
+// want a hard wall-clock cap (and the `window-exceeded` child teardown it
+// triggers) can still set `agentToolReattachMaxWindowMs` to a finite value.
+const DEFAULT_AGENT_TOOL_REATTACH_MAX_WINDOW_MS = Number.POSITIVE_INFINITY;
+// Absolute safety ceiling on a DETACHED ("background") agent-tool run
+// (rfc-detached-agent-tools). A detached run has no awaiting parent turn and no
+// live observer, so unlike the re-attach window above this defaults to a FINITE
+// value: an abandoned detached run otherwise holds a concurrency slot + live
+// facet forever with nobody to notice the leak. On expiry the parent gives up
+// watching (delivers the completion hook with `interrupted`/`budget-exceeded`)
+// and tears the child down. 24h is generous enough for video renders / large
+// batch jobs while still bounding a genuinely stuck run.
+const DEFAULT_DETACHED_MAX_BUDGET_MS = 24 * 60 * 60 * 1000;
+// Resetting no-progress window for detached runs: once a child has emitted at
+// least one `reportProgress` signal, the parent gives up if it then goes silent
+// for this long (the window resets on every signal). A child that never signals
+// is bounded only by the absolute `detachedMaxBudgetMs` ceiling — we never give
+// up on a run merely for taking a long time, only for going silent after it
+// started reporting. Matches `rfc-chat-recovery-work-budget`.
+const DEFAULT_DETACHED_NO_PROGRESS_BUDGET_MS = 60 * 60 * 1000;
+// How long a detached terminal-delivery claim is leased before another delivery
+// path (a backbone reconcile racing the warm fast path, or a re-delivery after
+// a crash mid-handler) may re-claim it. Guards against a double-fire on the
+// happy path while guaranteeing at-least-once delivery under failure.
+const DETACHED_DELIVERY_LEASE_MS = 60_000;
+// Escalating cadence for the self-scheduling detached reconcile backbone. The
+// warm fast path makes the first entries near-moot; these bound worst-case
+// post-eviction latency while keeping steady-state alarm cost low. The schedule
+// cancels itself once no detached run remains outstanding.
+const DETACHED_BACKBONE_CADENCE_S = [5, 15, 30, 120];
+// Detached runs hold a `maxConcurrentAgentTools` slot for their ENTIRE life and
+// have no observer to notice them piling up. With the default `Infinity` cap
+// that is a real leak footgun, so the framework emits an edge-triggered warning
+// when the live (non-terminal) detached count first crosses this threshold,
+// rather than silently accumulating. (A separate `maxConcurrentDetachedAgentTools`
+// cap is deferred until evidence shows the single cap conflates two budgets.)
+const DETACHED_LIVE_COUNT_WARN_THRESHOLD = 50;
+const DETACHED_RECONCILE_CALLBACK = "_cfDetachedReconcileTick";
+// Conventional method name a chat agent (Think / AIChatAgent) implements to
+// receive `detached: { notify: true }` completions. Resolved by name so the
+// base Agent stays decoupled from the chat layer.
+const DETACHED_NOTIFY_CALLBACK = "_cfDetachedNotifyFinish";
+const SUB_AGENT_IDENTITY_VERSION_LEGACY = "legacy";
+const SUB_AGENT_IDENTITY_VERSION_PATH_V2 = "path-v2";
+const SUB_AGENT_IDENTITY_PATH_V2_PREFIX = "cf-agents:v2:";
+
+type SubAgentIdentityVersion =
+  | typeof SUB_AGENT_IDENTITY_VERSION_LEGACY
+  | typeof SUB_AGENT_IDENTITY_VERSION_PATH_V2;
+
+type AgentToolRecoveryInspection =
+  | {
+      status: "inspected";
+      adapter: AgentToolChildAdapter;
+      inspection: AgentToolRunInspection | null;
+    }
+  | { status: "failed" }
+  | { status: "timed-out" };
 
 /**
  * Schema version for the Agent's internal SQLite tables.
@@ -869,7 +1125,7 @@ const DEFAULT_KEEP_ALIVE_INTERVAL_MS = 30_000;
  * The constructor stores this as a row in cf_agents_state and checks it
  * on wake to skip DDL on established DOs.
  */
-const CURRENT_SCHEMA_VERSION = 8;
+const CURRENT_SCHEMA_VERSION = 11;
 
 const SCHEMA_VERSION_ROW_ID = "cf_schema_version";
 const STATE_ROW_ID = "cf_state_row_id";
@@ -878,6 +1134,33 @@ const STATE_ROW_ID = "cf_state_row_id";
 const STATE_WAS_CHANGED = "cf_state_was_changed";
 
 const DEFAULT_STATE = {} as unknown;
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function pathV2IdentityName(logicalName: string, digest: string): string {
+  return `${SUB_AGENT_IDENTITY_PATH_V2_PREFIX}${encodeURIComponent(logicalName)}:${digest}`;
+}
+
+function logicalNameFromPathV2Identity(identityName: string): string | null {
+  if (!identityName.startsWith(SUB_AGENT_IDENTITY_PATH_V2_PREFIX)) {
+    return null;
+  }
+  const rest = identityName.slice(SUB_AGENT_IDENTITY_PATH_V2_PREFIX.length);
+  const separator = rest.lastIndexOf(":");
+  if (separator === -1) return null;
+
+  try {
+    return decodeURIComponent(rest.slice(0, separator));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Validate that a stored `parentPath` has the expected shape. Used
@@ -1037,7 +1320,49 @@ export const DEFAULT_AGENT_STATIC_OPTIONS = {
     maxAttempts: 3,
     baseDelayMs: 100,
     maxDelayMs: 3000
-  } satisfies Required<RetryOptions>
+  } satisfies Required<RetryOptions>,
+  /** Timeout for internal framework fiber recovery hooks. */
+  fiberRecoveryHookTimeoutMs: 10_000,
+  /** Soft deadline for one interrupted-fiber recovery scan. */
+  fiberRecoveryScanDeadlineMs: 10_000,
+  /**
+   * Maximum age of an unmanaged interrupted-fiber row before recovery gives
+   * up. Bounds repeated retries of a `onFiberRecovered()` hook that keeps
+   * throwing so a poison row cannot re-trigger forever across boots.
+   */
+  fiberRecoveryMaxAgeMs: 24 * 60 * 60 * 1000,
+  /**
+   * No-progress budget (ms) for re-attaching to a still-running agent-tool
+   * child after a deploy / parent recovery (#1630). Bounds how long the parent
+   * waits with NO forward progress from the child; it resets on every forwarded
+   * chunk, so a child that keeps streaming is never abandoned mid-flight. Only a
+   * genuinely silent/hung child seals `interrupted` after a full window. Raise
+   * for children with long quiet stretches between outputs.
+   */
+  agentToolReattachNoProgressTimeoutMs:
+    DEFAULT_AGENT_TOOL_REATTACH_NO_PROGRESS_TIMEOUT_MS,
+  /**
+   * Optional hard wall-clock ceiling (ms) on a single agent-tool re-attach
+   * (#1630). Caps the total wait even as the no-progress budget re-arms across
+   * stream-closes. Defaults to `Infinity` (no implicit cap), mirroring
+   * chat-recovery's `maxRecoveryWork` (#1672): a healthy, still-advancing child
+   * is followed for as long as it makes progress — a hung child is bounded by
+   * the no-progress budget, and a content-runaway by the child's own
+   * `maxRecoveryWork` / `shouldKeepRecovering`. Set a finite value to impose a
+   * wall-clock cap (which also tears the child down on `window-exceeded`).
+   */
+  agentToolReattachMaxWindowMs: DEFAULT_AGENT_TOOL_REATTACH_MAX_WINDOW_MS,
+  detachedMaxBudgetMs: DEFAULT_DETACHED_MAX_BUDGET_MS,
+  detachedNoProgressBudgetMs: DEFAULT_DETACHED_NO_PROGRESS_BUDGET_MS,
+  /**
+   * Consecutive alarm invocations that may end in a Durable Object memory-limit
+   * reset (the isolate exceeded its 128 MB limit) before the alarm-boundary
+   * circuit breaker stops the platform's auto-retry loop and seals the looping
+   * work (#1825). A small budget tolerates a genuinely transient memory spike;
+   * a deterministic OOM (the work's footprint, not the platform, is the cause)
+   * is bounded here regardless of whether the in-DO recovery budgets could run.
+   */
+  maxAlarmMemoryLimitStrikes: 3
 };
 
 /**
@@ -1049,6 +1374,14 @@ interface ResolvedAgentOptions {
   hungScheduleTimeoutSeconds: number;
   keepAliveIntervalMs: number;
   retry: Required<RetryOptions>;
+  fiberRecoveryHookTimeoutMs: number;
+  fiberRecoveryScanDeadlineMs: number;
+  fiberRecoveryMaxAgeMs: number;
+  agentToolReattachNoProgressTimeoutMs: number;
+  agentToolReattachMaxWindowMs: number;
+  detachedMaxBudgetMs: number;
+  detachedNoProgressBudgetMs: number;
+  maxAlarmMemoryLimitStrikes: number;
 }
 
 /**
@@ -1069,6 +1402,88 @@ export interface AgentStaticOptions {
   keepAliveIntervalMs?: number;
   /** Default retry options for schedule(), queue(), and this.retry(). */
   retry?: RetryOptions;
+  /**
+   * Timeout in milliseconds for internal framework fiber recovery hooks.
+   * User-defined `onFiberRecovered()` hooks are not timed out by default.
+   */
+  fiberRecoveryHookTimeoutMs?: number;
+  /** Soft deadline in milliseconds for one interrupted-fiber recovery scan. */
+  fiberRecoveryScanDeadlineMs?: number;
+  /**
+   * Maximum age in milliseconds of an unmanaged interrupted-fiber row before
+   * recovery stops retrying a repeatedly-throwing `onFiberRecovered()` hook
+   * and discards the row (emitting `fiber:recovery:skipped` with reason
+   * `max_age_exceeded`). Defaults to 24h.
+   *
+   * Set to `0` to retain rows indefinitely. NOTE: with `0`, a hook that keeps
+   * throwing is retried forever — the recovery alarm backs off exponentially
+   * (capped at 5 minutes) so it is not a busy-loop, but the Durable Object
+   * stays warm (never idle-evicts) for as long as the un-recoverable row
+   * exists. Prefer a finite age unless you intend to inspect/clear such rows
+   * yourself.
+   */
+  fiberRecoveryMaxAgeMs?: number;
+  /**
+   * No-progress budget in milliseconds for re-attaching to a still-running
+   * agent-tool child after a deploy / parent recovery (#1630). Resets on every
+   * forwarded chunk, so a steadily-streaming child is never abandoned; only a
+   * genuinely silent child seals `interrupted` after a full window.
+   * Default: 120000 (2 minutes). Set to `0` to skip waiting (collect only an
+   * already-terminal child). Set to `Infinity` to never seal on no-progress —
+   * a silent-but-alive child is then followed until its stream closes (or the
+   * `agentToolReattachMaxWindowMs` ceiling fires), mirroring that knob's
+   * "Infinity = off" convention.
+   */
+  agentToolReattachNoProgressTimeoutMs?: number;
+  /**
+   * Optional hard wall-clock ceiling in milliseconds on a single agent-tool
+   * re-attach (#1630). Caps the total wait even as the no-progress budget
+   * re-arms across stream-closes. Default: `Infinity` (no implicit cap),
+   * mirroring chat-recovery's `maxRecoveryWork` (#1672) — a healthy,
+   * still-advancing child is followed for as long as it makes progress, exactly
+   * as on the live (never-evicted) path. Set a finite value to impose a
+   * wall-clock cap (which also tears the child down on `window-exceeded`); `0`
+   * also disables the ceiling.
+   */
+  agentToolReattachMaxWindowMs?: number;
+  /**
+   * Absolute safety ceiling in milliseconds for a DETACHED ("background")
+   * agent-tool run dispatched via `runAgentTool(cls, { detached: ... })`
+   * (rfc-detached-agent-tools). A detached run has no awaiting parent turn, so
+   * on expiry the parent gives up watching — delivers the completion hook with
+   * `interrupted` / `budget-exceeded` and tears the child down — rather than
+   * holding a concurrency slot + live facet forever. Unlike the re-attach
+   * window this defaults to a FINITE value (24h) precisely because an abandoned
+   * detached run has no observer to notice the leak. Override per-run via
+   * `detached: { maxBudgetMs }`.
+   */
+  detachedMaxBudgetMs?: number;
+  /**
+   * Resetting no-progress window in milliseconds for a DETACHED agent-tool run
+   * (rfc-detached-agent-tools §progress). Once the child has emitted at least
+   * one `reportProgress` signal, the parent gives up if the run then goes
+   * silent for this long; the window resets on every subsequent signal. A child
+   * that never reports progress is bounded only by `detachedMaxBudgetMs` — we
+   * never give up on a run merely for taking a long time, only for going silent
+   * after it began reporting. Default: 1h. Set `0`/`Infinity` to disable (rely
+   * on the absolute ceiling only). Override per-run via
+   * `detached: { noProgressBudgetMs }`.
+   */
+  detachedNoProgressBudgetMs?: number;
+  /**
+   * Consecutive alarm invocations that may end in a Durable Object memory-limit
+   * reset (the isolate exceeded its 128 MB limit) before the alarm-boundary
+   * circuit breaker stops the platform's auto-retry loop and seals the looping
+   * recovery work (#1825). Default: 3. Set to `0` to seal on the first such
+   * reset. This is the universal backstop for the case where the in-DO recovery
+   * budgets (`chatRecovery.maxOomRetries` / `maxRecoveryWork`) can't engage
+   * because the OOM bypasses them — e.g. it is thrown before the budget code
+   * runs, or its own writes also OOM. The boundary handler runs at the outermost
+   * alarm frame, after the heavy turn has unwound and GC has reclaimed its
+   * footprint, so its small seal/purge writes can land where mid-turn writes
+   * could not.
+   */
+  maxAlarmMemoryLimitStrikes?: number;
 }
 
 /**
@@ -1098,6 +1513,12 @@ function resolveRetryConfig(
     maxDelayMs: taskRetry?.maxDelayMs ?? defaults.maxDelayMs
   };
 }
+
+// `isDurableObjectCodeUpdateReset` / `isPlatformTransientError` (used by the
+// scheduler's defer-vs-abandon decisions below) live in ./retries next to
+// `isErrorRetryable`, and are re-exported from the package root so higher
+// layers (e.g. `@cloudflare/think`) classify with the SAME matcher instead of
+// drifting copies.
 
 export function getCurrentAgent<
   T extends Agent<Cloudflare.Env> = Agent<Cloudflare.Env>
@@ -1149,7 +1570,7 @@ function withAgentContext<T extends (...args: any[]) => any>(
     }
     // Crossing to a different Agent must not carry native I/O handles
     // from the previous request/WebSocket/email turn into the new DO.
-    return agentContext.run(
+    return runInInvocation(
       {
         agent: this,
         connection: undefined,
@@ -1216,19 +1637,20 @@ export class Agent<
   /** True when this agent runs as a facet (sub-agent) inside a parent. */
   private _isFacet = false;
 
-  /**
-   * True only while the internal facet bootstrap RPC runs startup.
-   * Startup may happen while the parent is handling a WebSocket
-   * message, so protocol broadcasts must not touch any ambient
-   * parent-owned WebSocket handles during this window.
-   */
-  private _suppressProtocolBroadcasts = false;
   private _protocolBroadcastExcludeIds = new Set<string>();
   private _cf_currentSubAgentBridge?: SubAgentConnectionBridgeLike;
   private _cf_virtualSubAgentConnections = new Map<
     string,
     StoredSubAgentConnection
   >();
+
+  /**
+   * User-facing facet name. For legacy facets this is the same as
+   * `ctx.id.name`; path-scoped facets use an internal routing id and
+   * keep the logical name here instead.
+   * @internal
+   */
+  private _facetName?: string;
 
   /**
    * Ancestor chain, root-first. Empty for top-level DOs; populated at
@@ -1243,6 +1665,9 @@ export class Agent<
 
   /** Tracks callbacks already warned about during this onStart() to avoid log spam. */
   private _warnedScheduleInOnStart = new Set<string>();
+
+  /** Warn-once guard: `chatRecovery` reassigned during onStart() (too late for wake recovery). */
+  private _warnedChatRecoveryInOnStart = false;
 
   /**
    * Number of active keepAlive() callers. When > 0, `_scheduleNextAlarm()`
@@ -1271,6 +1696,19 @@ export class Agent<
   private _managedFiberTerminalWaiters = new Map<string, Set<() => void>>();
   /** @internal Prevents re-entrant recovery from overlapping alarm ticks. */
   private _runFiberRecoveryInProgress = false;
+  /**
+   * @internal Consecutive runFiber-recovery scans that made NO forward progress
+   * while work was still pending. Drives the exponential backoff of the
+   * recovery follow-up alarm so a repeatedly-throwing recovery hook does not
+   * busy-loop the DO. Reset to 0 whenever a scan recovers anything.
+   */
+  private _recoveryNoProgressScans = 0;
+  /** @internal Single-flight background recovery for parent agent-tool rows. */
+  private _agentToolRunRecoveryPromise: Promise<void> | undefined;
+  /** @internal Serializes detached-backbone arming against concurrent dispatch. */
+  private _detachedBackboneArming: Promise<void> = Promise.resolve();
+  /** @internal Edge-trigger latch for the live-detached-count warning. */
+  private _detachedLiveCountWarned = false;
 
   private _ParentClass: typeof Agent<Env, State> =
     Object.getPrototypeOf(this).constructor;
@@ -1397,7 +1835,31 @@ export class Agent<
           DEFAULT_AGENT_STATIC_OPTIONS.retry.baseDelayMs,
         maxDelayMs:
           userRetry?.maxDelayMs ?? DEFAULT_AGENT_STATIC_OPTIONS.retry.maxDelayMs
-      }
+      },
+      fiberRecoveryHookTimeoutMs:
+        ctor.options?.fiberRecoveryHookTimeoutMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.fiberRecoveryHookTimeoutMs,
+      fiberRecoveryScanDeadlineMs:
+        ctor.options?.fiberRecoveryScanDeadlineMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.fiberRecoveryScanDeadlineMs,
+      fiberRecoveryMaxAgeMs:
+        ctor.options?.fiberRecoveryMaxAgeMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.fiberRecoveryMaxAgeMs,
+      agentToolReattachNoProgressTimeoutMs:
+        ctor.options?.agentToolReattachNoProgressTimeoutMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.agentToolReattachNoProgressTimeoutMs,
+      agentToolReattachMaxWindowMs:
+        ctor.options?.agentToolReattachMaxWindowMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.agentToolReattachMaxWindowMs,
+      detachedMaxBudgetMs:
+        ctor.options?.detachedMaxBudgetMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.detachedMaxBudgetMs,
+      detachedNoProgressBudgetMs:
+        ctor.options?.detachedNoProgressBudgetMs ??
+        DEFAULT_AGENT_STATIC_OPTIONS.detachedNoProgressBudgetMs,
+      maxAlarmMemoryLimitStrikes:
+        ctor.options?.maxAlarmMemoryLimitStrikes ??
+        DEFAULT_AGENT_STATIC_OPTIONS.maxAlarmMemoryLimitStrikes
     };
     return this._cachedOptions;
   }
@@ -1422,6 +1884,53 @@ export class Agent<
       payload,
       timestamp: Date.now()
     } as ObservabilityEvent);
+  }
+
+  /** Run SDK work under a stable parent for platform child spans. */
+  private _withAgentSpan<T>(
+    operation: string,
+    storagePhase: string,
+    attributes: TraceAttributes,
+    run: (update: (attributes: TraceAttributes) => void) => Promise<T>
+  ): Promise<T>;
+  private _withAgentSpan<T>(
+    operation: string,
+    storagePhase: string,
+    attributes: TraceAttributes,
+    run: (update: (attributes: TraceAttributes) => void) => T
+  ): T;
+  private _withAgentSpan<T>(
+    operation: string,
+    storagePhase: string,
+    attributes: TraceAttributes,
+    run: (update: (attributes: TraceAttributes) => void) => T | Promise<T>
+  ): T | Promise<T> {
+    // The instance name is not always readable during construction: facets
+    // restore it after construction and unnamed DOs receive it later.
+    let agentId: string | undefined;
+    try {
+      agentId = this.name;
+    } catch {
+      agentId = undefined;
+    }
+
+    return tracer.withSpan(
+      operation,
+      {
+        "cloudflare.agents.agent.id": agentId,
+        "cloudflare.agents.agent.name": this._ParentClass.name,
+        "cloudflare.agents.operation.name": operation,
+        "cloudflare.agents.storage.grouped": true,
+        "cloudflare.agents.storage.system": "durable_object",
+        "cloudflare.agents.storage.phase": storagePhase,
+        ...attributes
+      },
+      (span) =>
+        run((finishAttributes) => writeSpanAttributes(span, finishAttributes)),
+      agentContext.getStore()?.connection === undefined
+        ? undefined
+        : { boundToInvocation: true }
+    );
   }
 
   /**
@@ -1449,6 +1958,14 @@ export class Agent<
       throw new SqlError(query, e);
     }
   }
+  private _schemaInitialization:
+    | {
+        previousVersion: number;
+        currentVersion: number;
+        migrated: boolean;
+      }
+    | undefined;
+
   /**
    * Create all internal tables and run migrations if needed.
    * Called by the constructor on every wake. Idempotent — skips DDL when
@@ -1718,6 +2235,8 @@ export class Agent<
           summary TEXT,
           output_json TEXT,
           error_message TEXT,
+          interrupted_reason TEXT,
+          child_still_running INTEGER,
           display_metadata TEXT,
           display_order INTEGER NOT NULL DEFAULT 0,
           started_at INTEGER NOT NULL,
@@ -1733,6 +2252,71 @@ export class Agent<
       addColumnIfNotExists(
         "ALTER TABLE cf_agent_tool_runs ADD COLUMN output_json TEXT"
       );
+      // #1630 follow-up: persist the typed interrupted cause so it survives a
+      // reconnect replay (otherwise live clients see `reason`/`childStillRunning`
+      // but reconnecting clients replay them as `undefined`).
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN interrupted_reason TEXT"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN child_still_running INTEGER"
+      );
+      // Detached ("background") runs (rfc-detached-agent-tools). `detached`
+      // marks a run dispatched without an awaiting parent turn;
+      // `detached_on_finish` is the parent METHOD NAME to call on terminal
+      // (durable, eviction-surviving — like a `schedule` callback);
+      // `detached_notify_source` is a caller-controlled chat metadata source for
+      // the `notify` sugar; `detached_max_budget_at` is the absolute give-up
+      // deadline. The four ledger columns implement a two-slot (finish /
+      // give-up) claim+lease so delivery is exactly-once on the happy path and
+      // at-least-once under failure — give-up and finish are INDEPENDENT slots
+      // so a premature give-up can never dedupe a child's real late completion
+      // away (the production incident in #1752).
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached INTEGER NOT NULL DEFAULT 0"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_on_finish TEXT"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_notify_source TEXT"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_max_budget_at INTEGER"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN finish_claimed_at INTEGER"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN finish_delivered_at INTEGER"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN give_up_claimed_at INTEGER"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN give_up_delivered_at INTEGER"
+      );
+      // Detached progress (rfc-detached-agent-tools §progress). The resetting
+      // no-progress window DURATION (not an absolute deadline — it floats with
+      // the child's latest signal) and the parent's last-observed signal time.
+      // The backbone reconcile reads the child's authoritative `progress.at`
+      // via `inspectAgentToolRun`; this cached value is a best-effort liveness
+      // hint observed off the warm tail so a still-warm parent does not have to
+      // inspect on every tick.
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_no_progress_budget_ms INTEGER"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN last_progress_at INTEGER"
+      );
+      // Chat-host `detached: { onMilestones }` convenience (4b): JSON
+      // `{ names, mode }` — the milestone names that inject an idempotent chat
+      // notification when reached, and whether to "react" (model turn) or
+      // "narrate" (synthetic assistant line). Persisted so the cold backbone
+      // reconcile can deliver them after eviction, not only the warm tail.
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_on_milestones TEXT"
+      );
 
       // Mark schema as up-to-date
       this.sql`
@@ -1740,25 +2324,55 @@ export class Agent<
         VALUES (${SCHEMA_VERSION_ROW_ID}, ${String(CURRENT_SCHEMA_VERSION)})
       `;
     }
+
+    this._schemaInitialization = {
+      previousVersion: schemaVersion,
+      currentVersion: CURRENT_SCHEMA_VERSION,
+      migrated: schemaVersion < CURRENT_SCHEMA_VERSION
+    };
   }
 
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
 
-    if (!wrappedClasses.has(this.constructor)) {
-      // Auto-wrap custom methods with agent context
-      this._autoWrapCustomMethods();
-      wrappedClasses.add(this.constructor);
-    }
+    this.mcp = this._withAgentSpan(
+      "agent_initialization",
+      "initialization",
+      {},
+      (update) => {
+        if (!wrappedClasses.has(this.constructor)) {
+          // Auto-wrap custom methods with agent context
+          this._autoWrapCustomMethods();
+          wrappedClasses.add(this.constructor);
+        }
 
-    this._ensureSchema();
+        this._withAgentSpan(
+          "initialize_agent_storage",
+          "initialization",
+          {},
+          (updateStorage) => {
+            this._ensureSchema();
+            const schemaAttributes = {
+              "cloudflare.agents.schema.version.previous":
+                this._schemaInitialization?.previousVersion,
+              "cloudflare.agents.schema.version.current":
+                this._schemaInitialization?.currentVersion,
+              "cloudflare.agents.schema.migrated":
+                this._schemaInitialization?.migrated
+            };
+            updateStorage(schemaAttributes);
+            update(schemaAttributes);
+          }
+        );
 
-    // Initialize MCPClientManager AFTER tables are created
-    this.mcp = new MCPClientManager(this._ParentClass.name, "0.0.1", {
-      storage: this.ctx.storage,
-      createAuthProvider: (callbackUrl) =>
-        this.createMcpOAuthProvider(callbackUrl)
-    });
+        // Initialize MCPClientManager AFTER tables are created
+        return new MCPClientManager(this._ParentClass.name, "0.0.1", {
+          storage: this.ctx.storage,
+          createAuthProvider: (callbackUrl) =>
+            this.createMcpOAuthProvider(callbackUrl)
+        });
+      }
+    );
 
     // Broadcast server state whenever MCP state changes (register, connect, OAuth, remove, etc.)
     this._disposables.add(
@@ -1818,7 +2432,7 @@ export class Agent<
 
     const _onRequest = this.onRequest.bind(this);
     this.onRequest = (request: Request) => {
-      return agentContext.run(
+      return runInInvocation(
         { agent: this, connection: undefined, request, email: undefined },
         async () => {
           // Handle MCP OAuth callback if this is one
@@ -1838,7 +2452,7 @@ export class Agent<
         return;
       }
       this._ensureConnectionWrapped(connection);
-      return agentContext.run(
+      return runInInvocation(
         { agent: this, connection, request: undefined, email: undefined },
         async () => {
           if (typeof message !== "string") {
@@ -1933,7 +2547,7 @@ export class Agent<
                 success: true,
                 type: MessageType.RPC
               };
-              connection.send(JSON.stringify(response));
+              sendRpcResponseIfOpen(connection, response);
             } catch (e) {
               // Send error response
               const response: RPCResponse = {
@@ -1943,7 +2557,7 @@ export class Agent<
                 success: false,
                 type: MessageType.RPC
               };
-              connection.send(JSON.stringify(response));
+              sendRpcResponseIfOpen(connection, response);
               console.error("RPC error:", e);
               this._emit("rpc:error", {
                 method: parsed.method,
@@ -1984,7 +2598,7 @@ export class Agent<
       }
       // TODO: This is a hack to ensure the state is sent after the connection is established
       // must fix this
-      return agentContext.run(
+      return runInInvocation(
         { agent: this, connection, request: ctx.request, email: undefined },
         async () => {
           // Check if connection should be readonly before sending any messages
@@ -2091,7 +2705,7 @@ export class Agent<
       ) {
         return;
       }
-      return agentContext.run(
+      return runInInvocation(
         { agent: this, connection, request: undefined, email: undefined },
         () => {
           this._emit("disconnect", {
@@ -2105,8 +2719,11 @@ export class Agent<
     };
 
     const _onStart = this.onStart.bind(this);
-    this.onStart = async (props?: Props) => {
-      return agentContext.run(
+    const startAgent = async (
+      props: Props | undefined,
+      update: (attributes: TraceAttributes) => void
+    ) => {
+      return runInInvocation(
         {
           agent: this,
           connection: undefined,
@@ -2114,58 +2731,137 @@ export class Agent<
           email: undefined
         },
         async () => {
-          // Hydrate _isFacet from persistent storage so the flag
-          // survives hibernation (the DO constructor resets it to false).
-          const isFacet =
-            await this.ctx.storage.get<boolean>("cf_agents_is_facet");
-          if (isFacet) this._isFacet = true;
+          await this._withAgentSpan(
+            "restore_agent_state",
+            "startup",
+            {},
+            async () => {
+              // Hydrate _isFacet from persistent storage so the flag
+              // survives hibernation (the DO constructor resets it to false).
+              const isFacet =
+                await this.ctx.storage.get<boolean>("cf_agents_is_facet");
+              if (isFacet) this._isFacet = true;
 
-          const storedParentPath = await this.ctx.storage.get<
-            Array<{ className: string; name: string }>
-          >("cf_agents_parent_path");
-          if (isValidParentPath(storedParentPath)) {
-            this._parentPath = storedParentPath;
-          }
-          try {
-            await this._cf_hydrateSubAgentConnectionsFromRoot();
-          } catch (error) {
-            console.warn(
-              "[Agent] Unable to hydrate sub-agent WebSocket connections:",
-              error
-            );
-          }
+              const storedFacetName = await this.ctx.storage.get<string>(
+                "cf_agents_facet_name"
+              );
+              if (typeof storedFacetName === "string") {
+                this._facetName = storedFacetName;
+              }
+
+              const storedParentPath = await this.ctx.storage.get<
+                Array<{ className: string; name: string }>
+              >("cf_agents_parent_path");
+              if (isValidParentPath(storedParentPath)) {
+                this._parentPath = storedParentPath;
+              }
+              try {
+                await this._cf_hydrateSubAgentConnectionsFromRoot();
+              } catch (error) {
+                console.warn(
+                  "[Agent] Unable to hydrate sub-agent WebSocket connections:",
+                  error
+                );
+              }
+            }
+          );
 
           await this._tryCatch(async () => {
-            await this.mcp.restoreConnectionsFromStorage(this.name);
-            await this._restoreRpcMcpServers();
-            this.broadcastMcpServers();
+            // Restore MCP connections before fiber/chat recovery so recovered
+            // turns see MCP tools. Restored connections re-advertise the
+            // capabilities persisted from the previous session; the handlers
+            // behind them attach when onStart() configures them.
+            await this._withAgentSpan(
+              "restore_mcp_connections",
+              "startup",
+              {},
+              async () => {
+                await this.mcp.restoreConnectionsFromStorage(this.name);
+                await this._restoreRpcMcpServers();
+                this.broadcastMcpServers();
+              }
+            );
 
-            this._checkOrphanedWorkflows();
-            await this._checkRunFibers();
-            const recoveredAgentToolFinishes =
-              await this._reconcileAgentToolRuns({
-                deferFinishHooks: true
-              });
+            const startupAgentToolRunIds = await this._withAgentSpan(
+              "recover_agent_work",
+              "startup",
+              {},
+              async () => {
+                this._checkOrphanedWorkflows();
+                await this._checkRunFibers();
+                return this._agentToolRunRecoveryRunIds();
+              }
+            );
+            update({
+              "cloudflare.agents.start.facet": this._isFacet,
+              "cloudflare.agents.recovery.agent_tools.count":
+                startupAgentToolRunIds.length
+            });
+
+            // Chat recovery (above, in `_checkRunFibers`) evaluates its budgets
+            // — and may seal an interrupted turn, firing `onExhausted` — BEFORE
+            // the user's onStart runs. So a `chatRecovery` config produced
+            // inside onStart is applied too late for the recovery that matters.
+            // Snapshot the reference (subclasses like Think / AIChatAgent expose
+            // `chatRecovery`; plain Agents leave it undefined) so we can warn if
+            // onStart swaps in a custom config object below.
+            const chatRecoveryBefore = (this as { chatRecovery?: unknown })
+              .chatRecovery;
 
             this._insideOnStart = true;
             this._warnedScheduleInOnStart.clear();
             let result: Awaited<ReturnType<typeof _onStart>>;
             try {
-              result = await _onStart(props);
+              result = await this._withAgentSpan(
+                "run_user_on_start",
+                "startup",
+                {},
+                () => _onStart(props)
+              );
             } finally {
               this._insideOnStart = false;
             }
-            // Recovered finish hooks run only after successful user startup.
-            // If onStart fails, durable recovery state is already finalized,
-            // but user hook side effects may depend on startup-initialized mirrors.
-            await this._runDeferredAgentToolFinishHooks(
-              recoveredAgentToolFinishes
-            );
+
+            const chatRecoveryAfter = (this as { chatRecovery?: unknown })
+              .chatRecovery;
+            // Warn when onStart swaps in a recovery config that would have
+            // mattered: a custom config object OR `chatRecovery = true`
+            // (enabling recovery / its defaults too late). Setting `false`
+            // (disabling) is intentionally NOT warned — recovery already ran
+            // with the pre-onStart value, so disabling here is a benign no-op
+            // for the wake that just happened, not the silent-misconfig bug.
+            const chatRecoveryAfterMatters =
+              (typeof chatRecoveryAfter === "object" &&
+                chatRecoveryAfter !== null) ||
+              chatRecoveryAfter === true;
+            if (
+              !this._warnedChatRecoveryInOnStart &&
+              chatRecoveryBefore !== chatRecoveryAfter &&
+              chatRecoveryAfterMatters
+            ) {
+              this._warnedChatRecoveryInOnStart = true;
+              console.warn(
+                "[Agent] `chatRecovery` was assigned during onStart(). Chat " +
+                  "recovery evaluates its budgets (and may seal an interrupted " +
+                  "turn, firing onExhausted) on wake BEFORE onStart() runs, so a " +
+                  "config set here is applied too late and the built-in defaults " +
+                  "are used for the recovery that matters. Assign `chatRecovery` " +
+                  "as a class field or in the constructor instead."
+              );
+            }
+
+            this._scheduleAgentToolRunRecovery({
+              runIds: startupAgentToolRunIds
+            });
             return result;
           });
         }
       );
     };
+    this.onStart = (props?: Props) =>
+      this._withAgentSpan("agent_start", "startup", {}, (update) =>
+        startAgent(props, update)
+      );
   }
 
   /**
@@ -2226,8 +2922,6 @@ export class Agent<
    * @param excludeIds Additional connection IDs to exclude (e.g. the source)
    */
   private _broadcastProtocol(msg: string, excludeIds: string[] = []) {
-    if (this._suppressProtocolBroadcasts) return;
-
     const exclude = [...excludeIds, ...this._protocolBroadcastExcludeIds];
     for (const conn of this.getConnections()) {
       if (!this.isConnectionProtocolEnabled(conn)) {
@@ -2267,12 +2961,15 @@ export class Agent<
     this.ctx.waitUntil(
       (async () => {
         try {
-          await agentContext.run(
+          await runInInvocation(
             { agent: this, connection, request, email },
             async () => {
               this._emit("state:update");
               await this._callStatePersistenceHook(nextState, source);
-            }
+            },
+            // Runs past the handler that set the state, on waitUntil's own
+            // extension of the invocation.
+            { detached: true }
           );
         } catch (e) {
           // onStateChanged/onStateUpdate errors should not affect state or broadcasts
@@ -2314,6 +3011,37 @@ export class Agent<
    */
   private _ensureConnectionWrapped(connection: Connection) {
     if (this._rawStateAccessors.has(connection)) return;
+
+    // As of compatibility date 2026-03-17 the runtime defaults a server-side
+    // WebSocket's `binaryType` to "blob" (the `websocket_standard_binary_type`
+    // flag), so binary frames arrive as `Blob` instead of `ArrayBuffer`. The
+    // Agent protocol and every downstream consumer (e.g. voice audio frames,
+    // user-defined `onMessage` handlers that do `message instanceof ArrayBuffer`)
+    // have always relied on binary frames being delivered as `ArrayBuffer`.
+    //
+    // For non-hibernating agents (`static options = { hibernate: false }`)
+    // messages are delivered through `addEventListener("message", ...)`, where
+    // this new default applies and would silently break binary handling. Pin
+    // it back to "arraybuffer" so the contract holds regardless of the app's
+    // compatibility date. This first runs in `onConnect` before the client can
+    // send any frame, so it takes effect for every message on the connection.
+    //
+    // This is defense-in-depth: partyserver >= 0.5.7 also pins `binaryType` in
+    // `accept()`, but agents may run against an older partyserver or a custom
+    // connection, so we keep our own pin. It runs once per connection per
+    // isolate lifetime (gated by the `_rawStateAccessors` check above); after a
+    // hibernation wake that in-memory map is empty, so it re-pins on the first
+    // call. The hibernatable `webSocketMessage` handler always delivers
+    // `ArrayBuffer` regardless of this flag, so for hibernating agents this is a
+    // harmless no-op.
+    try {
+      if (connection.binaryType !== "arraybuffer") {
+        connection.binaryType = "arraybuffer";
+      }
+    } catch {
+      // Some connection shims may not expose a settable `binaryType`; the
+      // protocol still works for string frames, so ignore and continue.
+    }
 
     // Determine whether `state` is an accessor (getter) or a data property.
     // partyserver always defines `state` as a getter via Object.defineProperties,
@@ -2642,7 +3370,7 @@ export class Agent<
         payload._bridge.reply(options)
     };
 
-    return agentContext.run(
+    return runInInvocation(
       { agent: this, connection: undefined, request: undefined, email },
       async () => {
         this._emit("email:receive", {
@@ -3031,7 +3759,7 @@ export class Agent<
             continue;
           }
           const { connection, request, email } = agentContext.getStore() || {};
-          await agentContext.run(
+          await runInInvocation(
             {
               agent: this,
               connection,
@@ -3085,7 +3813,10 @@ export class Agent<
               } finally {
                 this.dequeue(row.id);
               }
-            }
+            },
+            // The drain loop is started with `void` and routinely outlives the
+            // handler that enqueued the item.
+            { detached: true }
           );
         }
       }
@@ -3214,9 +3945,22 @@ export class Agent<
     }
 
     return (await getServerByName<Cloudflare.Env, Agent>(
-      binding as DurableObjectNamespace<Agent>,
+      binding as unknown as DurableObjectNamespace<Agent>,
       root.name
     )) as unknown as RootFacetRpcSurface;
+  }
+
+  private _cf_rootResolvesToSelf(): boolean {
+    const root = this._parentPath[0];
+    if (!root) return false;
+
+    const ctx = this.ctx as unknown as Partial<FacetCapableCtx>;
+    const binding = ctx.exports?.[root.className] as
+      | DurableObjectNamespace
+      | undefined;
+    if (!binding?.idFromName) return false;
+
+    return binding.idFromName(root.name).equals(this.ctx.id);
   }
 
   private _validateScheduleCallback(
@@ -4123,6 +4867,21 @@ export class Agent<
       if (disposed) return;
       disposed = true;
       this._keepAliveRefs = Math.max(0, this._keepAliveRefs - 1);
+      // When the last lease is released, recompute the alarm from persistent
+      // state so a short-lived keepAlive does not leave a stale
+      // `now + keepAliveIntervalMs` heartbeat armed. The dispose contract is
+      // synchronous, so fire-and-forget the async reschedule via waitUntil
+      // (mirrors `_cf_releaseFacetKeepAlive`).
+      if (this._keepAliveRefs === 0) {
+        this.ctx.waitUntil(
+          this._scheduleNextAlarm().catch((e) => {
+            console.error(
+              "[Agent] Failed to reschedule alarm after keepAlive dispose:",
+              e
+            );
+          })
+        );
+      }
     };
   }
 
@@ -4334,31 +5093,108 @@ export class Agent<
     }
   }
 
+  private _fiberRecoveryPayload(
+    ctx: FiberRecoveryContext,
+    managedRow: FiberLedgerRow | null,
+    startedAt?: number
+  ): Record<string, unknown> {
+    return {
+      fiberId: ctx.id,
+      fiberName: ctx.name,
+      managed: managedRow !== null,
+      recoveryReason: ctx.recoveryReason,
+      elapsedMs: startedAt === undefined ? undefined : Date.now() - startedAt
+    };
+  }
+
+  private async _withFiberRecoveryTimeout<T>(
+    ctx: FiberRecoveryContext,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const timeoutMs = this._resolvedOptions.fiberRecoveryHookTimeoutMs;
+    if (timeoutMs <= 0) return operation();
+
+    // Note: this bounds how long we WAIT for the operation, but does not
+    // cancel it — `operation` keeps running after the timeout rejects. It is
+    // applied to internal framework recovery only, which is idempotent and
+    // safe to abandon mid-flight.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(
+              new Error(
+                `Fiber recovery hook timed out after ${timeoutMs}ms for "${ctx.name}" (${ctx.id})`
+              )
+            );
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private _recordFiberRecoveryFailure(
+    ctx: FiberRecoveryContext,
+    managedRow: FiberLedgerRow | null,
+    error: unknown,
+    startedAt: number,
+    reason = "handler_error"
+  ): void {
+    const errorMessage = this._fiberErrorMessage(error);
+    const completedAt = Date.now();
+    if (managedRow) {
+      this.sql`
+        UPDATE cf_agents_fibers
+        SET status = 'error',
+            error_message = ${errorMessage},
+            completed_at = ${completedAt}
+        WHERE fiber_id = ${ctx.id}
+          AND status = 'interrupted'
+      `;
+      this._notifyManagedFiberTerminal(ctx.id);
+    }
+    this._emit("fiber:recovery:failed", {
+      ...this._fiberRecoveryPayload(ctx, managedRow, startedAt),
+      error: errorMessage,
+      reason
+    });
+  }
+
   private async _runFiberRecoveryHook(
     ctx: FiberRecoveryContext,
     managedRow: FiberLedgerRow | null
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const startedAt = Date.now();
+    this._emit(
+      "fiber:recovery:attempt",
+      this._fiberRecoveryPayload(ctx, managedRow)
+    );
     try {
-      const handled = await this._handleInternalFiberRecovery(ctx);
+      const handled = await this._withFiberRecoveryTimeout(ctx, () =>
+        this._handleInternalFiberRecovery(ctx)
+      );
       if (!handled) {
         const recoveryResult = await this.onFiberRecovered(ctx);
         if (managedRow && recoveryResult) {
           this._applyManagedFiberRecoveryResult(ctx.id, recoveryResult);
         }
       }
+      this._emit("fiber:recovery:handled", {
+        ...this._fiberRecoveryPayload(ctx, managedRow, startedAt),
+        status: handled ? "internal" : managedRow ? "managed" : "user"
+      });
+      return true;
     } catch (e) {
-      if (managedRow) {
-        this.sql`
-          UPDATE cf_agents_fibers
-          SET error_message = ${this._fiberErrorMessage(e)}
-          WHERE fiber_id = ${ctx.id}
-            AND status = 'interrupted'
-        `;
-      }
+      this._recordFiberRecoveryFailure(ctx, managedRow, e, startedAt);
       console.error(
         `[Agent] Fiber recovery failed for "${ctx.name}" (${ctx.id}):`,
         e
       );
+      return false;
     }
   }
 
@@ -4640,6 +5476,23 @@ export class Agent<
     return this._runFiberInternal(nanoid(), name, fn);
   }
 
+  /**
+   * Internal framework entry point for fibers that need to compose their own
+   * recovery metadata with user checkpoint data while preserving the public
+   * `this.stash()` behavior.
+   *
+   * This deliberately stays protected/internal rather than becoming a public
+   * `runFiber()` option until the durable execution API needs this generality.
+   * @internal
+   */
+  protected async _runFiberWithStashWrapper<T>(
+    name: string,
+    fn: (ctx: FiberContext) => Promise<T>,
+    options: Pick<InternalFiberOptions, "initialSnapshot" | "wrapStash">
+  ): Promise<T> {
+    return this._runFiberInternal(nanoid(), name, fn, options);
+  }
+
   async startFiber(
     name: string,
     fn: (ctx: FiberContext) => Promise<void>,
@@ -4800,25 +5653,63 @@ export class Agent<
     id: string,
     name: string,
     fn: (ctx: FiberContext) => Promise<T>,
-    options?: {
-      signal?: AbortSignal;
-      managed?: boolean;
-      beforeRunCleanup?: (
-        outcome: { ok: true } | { ok: false; error: unknown }
-      ) => void;
-    }
+    options?: InternalFiberOptions
   ): Promise<T> {
     const signal = options?.signal ?? new AbortController().signal;
-    this.sql`
-      INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
-      VALUES (${id}, ${name}, NULL, ${Date.now()})
-    `;
+    this._withAgentSpan(
+      "initialize_fiber",
+      "fiber",
+      {
+        "cloudflare.agents.fiber.id": id,
+        "cloudflare.agents.fiber.name": name
+      },
+      () => {
+        this.sql`
+          INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
+          VALUES (${id}, ${name}, NULL, ${Date.now()})
+        `;
+      }
+    );
+    const startedAt = Date.now();
+    this._emit("fiber:run:started", {
+      fiberId: id,
+      fiberName: name,
+      managed: options?.managed === true
+    });
     this._runFiberActiveFibers.add(id);
+
+    const writeSnapshot = (data: unknown) => {
+      const snapshot = JSON.stringify(data);
+      this._withAgentSpan(
+        "persist_fiber_snapshot",
+        "fiber",
+        {
+          "cloudflare.agents.fiber.id": id,
+          "cloudflare.agents.fiber.name": name
+        },
+        () => {
+          this.sql`
+            UPDATE cf_agents_runs SET snapshot = ${snapshot}
+            WHERE id = ${id}
+          `;
+          if (options?.managed) {
+            this.sql`
+              UPDATE cf_agents_fibers SET snapshot = ${snapshot}
+              WHERE fiber_id = ${id}
+            `;
+          }
+        }
+      );
+    };
 
     let root: RootFacetRpcSurface | undefined;
     let registeredFacetRun = false;
     let dispose: () => void = () => {};
     try {
+      if ("initialSnapshot" in (options ?? {})) {
+        writeSnapshot(options?.initialSnapshot);
+      }
+
       if (this._isFacet) {
         root = await this._rootAlarmOwner();
         await root._cf_registerFacetRun(this.selfPath, id);
@@ -4827,17 +5718,7 @@ export class Agent<
 
       dispose = await this.keepAlive();
       const stash = (data: unknown) => {
-        const snapshot = JSON.stringify(data);
-        this.sql`
-          UPDATE cf_agents_runs SET snapshot = ${snapshot}
-          WHERE id = ${id}
-        `;
-        if (options?.managed) {
-          this.sql`
-            UPDATE cf_agents_fibers SET snapshot = ${snapshot}
-            WHERE fiber_id = ${id}
-          `;
-        }
+        writeSnapshot(options?.wrapStash ? options.wrapStash(data) : data);
       };
 
       try {
@@ -4845,14 +5726,37 @@ export class Agent<
           fn({ id, signal, stash, snapshot: null })
         );
         options?.beforeRunCleanup?.({ ok: true });
+        this._emit("fiber:run:completed", {
+          fiberId: id,
+          fiberName: name,
+          managed: options?.managed === true,
+          elapsedMs: Date.now() - startedAt
+        });
         return result;
       } catch (error) {
         options?.beforeRunCleanup?.({ ok: false, error });
+        this._emit("fiber:run:failed", {
+          fiberId: id,
+          fiberName: name,
+          managed: options?.managed === true,
+          error: this._fiberErrorMessage(error),
+          elapsedMs: Date.now() - startedAt
+        });
         throw error;
       }
     } finally {
       this._runFiberActiveFibers.delete(id);
-      this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
+      this._withAgentSpan(
+        "finalize_fiber",
+        "fiber",
+        {
+          "cloudflare.agents.fiber.id": id,
+          "cloudflare.agents.fiber.name": name
+        },
+        () => {
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
+        }
+      );
       dispose();
       if (root && registeredFacetRun) {
         try {
@@ -4917,6 +5821,13 @@ export class Agent<
   private async _checkRunFibers(): Promise<void> {
     if (this._runFiberRecoveryInProgress) return;
     this._runFiberRecoveryInProgress = true;
+    const scanStartedAt = Date.now();
+    const scanDeadlineMs = this._resolvedOptions.fiberRecoveryScanDeadlineMs;
+    const fiberRecoveryMaxAgeMs = this._resolvedOptions.fiberRecoveryMaxAgeMs;
+    // Forward progress this scan = at least one fiber was resolved (orphan row
+    // deleted via recovery/age-out/managed-terminal, or a ledger-only managed
+    // fiber finalized). Drives the recovery-alarm backoff in `_scheduleNextAlarm`.
+    let madeProgress = false;
 
     try {
       const rows = this.sql<{
@@ -4927,6 +5838,15 @@ export class Agent<
       }>`SELECT id, name, snapshot, created_at FROM cf_agents_runs`;
 
       for (const row of rows) {
+        if (scanDeadlineMs > 0 && Date.now() - scanStartedAt > scanDeadlineMs) {
+          this._emit("fiber:recovery:skipped", {
+            fiberId: row.id,
+            fiberName: row.name,
+            reason: "scan_deadline_exceeded",
+            elapsedMs: Date.now() - scanStartedAt
+          });
+          break;
+        }
         if (this._runFiberActiveFibers.has(row.id)) continue;
 
         const snapshot = this._parseFiberRecoverySnapshot(row.id, row.snapshot);
@@ -4934,13 +5854,26 @@ export class Agent<
           id: row.id,
           name: row.name,
           snapshot,
-          createdAt: row.created_at
+          createdAt: row.created_at,
+          recoveryReason: "interrupted"
         };
 
         const managedRow = this._readFiber(row.id);
+        this._emit("fiber:recovery:detected", {
+          ...this._fiberRecoveryPayload(ctx, managedRow),
+          elapsedMs: Date.now() - row.created_at
+        });
+        this._emit("fiber:run:interrupted", {
+          fiberId: row.id,
+          fiberName: row.name,
+          managed: managedRow !== null,
+          recoveryReason: "interrupted",
+          elapsedMs: Date.now() - row.created_at
+        });
         if (managedRow) {
           if (this._isTerminalFiberStatus(managedRow.status)) {
             this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+            madeProgress = true;
             this._notifyManagedFiberTerminal(row.id);
             continue;
           }
@@ -4959,8 +5892,26 @@ export class Agent<
           ctx.status = "interrupted";
         }
 
-        await this._runFiberRecoveryHook(ctx, managedRow);
-        this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+        const recovered = await this._runFiberRecoveryHook(ctx, managedRow);
+        // Managed rows are always cleaned up (their ledger row records the
+        // terminal status). Unmanaged rows are retained when recovery fails so
+        // a later scan can retry — but only until they exceed the max age, at
+        // which point a repeatedly-throwing hook would otherwise loop forever.
+        const tooOld =
+          fiberRecoveryMaxAgeMs > 0 &&
+          Date.now() - row.created_at > fiberRecoveryMaxAgeMs;
+        if (recovered || managedRow || tooOld) {
+          if (!recovered && !managedRow && tooOld) {
+            this._emit("fiber:recovery:skipped", {
+              fiberId: row.id,
+              fiberName: row.name,
+              reason: "max_age_exceeded",
+              elapsedMs: Date.now() - row.created_at
+            });
+          }
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+          madeProgress = true;
+        }
         if (managedRow) {
           this._notifyManagedFiberTerminal(row.id);
         }
@@ -4977,6 +5928,16 @@ export class Agent<
       `;
 
       for (const row of ledgerOnlyRows) {
+        if (scanDeadlineMs > 0 && Date.now() - scanStartedAt > scanDeadlineMs) {
+          this._emit("fiber:recovery:skipped", {
+            fiberId: row.fiber_id,
+            fiberName: row.name,
+            reason: "scan_deadline_exceeded",
+            elapsedMs: Date.now() - scanStartedAt,
+            managed: true
+          });
+          break;
+        }
         if (this._runFiberActiveFibers.has(row.fiber_id)) continue;
 
         const snapshot = this._parseFiberRecoverySnapshot(
@@ -4992,22 +5953,47 @@ export class Agent<
             AND status IN ('pending', 'running')
         `;
 
-        await this._runFiberRecoveryHook(
-          {
-            id: row.fiber_id,
-            name: row.name,
-            snapshot,
-            createdAt: row.created_at,
-            idempotencyKey: row.idempotency_key ?? undefined,
-            metadata: this._parseFiberJsonObject(row.metadata_json),
-            status: "interrupted"
-          },
-          row
-        );
+        const ctx: FiberRecoveryContext = {
+          id: row.fiber_id,
+          name: row.name,
+          snapshot,
+          createdAt: row.created_at,
+          idempotencyKey: row.idempotency_key ?? undefined,
+          metadata: this._parseFiberJsonObject(row.metadata_json),
+          status: "interrupted",
+          recoveryReason: "interrupted"
+        };
+        this._emit("fiber:recovery:detected", {
+          ...this._fiberRecoveryPayload(ctx, row),
+          elapsedMs: Date.now() - row.created_at
+        });
+        this._emit("fiber:run:interrupted", {
+          fiberId: row.fiber_id,
+          fiberName: row.name,
+          managed: true,
+          recoveryReason: "interrupted",
+          elapsedMs: Date.now() - row.created_at
+        });
+
+        await this._runFiberRecoveryHook(ctx, row);
+        // A ledger-only fiber is finalized this pass regardless of hook outcome
+        // (its ledger row is marked terminal and waiters are notified), so it
+        // will not be pending next scan — that is forward progress.
+        madeProgress = true;
         this._notifyManagedFiberTerminal(row.fiber_id);
       }
     } finally {
       this._runFiberRecoveryInProgress = false;
+      // Update the recovery-alarm backoff streak: reset on any forward progress,
+      // otherwise grow it only while work is still pending (a repeatedly-failing
+      // poison hook). `_scheduleNextAlarm` reads this to space out retries.
+      if (madeProgress) {
+        this._recoveryNoProgressScans = 0;
+      } else {
+        this._recoveryNoProgressScans = this._hasPendingFiberRecovery()
+          ? this._recoveryNoProgressScans + 1
+          : 0;
+      }
     }
   }
 
@@ -5181,6 +6167,69 @@ export class Agent<
   }
 
   /**
+   * Invoke an RPC method on this Agent or a descendant facet identified
+   * by a root-first path. Used by AgentWorkflow to route callbacks and
+   * `this.agent` calls back to the exact sub-agent that started a workflow.
+   * @internal
+   */
+  async _cf_invokeAgentPath(
+    targetPath: ReadonlyArray<AgentPathStep>,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    await this.__unsafe_ensureInitialized();
+
+    const selfPath = this.selfPath;
+    if (!this._isSameAgentPathPrefix(selfPath, targetPath)) {
+      throw new Error(
+        `Workflow origin path does not descend from ${JSON.stringify(selfPath)}.`
+      );
+    }
+
+    if (selfPath.length === targetPath.length) {
+      // Match real DO-stub RPC semantics: refuse JS-internal probes
+      // (`constructor`, `toString`, symbol keys, thenable checks, …) and
+      // anything inherited from `Object.prototype` so a facet-origin workflow
+      // cannot reach a method surface a top-level workflow's stub would deny.
+      // The framework's own `_workflow_*` / `_cf_*` RPC methods and any
+      // user-defined Agent methods live on the subclass prototype, not
+      // `Object.prototype`, so they remain callable.
+      const target = this as unknown as Record<string, unknown>;
+      const fn = target[method];
+      if (
+        isInternalJsStubProp(method) ||
+        method in Object.prototype ||
+        typeof fn !== "function"
+      ) {
+        throw new Error(
+          `Workflow origin method "${method}" is not callable on ${this.constructor.name}.`
+        );
+      }
+      return await (fn as (...methodArgs: unknown[]) => unknown).apply(
+        this,
+        args
+      );
+    }
+
+    const next = targetPath[selfPath.length];
+    if (!this.hasSubAgent(next.className, next.name)) {
+      throw new Error(
+        `Workflow origin sub-agent ${next.className} "${next.name}" no longer exists.`
+      );
+    }
+
+    const stub = await this._cf_resolveSubAgent(next.className, next.name);
+    const handle = stub as unknown as {
+      _cf_invokeAgentPath(
+        path: ReadonlyArray<AgentPathStep>,
+        method: string,
+        args: unknown[]
+      ): Promise<unknown>;
+    };
+    return await handle._cf_invokeAgentPath(targetPath, method, args);
+  }
+
+  /**
    * Recursively destroy a descendant facet identified by
    * `targetPath`. Walks down from `selfPath` until reaching the
    * target's immediate parent, where it cancels the target's
@@ -5266,7 +6315,7 @@ export class Agent<
       return;
     }
 
-    await agentContext.run(
+    await runInInvocation(
       {
         agent: this,
         connection: undefined,
@@ -5299,6 +6348,45 @@ export class Agent<
           return;
         }
 
+        // A one-shot row is deleted by `alarm()` once this returns normally.
+        // If it fails with a superseded-isolate error (a deploy / code update
+        // replaced the isolate — "reset because its code was updated" or "this
+        // script has been upgraded"), burning in-process retries is futile
+        // (code never reloads mid-invocation) and swallowing the error would
+        // let `alarm()` delete the row — permanently abandoning the work (e.g.
+        // an interrupted chat-recovery continuation, or a queued submission's
+        // drain alarm, leaving the submission orphaned with no driver). For
+        // that transient we skip the doomed retries and re-throw so `alarm()`
+        // rejects, the one-shot row survives, and the platform re-runs it on a
+        // fresh isolate (= new code) under the at-least-once alarm guarantee.
+        //
+        // Other platform transients ("Network connection lost." / errors the
+        // platform flags `retryable`) MAY succeed on an in-process retry (a
+        // momentary blip), so they keep the normal retry budget — but if the
+        // budget drains while the platform is still unhealthy (#1730: a
+        // deploy-reset window outlasts the few-seconds retry schedule by
+        // design), the row is deferred on exhaustion instead of consumed: the
+        // platform failed, not the callback, and the same work succeeds when
+        // the alarm re-fires in the healthy window that follows. A genuinely
+        // failing callback throws application-shaped errors (none of the
+        // platform signals) and is still abandoned after `maxAttempts` exactly
+        // as before.
+        const isOneShotSchedule =
+          row.type === "delayed" || row.type === "scheduled";
+        const shouldDeferReset = (error: unknown): boolean =>
+          isOneShotSchedule && isDurableObjectCodeUpdateReset(error);
+        const shouldDeferOnExhaustion = (error: unknown): boolean =>
+          isOneShotSchedule && isPlatformTransientError(error);
+        // A memory-limit reset is re-thrown (not swallowed) so the one-shot row
+        // is preserved and the error reaches the alarm-boundary circuit breaker
+        // (#1825), which bounds it: it tolerates a few strikes (a transient
+        // spike may clear on a fresh isolate) and then seals + purges the
+        // looping row. Deferral is only SAFE because that breaker bounds it —
+        // re-running a deterministic OOM forever is exactly what we must avoid,
+        // and without the breaker this would amplify the loop (see retries.ts).
+        const shouldDeferMemoryLimit = (error: unknown): boolean =>
+          isOneShotSchedule && isDurableObjectMemoryLimitReset(error);
+
         try {
           this._emit("schedule:execute", {
             callback: row.callback,
@@ -5323,9 +6411,31 @@ export class Agent<
                 ) => Promise<void>
               ).bind(this)(parsedPayload, row as unknown as Schedule<unknown>);
             },
-            { baseDelayMs, maxDelayMs }
+            {
+              baseDelayMs,
+              maxDelayMs,
+              shouldRetry: (error) => !shouldDeferReset(error)
+            }
           );
         } catch (e) {
+          if (shouldDeferReset(e)) {
+            console.warn(
+              `Deferring scheduled callback "${row.callback}" to a fresh invocation after a Durable Object code-update reset; the one-shot row is preserved and the alarm will re-run on new code.`
+            );
+            throw e;
+          }
+          if (shouldDeferOnExhaustion(e)) {
+            console.warn(
+              `Deferring scheduled callback "${row.callback}" after exhausting in-process retries on a transient platform error; the one-shot row is preserved and the alarm will re-run once the platform recovers.`
+            );
+            throw e;
+          }
+          if (shouldDeferMemoryLimit(e)) {
+            console.warn(
+              `Deferring scheduled callback "${row.callback}" to the alarm memory-limit circuit breaker after a Durable Object memory-limit reset; the one-shot row is preserved so the breaker can bound the retry loop and seal it (#1825).`
+            );
+            throw e;
+          }
           console.error(
             `error executing callback "${row.callback}" after ${maxAttempts} attempts`,
             e
@@ -5346,7 +6456,50 @@ export class Agent<
     );
   }
 
-  private async _scheduleNextAlarm() {
+  /**
+   * Whether any runFiber recovery work is still outstanding: orphaned
+   * `cf_agents_runs` rows left by a dead process (excluding fibers currently
+   * executing in memory, which already hold a keepAlive ref) or managed
+   * ledger fibers stuck in a non-terminal state with no live run row.
+   *
+   * Used by `_scheduleNextAlarm` to arm a follow-up alarm so multi-pass
+   * recovery (e.g. after a scan-deadline yield, or while retrying a throwing
+   * recovery hook) resumes instead of starving.
+   * @internal
+   */
+  private _hasPendingFiberRecovery(): boolean {
+    const runRows = this.sql<{ id: string }>`
+      SELECT id FROM cf_agents_runs
+    `;
+    for (const row of runRows) {
+      if (!this._runFiberActiveFibers.has(row.id)) return true;
+    }
+
+    const ledgerOnly = this.sql<{ count: number }>`
+      SELECT COUNT(*) AS count
+      FROM cf_agents_fibers f
+      LEFT JOIN cf_agents_runs r ON r.id = f.fiber_id
+      WHERE f.status IN ('pending', 'running')
+        AND r.id IS NULL
+    `;
+    return (ledgerOnly[0]?.count ?? 0) > 0;
+  }
+
+  private async _scheduleNextAlarm(): Promise<void> {
+    await this._withAgentSpan("schedule_agent_alarm", "alarm", {}, () =>
+      this._scheduleNextAlarmBody()
+    );
+  }
+
+  private async _scheduleNextAlarmBody(): Promise<void> {
+    // A pending destroy (#1625) owns the alarm: keep it armed immediately so
+    // teardown lands, and never let the "no work pending" branch below
+    // delete it out from under `_cf_scheduleDestroy`.
+    if (await this._hasPendingDestroy()) {
+      await this.ctx.storage.setAlarm(Date.now());
+      return;
+    }
+
     const nowMs = Date.now();
     const nowSeconds = Math.floor(nowMs / 1000);
     const hungCutoffSeconds =
@@ -5407,6 +6560,34 @@ export class Agent<
         nextTimeMs === null ? keepAliveMs : Math.min(nextTimeMs, keepAliveMs);
     }
 
+    // Fibers left behind by a dead process (orphaned `cf_agents_runs` rows or
+    // interrupted/pending managed ledger rows) are recovered by the alarm-
+    // driven scan. A single scan can leave work behind — it yields once it
+    // crosses `fiberRecoveryScanDeadlineMs`, and a repeatedly-throwing
+    // unmanaged recovery hook keeps its row until it ages out. Without a
+    // follow-up alarm those leftovers would starve, since the orphans hold no
+    // keepAlive ref. Arm one so recovery resumes.
+    //
+    // The delay backs off exponentially while scans make no forward progress
+    // (a poison hook that keeps throwing, or a `fiberRecoveryMaxAgeMs: 0`
+    // retain-forever row) so the DO is not woken every `keepAliveIntervalMs`
+    // indefinitely. A scan that recovers anything resets the streak (see
+    // `_checkRunFibers`), so legitimate multi-pass draining stays prompt.
+    if (this._hasPendingFiberRecovery()) {
+      const base = this._resolvedOptions.keepAliveIntervalMs;
+      const exp = Math.min(
+        this._recoveryNoProgressScans,
+        FIBER_RECOVERY_BACKOFF_MAX_EXP
+      );
+      const recoveryDelayMs = Math.min(
+        FIBER_RECOVERY_MAX_BACKOFF_MS,
+        base * 2 ** exp
+      );
+      const recoveryMs = nowMs + recoveryDelayMs;
+      nextTimeMs =
+        nextTimeMs === null ? recoveryMs : Math.min(nextTimeMs, recoveryMs);
+    }
+
     const facetRuns = this.sql<{ count: number }>`
       SELECT COUNT(*) as count FROM cf_agents_facet_runs
     `;
@@ -5448,6 +6629,44 @@ export class Agent<
    * See {@link https://developers.cloudflare.com/agents/api-reference/schedule-tasks/}
    */
   async alarm() {
+    // A pending destroy (#1625) pre-empts everything — including
+    // `super.alarm()`'s onStart, which would re-initialize user state on a
+    // condemned agent. This is both the landing point for the deferred
+    // teardown scheduled by `_cf_scheduleDestroy` (which arms an immediate
+    // alarm precisely so teardown runs here, with this invocation's full
+    // execution budget) and the convergence point for a destroy that a
+    // previous invocation started but couldn't finish.
+    if (await this._hasPendingDestroy()) {
+      await this.destroy();
+      return;
+    }
+
+    // Outermost alarm frame: a Durable Object memory-limit reset (#1825) that
+    // propagates here would otherwise be re-thrown to the platform, which
+    // auto-retries the alarm forever — the OOM crash loop. Intercept ONLY that
+    // class (everything else re-throws, unchanged) and break the loop from the
+    // boundary, where the heavy turn has unwound and GC has reclaimed its
+    // footprint, so the seal/purge writes can land where mid-turn ones OOMed.
+    try {
+      await this._cf_runAlarmBody();
+      // A clean alarm clears the strike counter so the breaker bounds
+      // CONSECUTIVE memory-limit resets, not lifetime ones (#1825). Without
+      // this a Durable Object that hits rare, non-consecutive transient
+      // spikes (e.g. one a month) would eventually reach the strike budget
+      // and wrongly seal healthy recovery work.
+      await this._cf_clearAlarmMemoryLimitStrikes();
+    } catch (error) {
+      if (!isDurableObjectMemoryLimitReset(error)) throw error;
+      await this._cf_handleAlarmMemoryLimitReset(error);
+    }
+  }
+
+  /**
+   * The alarm body: PartyServer init + due-schedule processing + housekeeping +
+   * next-alarm arm. Extracted from {@link alarm} so the memory-limit circuit
+   * breaker can wrap it at the outermost frame (see {@link alarm}).
+   */
+  private async _cf_runAlarmBody() {
     // Ensure PartyServer initialization (name resolution, onStart) runs
     // before processing any scheduled tasks.
     await super.alarm();
@@ -5555,7 +6774,13 @@ export class Agent<
             continue;
           }
         } else {
+          // Record the row id so the alarm-boundary circuit breaker can purge
+          // the exact looping row if this callback ends in a memory-limit reset
+          // (#1825). Cleared only on success; on a throw it propagates with the
+          // id still set, and the breaker clears it.
+          this._cf_executingScheduleRowId = row.id;
           await this._executeScheduleCallback(row);
+          this._cf_executingScheduleRowId = undefined;
           executed = true;
         }
 
@@ -5592,6 +6817,176 @@ export class Agent<
 
     // Schedule the next alarm
     await this._scheduleNextAlarm();
+  }
+
+  /**
+   * Durable storage key for the alarm memory-limit strike counter (#1825).
+   */
+  private static readonly _CF_OOM_ALARM_STRIKES_KEY =
+    "cf_agents:oom_alarm_strikes";
+
+  /**
+   * The schedule row id currently executing in the alarm loop, so the
+   * memory-limit circuit breaker can purge the exact looping row (#1825).
+   * `undefined` outside a callback (e.g. an OOM from `super.alarm()`/onStart).
+   */
+  private _cf_executingScheduleRowId?: string;
+
+  /**
+   * The schedule-callback names whose alarm rows drive a recovery loop that can
+   * deterministically OOM. The base agent has none; chat hosts (`Think`,
+   * `AIChatAgent`) override this to return their recovery continuation callbacks
+   * so the circuit breaker can surgically back them off / purge them WITHOUT
+   * disturbing unrelated scheduled tasks. See {@link _cf_handleAlarmMemoryLimitReset}.
+   */
+  protected _cf_recoveryAlarmCallbacks(): string[] {
+    return [];
+  }
+
+  /**
+   * Hook for a host to terminalize ("seal") any in-flight recovery work as an
+   * out-of-memory exhaustion when the alarm circuit breaker trips at its strike
+   * budget (#1825). Runs at the outermost alarm frame (post-unwind, so writes
+   * can land). Default: no-op. Chat hosts override to fire `onExhausted` + the
+   * terminal banner and persist the sealed incident.
+   */
+  protected async _cf_sealMemoryLimitedRecovery(): Promise<void> {}
+
+  /**
+   * Clear the durable memory-limit strike counter after a clean alarm so the
+   * circuit breaker counts CONSECUTIVE resets rather than lifetime ones
+   * (#1825). Reads first (cheap, usually cached) and only writes when a strike
+   * is actually recorded, so the common no-strike path costs no write.
+   * Best-effort: a stale strike only costs one extra tolerated spike later.
+   */
+  private async _cf_clearAlarmMemoryLimitStrikes(): Promise<void> {
+    try {
+      const prior = await this.ctx.storage.get<number>(
+        Agent._CF_OOM_ALARM_STRIKES_KEY
+      );
+      if (typeof prior === "number" && prior > 0) {
+        await this.ctx.storage.delete(Agent._CF_OOM_ALARM_STRIKES_KEY);
+      }
+    } catch {
+      // best-effort: a leftover strike is harmless beyond one extra tolerated spike
+    }
+  }
+
+  /**
+   * Alarm-boundary circuit breaker for Durable Object memory-limit resets
+   * (#1825). The in-DO recovery budgets (`chatRecovery.maxOomRetries` /
+   * `maxRecoveryWork`) only engage if their code runs AND its writes land; a
+   * severe OOM can defeat both — thrown before the budget runs (boot hydration),
+   * or its own small writes also OOM under memory pressure. In that case the
+   * error reaches {@link alarm} and, unhandled, the platform auto-retries the
+   * alarm indefinitely (re-running the doomed, billable turn each cycle).
+   *
+   * This runs at the OUTERMOST frame: the heavy turn has unwound and GC has
+   * reclaimed its footprint, so the small writes here can land where mid-turn
+   * ones (e.g. give-up's incident read) OOMed. A durable strike counter tolerates
+   * a few resets (a transient spike may clear), backing off the recovery rows so
+   * the retry is not a hot loop. At the `maxAlarmMemoryLimitStrikes` budget it
+   * seals the recovery work and purges the looping rows so the loop — and the
+   * bill — stops. Each step is best-effort: even these tiny writes can OOM, but
+   * swallowing (not re-throwing) still halts the platform's auto-retry, and a
+   * later wake re-arms legitimate schedules.
+   */
+  private async _cf_handleAlarmMemoryLimitReset(error: unknown): Promise<void> {
+    const key = Agent._CF_OOM_ALARM_STRIKES_KEY;
+    let strikes = 1;
+    try {
+      const prior = await this.ctx.storage.get<number>(key);
+      strikes = (typeof prior === "number" ? prior : 0) + 1;
+      await this.ctx.storage.put(key, strikes);
+    } catch {
+      // Even the strike write OOMed; proceed treating this as a strike so the
+      // breaker still progresses toward sealing rather than deadlocking.
+    }
+
+    const limit = this._resolvedOptions.maxAlarmMemoryLimitStrikes;
+    const sealed = strikes >= limit;
+    const recoveryCallbacks = this._cf_recoveryAlarmCallbacks();
+    const executingRowId = this._cf_executingScheduleRowId;
+    this._cf_executingScheduleRowId = undefined;
+
+    console.error(
+      `Alarm hit a Durable Object memory-limit reset (strike ${strikes}/${limit}` +
+        `${sealed ? ", sealing recovery" : ", will retry with backoff"}). ` +
+        "Breaking the platform alarm-retry loop (#1825).",
+      error instanceof Error ? error.message : String(error)
+    );
+
+    if (sealed) {
+      // Surgical purge: remove ONLY the looping rows (the recovery callbacks and
+      // the exact row that was executing) so they stop re-triggering; unrelated
+      // scheduled tasks survive.
+      for (const cb of recoveryCallbacks) {
+        try {
+          this.sql`DELETE FROM cf_agents_schedules WHERE callback = ${cb}`;
+        } catch {
+          // best-effort
+        }
+      }
+      if (executingRowId) {
+        try {
+          this
+            .sql`DELETE FROM cf_agents_schedules WHERE id = ${executingRowId}`;
+        } catch {
+          // best-effort
+        }
+      }
+      try {
+        await this._cf_sealMemoryLimitedRecovery();
+      } catch {
+        // best-effort terminalization; the purge above already broke the loop.
+      }
+      try {
+        await this.ctx.storage.delete(key);
+      } catch {
+        // best-effort counter reset
+      }
+    } else {
+      // Under budget: delay the looping rows so the next attempt runs on a fresh
+      // isolate after a backoff rather than immediately re-OOMing in a hot loop.
+      // A genuinely transient spike can clear in the meantime.
+      const backoffSeconds = Math.min(300, 30 * strikes);
+      const nextTime = Math.floor(Date.now() / 1000) + backoffSeconds;
+      for (const cb of recoveryCallbacks) {
+        try {
+          this
+            .sql`UPDATE cf_agents_schedules SET time = ${nextTime} WHERE callback = ${cb} AND time <= ${nextTime}`;
+        } catch {
+          // best-effort
+        }
+      }
+      if (executingRowId) {
+        try {
+          this
+            .sql`UPDATE cf_agents_schedules SET time = ${nextTime} WHERE id = ${executingRowId} AND time <= ${nextTime}`;
+        } catch {
+          // best-effort
+        }
+      }
+    }
+
+    try {
+      this._emit("alarm:memory_limit_reset", {
+        strikes,
+        limit,
+        sealed,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // event emission is non-critical
+    }
+
+    // Re-arm so non-recovery schedules continue. Wrapped because it can itself
+    // OOM; if it does, the next external wake re-arms.
+    try {
+      await this._scheduleNextAlarm();
+    } catch {
+      // best-effort
+    }
   }
 
   // ── Sub-agent routing (external addressability for facets) ──────────────
@@ -5666,6 +7061,10 @@ export class Agent<
           stored.meta
         ) as Connection<TState>;
       }
+      // Do NOT fall through to `super.getConnection()` on a facet — it resolves
+      // to the host/root DO's hibernatable sockets and reading them from the
+      // facet's I/O context throws a cross-DO Native I/O error. See issue #1677.
+      return undefined;
     }
 
     const connection = super.getConnection<TState>(id);
@@ -5679,6 +7078,13 @@ export class Agent<
     tag?: string
   ): Iterable<Connection<TState>> {
     if (this._isFacet) {
+      // A facet's client connections are all virtual — they are real
+      // WebSockets owned by the ROOT DO and bridged in. We must NOT fall
+      // through to `super.getConnections()` here: on a facet that resolves to
+      // the host/root DO's hibernatable sockets, and reading their attachments
+      // from the facet's I/O context throws
+      // "Cannot perform I/O on behalf of a different Durable Object (Native)".
+      // See issue #1677.
       for (const stored of this._cf_virtualSubAgentConnections.values()) {
         if (!tag || stored.meta.tags.includes(tag)) {
           yield this._cf_createSubAgentBridgeConnection(
@@ -5687,6 +7093,7 @@ export class Agent<
           ) as Connection<TState>;
         }
       }
+      return;
     }
 
     for (const connection of super.getConnections<TState>(tag)) {
@@ -6196,6 +7603,13 @@ export class Agent<
   protected async _cf_hydrateSubAgentConnectionsFromRoot(): Promise<void> {
     if (!this._isFacet || this._parentPath.length === 0) return;
 
+    if (this._cf_rootResolvesToSelf()) {
+      // The root stub would resolve back to this blocked Durable Object
+      // during startup. The facet view cannot see root-owned hibernated
+      // sockets locally, so preserve liveness and skip best-effort hydration.
+      return;
+    }
+
     const root = await this._rootAlarmOwner();
     const metas = await root._cf_subAgentConnectionMetas(this.selfPath);
     for (const meta of metas) {
@@ -6429,53 +7843,47 @@ export class Agent<
    * broadcast to their own WebSocket clients reached via sub-agent
    * routing.
    *
-   * The facet's name (and `this.name` getter) is handled entirely by
-   * partyserver via `ctx.id.name`, which is populated because the
-   * parent passed an explicit named Durable Object id to
-   * `ctx.facets.get()` — see {@link _cf_resolveSubAgent}. No
-   * `setName()` call or `__ps_name` storage write is needed; the
-   * facet's name survives cold wake automatically because the factory
-   * re-runs and `idFromName` is deterministic.
+   * The facet's logical name is persisted separately from its routing id.
+   * Legacy facets used the logical name directly as `ctx.id.name`; newer
+   * facets can use path-scoped routing ids while preserving `this.name`.
    *
    * @internal Called by {@link subAgent}.
    */
   async _cf_initAsFacet(
     name: string,
-    parentPath: ReadonlyArray<{ className: string; name: string }> = []
+    parentPath: ReadonlyArray<{ className: string; name: string }> = [],
+    identityName = name
   ): Promise<void> {
-    // Defense in depth: the parent is supposed to construct the
-    // facet with a named Durable Object id via `_cf_resolveSubAgent`,
-    // which makes `this.name` resolve to `name` automatically
-    // through partyserver's `ctx.id.name`. If
-    // it didn't (e.g. someone bypassed `_cf_resolveSubAgent`, or
-    // the parent's id construction has a bug), `this.name` would
-    // silently report the parent's name instead of the facet's
-    // name. Fail loud instead of letting a misconfigured facet
-    // operate with the wrong identity.
-    if (this.name !== name) {
+    const routedName = super.name;
+    if (routedName !== identityName) {
       throw new Error(
-        `Facet bootstrap mismatch: expected this.name === "${name}" but got "${this.name}". ` +
-          `This usually means the parent passed the wrong (or no) id to ctx.facets.get(). ` +
+        `Facet bootstrap mismatch: expected routed identity "${identityName}" but got "${routedName}". ` +
+          `This usually means the parent passed the wrong id to ctx.facets.get(). ` +
           `See _cf_resolveSubAgent.`
       );
     }
+
     this._isFacet = true;
+    this._facetName = name;
     this._parentPath = parentPath;
     // Persist the agent-specific facet keys in parallel.
     await Promise.all([
       this.ctx.storage.put("cf_agents_is_facet", true),
+      this.ctx.storage.put("cf_agents_facet_name", name),
       this.ctx.storage.put("cf_agents_parent_path", parentPath)
     ]);
-    // Fire onStart() now since this RPC bypasses Server.fetch(),
-    // which is the entry point that normally triggers it. Suppress
-    // protocol broadcasts only during startup so bootstrap cannot touch
-    // parent-owned WebSocket handles if the parent is inside onMessage().
-    this._suppressProtocolBroadcasts = true;
-    try {
-      await this.__unsafe_ensureInitialized();
-    } finally {
-      this._suppressProtocolBroadcasts = false;
-    }
+    // Fire onStart() now since this RPC bypasses Server.fetch(), which is the
+    // entry point that normally triggers it. Protocol broadcasts during this
+    // bootstrap window are safe: on a facet `getConnections()` returns only
+    // virtual sub-agent connections and `broadcast()` routes to the parent
+    // bridge, so neither touches the parent's own WebSocket handles (#1679).
+    await this.__unsafe_ensureInitialized();
+  }
+
+  override get name(): string {
+    return (
+      this._facetName ?? logicalNameFromPathV2Identity(super.name) ?? super.name
+    );
   }
 
   /**
@@ -6732,15 +8140,77 @@ export class Agent<
     _result: AgentToolLifecycleResult
   ): Promise<void> {}
 
+  /**
+   * Parent hook fired (best-effort) whenever a child agent-tool run emits a
+   * `reportProgress` signal that is forwarded through this parent's tail. Use it
+   * to meter / steer / surface progress server-side. Fires for both awaited and
+   * detached runs; it is NOT durable — after eviction a detached run's latest
+   * snapshot is read from `inspectAgentToolRun().progress` on reconcile instead.
+   */
+  async onProgress(
+    _run: AgentToolRunInfo,
+    _progress: AgentToolProgressSnapshot
+  ): Promise<void> {}
+
+  /**
+   * Emit an ephemeral progress signal from a sub-agent that is currently running
+   * as an agent tool. Rides the child's active turn stream as a transient
+   * `data-agent-progress` part (re-broadcast to the parent's clients + surfaced
+   * in `useAgentToolEvents`) and persists a latest-wins snapshot for recovery /
+   * inspection. A no-op (with a dev warning) on the base `Agent`, which has no
+   * streaming turn — overridden by chat hosts (`@cloudflare/think`,
+   * `AIChatAgent`). See `design/rfc-detached-agent-tools.md`.
+   */
+  async reportProgress<T = unknown>(
+    _progress: AgentToolProgress<T>,
+    _options?: { persist?: boolean }
+  ): Promise<void> {
+    console.warn(
+      "[agents] reportProgress() is only supported on chat agents (@cloudflare/think, AIChatAgent) running as an agent tool; ignoring on base Agent."
+    );
+  }
+
+  async runAgentTool<Input = unknown>(
+    cls: ChatCapableAgentClass,
+    options: RunAgentToolOptions<Input> & {
+      detached: true | DetachedAgentToolConfig;
+    }
+  ): Promise<DetachedRunAgentToolResult>;
   async runAgentTool<Input = unknown, Output = unknown>(
     cls: ChatCapableAgentClass,
     options: RunAgentToolOptions<Input>
-  ): Promise<RunAgentToolResult<Output>> {
+  ): Promise<RunAgentToolResult<Output>>;
+  async runAgentTool<Input = unknown, Output = unknown>(
+    cls: ChatCapableAgentClass,
+    options: RunAgentToolOptions<Input>
+  ): Promise<RunAgentToolResult<Output> | DetachedRunAgentToolResult> {
     const runId = options.runId ?? nanoid(12);
     const agentType = cls.name;
+    const detached = this._parseDetachedOption(options.detached);
+
     const existing = this._readAgentToolRun(runId);
     if (existing) {
-      if (this._isAgentToolTerminal(existing.status)) {
+      // Detached re-dispatch (e.g. chat recovery re-running the dispatching
+      // turn) is idempotent by runId: re-arm the durable backbone for a still
+      // non-terminal run and hand back the live handle instead of re-tailing or
+      // spawning fresh work. A run that already reached terminal simply returns
+      // a running-shaped handle — its delivery already happened (or is owned by
+      // the ledger).
+      if (detached) {
+        if (!this._isAgentToolRowHardTerminal(existing.status)) {
+          await this._armDetachedBackbone();
+        }
+        return { runId, agentType, status: "running" };
+      }
+      // HARD terminals (completed/error/aborted) are returned as-is. `interrupted`
+      // is a SOFT terminal — recovery gave up once, but the child may have
+      // reached its real terminal since — so it falls through to the re-attach
+      // path below (which can repair the row), exactly like a non-terminal run.
+      if (
+        existing.status === "completed" ||
+        existing.status === "error" ||
+        existing.status === "aborted"
+      ) {
         if (existing.status === "completed" && existing.output_json == null) {
           try {
             const child = await this.subAgent(
@@ -6767,9 +8237,49 @@ export class Agent<
         }
         return this._resultFromAgentToolRow<Output>(existing);
       }
+      // Non-terminal or soft-terminal (`interrupted`) runId: the child may still
+      // be in flight or may have reached terminal since we gave up (typically a
+      // re-issue after parent recovery re-runs the same turn with a stable
+      // runId — the documented "correct pattern"). Re-attach to the live child
+      // and tail it to terminal instead of abandoning it as `interrupted` and
+      // letting the model re-run already-completed child work (#1630). Falls
+      // back to replay+interrupt when there is no tail adapter or the bounded
+      // budget is exhausted.
+      let reattachReason: AgentToolInterruptedReason | undefined;
+      let childTornDown = false;
+      try {
+        const child = await this.subAgent(cls as SubAgentClass<Agent>, runId);
+        const adapter = this._asAgentToolChildAdapter<Input, Output>(child);
+        const reattach = await this._reattachAgentToolRunToTerminal<Output>(
+          adapter,
+          existing,
+          1,
+          this._resolvedOptions.agentToolReattachNoProgressTimeoutMs,
+          this._resolvedOptions.agentToolReattachMaxWindowMs
+        );
+        if (reattach.result) {
+          await this._finishAgentToolRun(
+            this._agentToolRunInfoFromRow(existing),
+            reattach.result,
+            { sequence: reattach.sequence, completedAt: reattach.completedAt }
+          );
+          return reattach.result;
+        }
+        reattachReason = reattach.reason;
+        // The parent has genuinely given up re-attaching to this live child —
+        // tear it down so it stops consuming a fiber / keep-alive (#1630).
+        childTornDown = await this._teardownGivenUpAgentToolChild(
+          adapter,
+          runId,
+          reattach.reason
+        );
+      } catch {
+        // Fall through to the honest interrupted state below.
+      }
       return await this._replayAndInterruptAgentToolRun<Output>(
         existing,
-        "Agent tool run was still running, but live-tail reattachment is not supported in this runtime."
+        this._interruptedMessageForReason(reattachReason),
+        { reason: reattachReason, childStillRunning: !childTornDown }
       );
     }
 
@@ -6811,14 +8321,30 @@ export class Agent<
       return { runId, agentType, status: "error", error };
     }
 
+    const detachedMaxBudgetAt = detached
+      ? startedAt +
+        (detached.maxBudgetMs ?? this._resolvedOptions.detachedMaxBudgetMs)
+      : null;
+    const detachedNoProgressBudgetMs = detached
+      ? (detached.noProgressBudgetMs ??
+        this._resolvedOptions.detachedNoProgressBudgetMs)
+      : null;
+    const detachedOnMilestonesJson = detached?.onMilestones
+      ? JSON.stringify(detached.onMilestones)
+      : null;
     this.sql`
       INSERT INTO cf_agent_tool_runs (
         run_id, parent_tool_call_id, agent_type, input_preview,
-        input_redacted, status, display_metadata, display_order, started_at
+        input_redacted, status, display_metadata, display_order, started_at,
+        detached, detached_on_finish, detached_notify_source,
+        detached_max_budget_at, detached_no_progress_budget_ms,
+        detached_on_milestones
       ) VALUES (
         ${runId}, ${options.parentToolCallId ?? null}, ${agentType},
         ${inputPreviewJson}, 1, 'starting', ${displayJson}, ${displayOrder},
-        ${startedAt}
+        ${startedAt}, ${detached ? 1 : 0}, ${detached?.onFinishName ?? null},
+        ${detached?.notifySource ?? null}, ${detachedMaxBudgetAt},
+        ${detachedNoProgressBudgetMs}, ${detachedOnMilestonesJson}
       )
     `;
 
@@ -6829,6 +8355,9 @@ export class Agent<
       inputPreview,
       status: "starting",
       display: options.display,
+      ...(detached?.notifySource !== undefined
+        ? { notifySource: detached.notifySource }
+        : {}),
       displayOrder,
       startedAt
     };
@@ -6848,6 +8377,29 @@ export class Agent<
       runId
     });
     this._markAgentToolRunning(runId);
+
+    if (detached) {
+      // The child must OUTLIVE the dispatching turn, so a detached run never
+      // inherits `options.signal` (which aborts when this turn ends). Cancel a
+      // detached run explicitly with `cancelAgentTool(runId)`.
+      if (options.signal) {
+        console.warn(
+          `[agents] runAgentTool: \`signal\` is ignored for a detached run (${runId}); a detached child must outlive the spawning turn. Use cancelAgentTool(runId) to cancel it.`
+        );
+      }
+      // Arm the durable backbone first so eviction between here and the fast
+      // path still finalizes the run, then kick the warm fast path that tails
+      // the child to terminal and delivers with low latency while alive.
+      await this._armDetachedBackbone({ resetCadence: true });
+      // Surface runaway accumulation: detached runs hold a slot for their whole
+      // life with no observer to notice a leak.
+      this._maybeWarnDetachedLiveCount();
+      this.ctx.waitUntil(
+        this._detachedFastPath<Input, Output>(runInfo, cls, runId)
+      );
+      return { runId, agentType, status: "running" };
+    }
+
     let sequence = 1;
     let parentAbortListener: (() => void) | undefined;
     if (options.signal) {
@@ -6880,13 +8432,15 @@ export class Agent<
         const stream = await adapter.tailAgentToolRun(runId, {
           afterSequence: -1
         });
-        sequence = await this._forwardAgentToolStream(
-          stream,
-          options.parentToolCallId,
-          runId,
-          sequence,
-          options.signal
-        );
+        sequence = (
+          await this._forwardAgentToolStream(
+            stream,
+            options.parentToolCallId,
+            runId,
+            sequence,
+            options.signal
+          )
+        ).next;
       } else {
         const chunks = await adapter.getAgentToolChunks(runId);
         sequence = this._broadcastAgentToolChunks(
@@ -6953,6 +8507,590 @@ export class Agent<
       if (parentAbortListener && options.signal) {
         options.signal.removeEventListener("abort", parentAbortListener);
       }
+    }
+  }
+
+  /**
+   * Cancel an agent-tool run by id. Idempotent: cancelling an already-terminal
+   * run is a no-op. Detached runs deliver through the guarded ledger so a wired
+   * `onFinish` fires once with `status: "aborted"`; awaited runs leave terminal
+   * observation to the awaiting/recovery path, avoiding duplicate finish hooks.
+   */
+  async cancelAgentTool(runId: string, reason?: unknown): Promise<void> {
+    const row = this._readAgentToolRun(runId);
+    if (!row) return;
+    if (this._isAgentToolRowHardTerminal(row.status)) return;
+    const isDetached = row.detached === 1;
+    const message =
+      reason instanceof Error
+        ? reason.message
+        : String(reason ?? "cancelled by parent");
+    try {
+      const child = await this._cf_resolveSubAgent(row.agent_type, runId);
+      const adapter = this._asAgentToolChildAdapter(child);
+      await adapter.cancelAgentToolRun(runId, reason);
+    } catch {
+      // Best-effort child teardown; we still record the aborted terminal so the
+      // detached parent stops watching and any wired callback fires.
+    }
+    if (!isDetached) return;
+    await this._deliverDetachedTerminal(runId, "finish", {
+      runId,
+      agentType: row.agent_type,
+      status: "aborted",
+      error: message
+    });
+  }
+
+  /**
+   * Parse + validate the `detached` option. Returns `null` for a non-detached
+   * run, or the normalized config (with the validated `onFinish` method name)
+   * for a detached one. Throws if `onFinish` does not name a method on this
+   * agent — closures cannot survive Durable Object eviction, so the durable
+   * hook is referenced by method name (the same contract as `schedule`).
+   */
+  private _parseDetachedOption(detached: RunAgentToolOptions["detached"]): {
+    onFinishName?: string;
+    maxBudgetMs?: number;
+    noProgressBudgetMs?: number;
+    notifySource?: string;
+    onMilestones?: { names: string[]; mode: "react" | "narrate" };
+  } | null {
+    if (!detached) return null;
+    if (detached === true) return {};
+    let onFinishName = detached.onFinish as string | undefined;
+    const notifySource =
+      typeof detached.notify === "object" ? detached.notify.source : undefined;
+    if (onFinishName !== undefined) {
+      const callback = (this as unknown as Record<string, unknown>)[
+        onFinishName
+      ];
+      if (typeof callback !== "function") {
+        throw new Error(
+          `runAgentTool: detached.onFinish "${onFinishName}" is not a method on ${this.constructor.name}. ` +
+            'Pass the NAME of a method (e.g. "onImportDone"), not a closure — ' +
+            "closures cannot be rehydrated after the Durable Object is evicted."
+        );
+      }
+    } else if (detached.notify) {
+      // `notify` sugar: auto-target the chat-agent notify hook if present.
+      // A no-op on a base Agent that does not implement it.
+      const notifyHook = (this as unknown as Record<string, unknown>)[
+        DETACHED_NOTIFY_CALLBACK
+      ];
+      if (typeof notifyHook === "function") {
+        onFinishName = DETACHED_NOTIFY_CALLBACK;
+      }
+    }
+    return {
+      ...(onFinishName !== undefined ? { onFinishName } : {}),
+      ...(notifySource !== undefined ? { notifySource } : {}),
+      ...(detached.maxBudgetMs !== undefined
+        ? { maxBudgetMs: detached.maxBudgetMs }
+        : {}),
+      ...(detached.noProgressBudgetMs !== undefined
+        ? { noProgressBudgetMs: detached.noProgressBudgetMs }
+        : {}),
+      ...(() => {
+        const raw = detached.onMilestones;
+        if (!raw) return {};
+        const names = Array.isArray(raw) ? raw : raw.names;
+        if (!Array.isArray(names) || names.length === 0) return {};
+        const mode: "react" | "narrate" = Array.isArray(raw)
+          ? "narrate"
+          : (raw.mode ?? "narrate");
+        return { onMilestones: { names, mode } };
+      })()
+    };
+  }
+
+  private _isAgentToolRowHardTerminal(status: AgentToolRunStatus): boolean {
+    return status === "completed" || status === "error" || status === "aborted";
+  }
+
+  private _hasOutstandingDetachedRuns(): boolean {
+    const rows = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM cf_agent_tool_runs
+      WHERE detached = 1 AND finish_delivered_at IS NULL
+    `;
+    return (rows[0]?.n ?? 0) > 0;
+  }
+
+  /** Detached runs still holding a concurrency slot (non-terminal). */
+  private _liveDetachedRunCount(): number {
+    const rows = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM cf_agent_tool_runs
+      WHERE detached = 1 AND status IN ('starting', 'running')
+    `;
+    return rows[0]?.n ?? 0;
+  }
+
+  /**
+   * Edge-triggered warning when live detached runs cross
+   * `DETACHED_LIVE_COUNT_WARN_THRESHOLD`. Fires once on the up-crossing and
+   * re-arms only after the count falls back below the threshold, so a parent
+   * accumulating long-lived background runs surfaces a signal without spamming.
+   */
+  private _maybeWarnDetachedLiveCount(): void {
+    const liveCount = this._liveDetachedRunCount();
+    if (liveCount < DETACHED_LIVE_COUNT_WARN_THRESHOLD) {
+      this._detachedLiveCountWarned = false;
+      return;
+    }
+    if (this._detachedLiveCountWarned) return;
+    this._detachedLiveCountWarned = true;
+    this._emit("agent_tool:detached:live_count_warning", {
+      liveCount,
+      threshold: DETACHED_LIVE_COUNT_WARN_THRESHOLD
+    });
+    console.warn(
+      `[agents] ${liveCount} detached agent-tool runs are live on this agent (threshold ${DETACHED_LIVE_COUNT_WARN_THRESHOLD}). Detached runs hold a concurrency slot until they finish — make sure they are completing or being cancelled, or lower \`maxConcurrentAgentTools\`.`
+    );
+  }
+
+  /**
+   * Warm fast path for a detached run: tail the child to terminal (so the
+   * parent re-broadcasts its live stream to clients) and deliver the completion
+   * with low latency while the isolate stays alive. Best-effort — the durable
+   * `_cfDetachedReconcileTick` backbone is the guarantee; anything this misses
+   * (eviction, a child that has not yet reached terminal) the backbone collects.
+   */
+  private async _detachedFastPath<Input, Output>(
+    runInfo: AgentToolRunInfo,
+    cls: ChatCapableAgentClass,
+    runId: string
+  ): Promise<void> {
+    try {
+      const child = await this.subAgent(cls as SubAgentClass<Agent>, runId);
+      const adapter = this._asAgentToolChildAdapter<Input, Output>(child);
+      let sequence = 1;
+      if (adapter.tailAgentToolRun) {
+        const stream = await adapter.tailAgentToolRun(runId, {
+          afterSequence: -1
+        });
+        sequence = (
+          await this._forwardAgentToolStream(
+            stream,
+            runInfo.parentToolCallId,
+            runId,
+            sequence,
+            undefined
+          )
+        ).next;
+      }
+      const inspection = await adapter.inspectAgentToolRun(runId);
+      if (
+        inspection &&
+        this._isAgentToolRowHardTerminal(
+          inspection.status as AgentToolRunStatus
+        )
+      ) {
+        const result = this._terminalResultFromInspection<Output>(
+          runInfo.agentType,
+          inspection
+        );
+        await this._deliverDetachedTerminal(
+          runId,
+          "finish",
+          result,
+          { sequence, serialize: true },
+          inspection.completedAt
+        );
+      }
+    } catch {
+      // Leave it to the backbone reconcile.
+    }
+  }
+
+  /**
+   * Single delivery funnel for a detached terminal. Both the warm fast path and
+   * the durable backbone route through here, with INDEPENDENT ledger slots for
+   * `finish` (the real terminal) vs `give_up` (budget exhausted). Each slot is
+   * delivered at-least-once via a claim + lease:
+   *
+   * - Concurrent double-fire is prevented by the guarded CAS claim (RETURNING
+   *   yields the row only to the winner).
+   * - A crash after the side effect but before `*_delivered_at` is written lets
+   *   the lease expire so a later reconcile re-delivers — hence handlers must be
+   *   idempotent.
+   * - Two slots, not one, because `interrupted` is SOFT: a give-up followed by a
+   *   real completion is legitimate, and a single shared "delivered" bit would
+   *   dedupe the child's real late result away (the #1752 production incident).
+   */
+  private async _deliverDetachedTerminal<Output>(
+    runId: string,
+    kind: "finish" | "give_up",
+    result: RunAgentToolResult<Output>,
+    options?: { sequence?: number; serialize?: boolean },
+    completedAt = Date.now()
+  ): Promise<void> {
+    const now = Date.now();
+    const leaseFloor = now - DETACHED_DELIVERY_LEASE_MS;
+    // Guarded CAS claim. `rowsWritten` (changes()) is the affected-row count, so
+    // exactly one concurrent caller observes 1 and proceeds; everyone else (a
+    // racing path, or a re-delivery within the lease) observes 0 and bails.
+    const claimQuery =
+      kind === "finish"
+        ? `UPDATE cf_agent_tool_runs
+             SET finish_claimed_at = ?
+             WHERE run_id = ?
+               AND finish_delivered_at IS NULL
+               AND (finish_claimed_at IS NULL OR finish_claimed_at < ?)`
+        : `UPDATE cf_agent_tool_runs
+             SET give_up_claimed_at = ?
+             WHERE run_id = ?
+               AND give_up_delivered_at IS NULL
+               AND (give_up_claimed_at IS NULL OR give_up_claimed_at < ?)`;
+    const claimed = this.ctx.storage.sql.exec(
+      claimQuery,
+      now,
+      runId,
+      leaseFloor
+    ).rowsWritten;
+    if (claimed === 0) return;
+
+    const row = this._readAgentToolRun(runId);
+    if (!row) return;
+
+    this._updateAgentToolTerminal(runId, result, completedAt);
+    // Always project the terminal onto the parent's `agent-tool-event` stream so
+    // a background-runs tray flips to its final state live. The backbone/fast
+    // path supply a tail sequence; other paths (e.g. an explicit
+    // `cancelAgentTool`, or a budget give-up) get a synthetic latest-wins
+    // sequence — the client reducer keys terminal status off the event kind, not
+    // the sequence, so a monotonic value is not required.
+    this._broadcastAgentToolTerminal(
+      row.parent_tool_call_id ?? undefined,
+      options?.sequence ?? Date.now(),
+      result
+    );
+
+    const runInfo = this._agentToolRunInfoFromRow(
+      row,
+      result.status,
+      completedAt
+    );
+    const lifecycle: AgentToolLifecycleResult = {
+      status: result.status,
+      ...(result.summary !== undefined ? { summary: result.summary } : {}),
+      ...(result.error !== undefined ? { error: result.error } : {}),
+      ...(result.reason !== undefined ? { reason: result.reason } : {}),
+      ...(result.childStillRunning !== undefined
+        ? { childStillRunning: result.childStillRunning }
+        : {})
+    };
+
+    const invoke = async () => {
+      // Global metering hook fires for detached runs too (cost accounting
+      // parity with the awaited path).
+      try {
+        await this.onAgentToolFinish(runInfo, lifecycle);
+      } catch (error) {
+        await this._safeRunOnError(error);
+      }
+      // Targeted, durable per-run callback (method name persisted on the row).
+      const callbackName = row.detached_on_finish;
+      if (callbackName) {
+        const callback = (this as unknown as Record<string, unknown>)[
+          callbackName
+        ];
+        if (typeof callback === "function") {
+          try {
+            await (
+              callback as (
+                run: AgentToolRunInfo,
+                res: AgentToolLifecycleResult
+              ) => Promise<void>
+            ).bind(this)(runInfo, lifecycle);
+          } catch (error) {
+            this._emit("agent_tool:detached:delivery_failed", {
+              runId,
+              kind,
+              status: result.status,
+              callback: callbackName,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            await this._safeRunOnError(error);
+            throw error;
+          }
+        }
+      }
+    };
+
+    // Delivery can fire from a scheduled alarm or the warm fast path (no ambient
+    // turn). `_runDetachedDelivery` establishes `agentContext` so a handler that
+    // calls runAgentTool / setState / submitMessages works, and — in chat-layer
+    // subclasses — serializes the delivery against the host turn queue when
+    // `serialize` is set, so a state-mutating `onFinish` never interleaves with
+    // an active LLM turn (RFC §"run inside a turn"). An explicit cancel runs
+    // inline (it is already inside its caller's context).
+    await this._runDetachedDelivery(invoke, { serialize: options?.serialize });
+
+    // Mark delivered only AFTER the handler resolves. A crash before this point
+    // leaves the lease to expire and a later reconcile to re-deliver.
+    if (kind === "finish") {
+      this.sql`
+        UPDATE cf_agent_tool_runs
+        SET finish_delivered_at = ${Date.now()}
+        WHERE run_id = ${runId}
+      `;
+    } else {
+      this.sql`
+        UPDATE cf_agent_tool_runs
+        SET give_up_delivered_at = ${Date.now()}
+        WHERE run_id = ${runId}
+      `;
+    }
+  }
+
+  private async _safeRunOnError(error: unknown): Promise<void> {
+    try {
+      await this.onError(error);
+    } catch {
+      // Delivery hooks are best-effort; a failing onError must not wedge the
+      // ledger or other detached runs.
+    }
+  }
+
+  /**
+   * Run a detached terminal delivery (the `onAgentToolFinish` + per-run
+   * `onFinish` callbacks) in an appropriate execution context. The base `Agent`
+   * has no turn queue, so it only establishes `agentContext` — a handler that
+   * calls `runAgentTool` / `setState` therefore works regardless of where the
+   * delivery fired from.
+   *
+   * Chat-layer subclasses (`@cloudflare/think`, `@cloudflare/ai-chat`) override
+   * this to additionally serialize delivery against their turn queue when
+   * `serialize` is set: a fast-path push or backbone tick can land mid-turn, and
+   * a state-mutating `onFinish` running concurrently with an active LLM turn is a
+   * data race. The fast path and backbone never run synchronously inside a turn
+   * (they fire from `waitUntil` / a scheduled alarm), so enqueuing them on the
+   * turn queue is deadlock-free. An explicit `cancelAgentTool` runs with
+   * `serialize` unset because it may be called from inside the very turn that
+   * triggers it, where enqueuing would self-deadlock.
+   */
+  protected async _runDetachedDelivery(
+    invoke: () => Promise<void>,
+    _options?: { serialize?: boolean }
+  ): Promise<void> {
+    if (agentContext.getStore()?.agent) {
+      await invoke();
+      return;
+    }
+    await runInInvocation(
+      {
+        agent: this,
+        connection: undefined,
+        request: undefined,
+        email: undefined
+      },
+      invoke,
+      { detached: true }
+    );
+  }
+
+  /**
+   * Arm the self-scheduling detached reconcile backbone. Existing schedules are
+   * reused for recovery/startup calls, but a fresh detached dispatch resets the
+   * pending cadence to the fast end so new work is noticed promptly.
+   */
+  private async _armDetachedBackbone(options?: {
+    resetCadence?: boolean;
+  }): Promise<void> {
+    // Serialize arming within the isolate. `_armDetachedBackboneInner` is a
+    // read-modify-write over the schedule rows (list → cancel duplicates →
+    // create one); concurrent dispatches (e.g. a fan-out of detached
+    // `runAgentTool`s in one turn) could otherwise each observe zero schedules
+    // and create their own, leaving several redundant backbones ticking.
+    const run = this._detachedBackboneArming.then(() =>
+      this._armDetachedBackboneInner(options)
+    );
+    // Keep the mutex chain alive even if one arm rejects.
+    this._detachedBackboneArming = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async _armDetachedBackboneInner(options?: {
+    resetCadence?: boolean;
+  }): Promise<void> {
+    const schedules = await this.listSchedules();
+    const armed = schedules.filter(
+      (schedule) => schedule.callback === DETACHED_RECONCILE_CALLBACK
+    );
+    // Collapse any accidental duplicates down to a single backbone even when no
+    // cadence reset was requested.
+    if (armed.length > 0 && !options?.resetCadence) {
+      for (const schedule of armed.slice(1)) {
+        await this.cancelSchedule(schedule.id);
+      }
+      return;
+    }
+    for (const schedule of armed) {
+      await this.cancelSchedule(schedule.id);
+    }
+    await this.schedule(
+      DETACHED_BACKBONE_CADENCE_S[0],
+      DETACHED_RECONCILE_CALLBACK as keyof this,
+      { cadenceIndex: 0 } satisfies DetachedReconcilePayload
+    );
+  }
+
+  /**
+   * Durable backbone for detached runs. Runs on a self-rescheduling alarm:
+   * collects any detached run that has reached terminal but was not yet
+   * delivered (e.g. the parent was evicted before the fast path landed), gives
+   * up on any run past its absolute budget (tearing the child down), and
+   * reschedules itself while any detached run remains undelivered — cancelling
+   * itself once everything has settled (zero steady-state cost).
+   */
+  async _cfDetachedReconcileTick(
+    payload?: DetachedReconcilePayload
+  ): Promise<void> {
+    const rows = this.sql<AgentToolRunStorageRow>`
+      SELECT run_id, parent_tool_call_id, agent_type, input_preview, status,
+             summary, output_json, error_message, interrupted_reason,
+             child_still_running, display_metadata, display_order,
+             started_at, completed_at, detached, detached_on_finish,
+             detached_notify_source, detached_max_budget_at,
+             detached_no_progress_budget_ms, last_progress_at,
+             detached_on_milestones,
+             finish_claimed_at, finish_delivered_at, give_up_claimed_at,
+             give_up_delivered_at
+      FROM cf_agent_tool_runs
+      WHERE detached = 1 AND finish_delivered_at IS NULL
+      ORDER BY started_at ASC
+    `;
+
+    for (const row of rows) {
+      const runId = row.run_id;
+      let inspection: AgentToolRunInspection | null = null;
+      try {
+        const child = await this._cf_resolveSubAgent(row.agent_type, runId);
+        const adapter = this._asAgentToolChildAdapter(child);
+        inspection = await adapter.inspectAgentToolRun(runId);
+      } catch {
+        // Treat an unreachable child like a null inspection: keep waiting within
+        // budget rather than sealing (a single failure is not proof it is gone).
+      }
+
+      // Deliver any configured milestone notifications the warm tail missed
+      // (e.g. the parent was evicted when the milestone landed). Idempotent:
+      // `_deliverDetachedMilestone` keys on (runId, name), so re-delivering an
+      // already-notified milestone is a no-op. Runs regardless of terminal
+      // state — a milestone reached just before completion still notifies.
+      if (inspection?.milestones && row.detached_on_milestones) {
+        const milestoneRunInfo = this._agentToolRunInfoFromRow(row);
+        for (const milestone of inspection.milestones) {
+          this._maybeDeliverDetachedMilestone(row, milestoneRunInfo, milestone);
+        }
+      }
+
+      if (
+        inspection &&
+        this._isAgentToolRowHardTerminal(
+          inspection.status as AgentToolRunStatus
+        )
+      ) {
+        const result = this._terminalResultFromInspection(
+          row.agent_type,
+          inspection
+        );
+        await this._deliverDetachedTerminal(
+          runId,
+          "finish",
+          result,
+          { sequence: Date.now(), serialize: true },
+          inspection.completedAt
+        );
+        continue;
+      }
+
+      // Still non-terminal. Give up only once (the give_up slot guards
+      // re-delivery), on whichever bound trips first:
+      //  - the absolute `detached_max_budget_at` ceiling (taking too long), or
+      //  - the resetting no-progress window: once the child has reported at
+      //    least one signal and then goes silent past the window. A child that
+      //    has never reported has no signal time and is bounded ONLY by the
+      //    absolute ceiling — never given up on merely for being slow.
+      const now = Date.now();
+      const budgetAt = row.detached_max_budget_at;
+      // ANY signal resets the window — ephemeral progress OR a durable milestone
+      // (milestones bump the child's signal clock but leave `progress` unset, so
+      // a milestone-only child must still count as alive). After eviction the
+      // child's inspect is authoritative; `last_progress_at` is the warm-tail
+      // cache fallback.
+      const latestMilestone = inspection?.milestones?.length
+        ? inspection.milestones[inspection.milestones.length - 1].at
+        : undefined;
+      const signalTimes = [
+        inspection?.progress?.at,
+        latestMilestone,
+        row.last_progress_at
+      ].filter((t): t is number => typeof t === "number");
+      const lastSignalAt =
+        signalTimes.length > 0 ? Math.max(...signalTimes) : undefined;
+      const noProgressBudgetMs = row.detached_no_progress_budget_ms;
+      const overAbsolute = budgetAt !== null && now >= budgetAt;
+      const overNoProgress =
+        typeof noProgressBudgetMs === "number" &&
+        noProgressBudgetMs > 0 &&
+        Number.isFinite(noProgressBudgetMs) &&
+        typeof lastSignalAt === "number" &&
+        now - lastSignalAt >= noProgressBudgetMs;
+      if (
+        (overAbsolute || overNoProgress) &&
+        row.give_up_delivered_at === null
+      ) {
+        let childTornDown = false;
+        try {
+          const child = await this._cf_resolveSubAgent(row.agent_type, runId);
+          const adapter = this._asAgentToolChildAdapter(child);
+          await adapter.cancelAgentToolRun(
+            runId,
+            overAbsolute
+              ? "detached budget exceeded"
+              : "detached run went silent past its no-progress window"
+          );
+          childTornDown = true;
+        } catch {
+          // Could not confirm teardown; the child may complete anyway and the
+          // finish slot (still open) will deliver the real result.
+        }
+        await this._deliverDetachedTerminal(
+          runId,
+          "give_up",
+          {
+            runId,
+            agentType: row.agent_type,
+            status: "interrupted",
+            error: overAbsolute
+              ? "detached run exceeded its budget before completing"
+              : "detached run went silent past its no-progress window",
+            reason: overAbsolute ? "budget-exceeded" : "no-progress",
+            childStillRunning: !childTornDown
+          },
+          { serialize: true }
+        );
+      }
+    }
+
+    // Reschedule while anything remains undelivered; otherwise let the backbone
+    // go quiet (the schedule is one-shot and is not recreated here).
+    if (this._hasOutstandingDetachedRuns()) {
+      const currentIndex =
+        typeof payload?.cadenceIndex === "number" ? payload.cadenceIndex : 0;
+      const nextIndex = Math.min(
+        currentIndex + 1,
+        DETACHED_BACKBONE_CADENCE_S.length - 1
+      );
+      await this.schedule(
+        DETACHED_BACKBONE_CADENCE_S[nextIndex],
+        DETACHED_RECONCILE_CALLBACK as keyof this,
+        { cadenceIndex: nextIndex } satisfies DetachedReconcilePayload
+      );
     }
   }
 
@@ -7047,13 +9185,40 @@ export class Agent<
   private _readAgentToolRun(runId: string): AgentToolRunStorageRow | null {
     const rows = this.sql<AgentToolRunStorageRow>`
       SELECT run_id, parent_tool_call_id, agent_type, input_preview, status,
-             summary, output_json, error_message, display_metadata, display_order,
-             started_at, completed_at
+             summary, output_json, error_message, interrupted_reason,
+             child_still_running, display_metadata, display_order,
+             started_at, completed_at, detached, detached_on_finish,
+             detached_notify_source, detached_max_budget_at,
+             finish_claimed_at, finish_delivered_at, give_up_claimed_at,
+             give_up_delivered_at
       FROM cf_agent_tool_runs
       WHERE run_id = ${runId}
       LIMIT 1
     `;
     return rows[0] ?? null;
+  }
+
+  /**
+   * Reconstruct the typed interrupted cause (`reason` / `childStillRunning`,
+   * #1630 follow-up) from a stored row so a row→result/event rebuild — e.g. a
+   * reconnect replay — carries the same fields a live client saw. Only
+   * `interrupted` rows store a cause; everything else yields `{}` (the columns
+   * are cleared whenever a row settles to a hard terminal).
+   */
+  private _agentToolInterruptedExtrasFromRow(row: {
+    status: AgentToolRunStatus;
+    interrupted_reason: string | null;
+    child_still_running: number | null;
+  }): { reason?: AgentToolInterruptedReason; childStillRunning?: boolean } {
+    if (row.status !== "interrupted") return {};
+    return {
+      ...(row.interrupted_reason !== null
+        ? { reason: row.interrupted_reason as AgentToolInterruptedReason }
+        : {}),
+      ...(row.child_still_running !== null
+        ? { childStillRunning: row.child_still_running !== 0 }
+        : {})
+    };
   }
 
   private _resultFromAgentToolRow<Output>(
@@ -7068,7 +9233,8 @@ export class Agent<
       status: row.status as RunAgentToolResult<Output>["status"],
       ...(output !== undefined ? { output } : {}),
       ...(row.summary !== null ? { summary: row.summary } : {}),
-      ...(row.error_message !== null ? { error: row.error_message } : {})
+      ...(row.error_message !== null ? { error: row.error_message } : {}),
+      ...this._agentToolInterruptedExtrasFromRow(row)
     };
   }
 
@@ -7086,6 +9252,9 @@ export class Agent<
       display: this._parseAgentToolJson(row.display_metadata) as
         | AgentToolDisplayMetadata
         | undefined,
+      ...(row.detached_notify_source != null
+        ? { notifySource: row.detached_notify_source }
+        : {}),
       displayOrder: row.display_order,
       startedAt: row.started_at,
       completedAt
@@ -7171,15 +9340,33 @@ export class Agent<
     result: RunAgentToolResult<Output>,
     completedAt = Date.now()
   ): void {
+    // `interrupted` is a SOFT terminal — recovery gave up collecting, but the
+    // child (a durable facet) may still reach its real terminal. So it is NOT
+    // in the guard below: a later child completion (via a re-issue's re-attach,
+    // #1630) can repair an `interrupted` row to `completed`/`error`. The three
+    // HARD terminals are never overwritten.
+    // Persist the typed interrupted cause (#1630 follow-up) so a reconnect
+    // replay reconstructs the same `reason` / `childStillRunning` a live client
+    // saw. Written unconditionally so repairing an `interrupted` row to a hard
+    // terminal (e.g. a re-attach that finally collects `completed`) CLEARS the
+    // stale cause rather than leaving it dangling.
+    const childStillRunning =
+      result.childStillRunning === undefined
+        ? null
+        : result.childStillRunning
+          ? 1
+          : 0;
     this.sql`
       UPDATE cf_agent_tool_runs
       SET status = ${result.status},
           summary = ${result.summary ?? null},
           output_json = ${this._stringifyAgentToolOutput(result.output)},
           error_message = ${result.error ?? null},
+          interrupted_reason = ${result.reason ?? null},
+          child_still_running = ${childStillRunning},
           completed_at = ${completedAt}
       WHERE run_id = ${runId}
-        AND status NOT IN ('completed', 'error', 'aborted', 'interrupted')
+        AND status NOT IN ('completed', 'error', 'aborted')
     `;
     if (result.status === "completed" && result.output !== undefined) {
       this.sql`
@@ -7268,7 +9455,29 @@ export class Agent<
   ): Promise<number> {
     const child = await this._cf_resolveSubAgent(row.agent_type, row.run_id);
     const adapter = this._asAgentToolChildAdapter(child);
-    const chunks = await adapter.getAgentToolChunks(row.run_id);
+    return this._broadcastAgentToolStoredChunksFromAdapter(
+      adapter,
+      row,
+      sequence,
+      replay,
+      connection
+    );
+  }
+
+  private async _broadcastAgentToolStoredChunksFromAdapter(
+    adapter: AgentToolChildAdapter,
+    row: Pick<AgentToolRunStorageRow, "run_id" | "parent_tool_call_id">,
+    sequence: number,
+    replay?: true,
+    connection?: Connection,
+    timeoutMs?: number
+  ): Promise<number> {
+    const chunks = await this._getAgentToolChunksForRecovery(
+      adapter,
+      row.run_id,
+      timeoutMs
+    );
+    if (!chunks) return sequence;
     return this._broadcastAgentToolChunks(
       row.parent_tool_call_id ?? undefined,
       row.run_id,
@@ -7284,24 +9493,58 @@ export class Agent<
     parentToolCallId: string | undefined,
     runId: string,
     sequence: number,
-    signal?: AbortSignal
-  ): Promise<number> {
+    signal?: AbortSignal,
+    idleTimeoutMs?: number
+  ): Promise<{ next: number; ended: "done" | "idle" | "aborted" }> {
     let next = sequence;
-    if (signal?.aborted) return next;
+    if (signal?.aborted) return { next, ended: "aborted" };
+    // How the forward loop ended, so the re-attach caller can re-arm ONLY on a
+    // clean stream-close (`done`) and never abandon a fresh reader per idle
+    // cycle: `idle` = a full no-progress window elapsed (stalled), `aborted` =
+    // the caller's ceiling signal fired.
+    let ended: "done" | "idle" | "aborted" = "done";
     const reader = (
       stream as ReadableStream<AgentToolStoredChunk | Uint8Array>
     ).getReader();
     const decoder = new TextDecoder();
     let bufferedBytes = "";
+    let aborted = false;
+    let resolveAbort: (() => void) | undefined;
+    const abortPromise = new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    });
     let abortListener: (() => void) | undefined;
     if (signal) {
-      abortListener = () => {
-        // runAgentTool() also calls cancelAgentToolRun(), whose adapter should
-        // close the tail stream. Avoid reader.cancel(reason) here because DO RPC
-        // can surface cancellation reasons as unhandled stream rejections.
-      };
+      abortListener = () => resolveAbort?.();
       signal.addEventListener("abort", abortListener, { once: true });
     }
+    // Optional no-progress (idle) budget: a re-attach passes this so a child
+    // that keeps forwarding chunks is never cut off mid-flight. The timer is
+    // (re-)armed on every forwarded chunk and only fires after a full window of
+    // silence. When `idleTimeoutMs` is undefined (the live run path) OR
+    // non-finite (`Infinity` = "never seal on no-progress") the idle promise
+    // never resolves, so the forward loop ends only on a clean stream-close or
+    // the caller's ceiling signal — never on silence.
+    const idleEnabled =
+      typeof idleTimeoutMs === "number" &&
+      idleTimeoutMs > 0 &&
+      Number.isFinite(idleTimeoutMs);
+    let resolveIdle: (() => void) | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const idlePromise = new Promise<void>((resolve) => {
+      resolveIdle = resolve;
+    });
+    const armIdle = () => {
+      if (!idleEnabled) return;
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => resolveIdle?.(), idleTimeoutMs);
+    };
+    // N9: track whether any chunk was forwarded since the last progress hook so
+    // a parent that is merely orchestrating a child still records forward
+    // progress for its OWN recovery budget — but ONLY when the child actually
+    // produces output (a silent/hung child forwards nothing → no credit → the
+    // parent still exhausts on its own no-progress timer).
+    let forwardedSinceProgress = false;
     try {
       const forwardChunk = (chunk: AgentToolStoredChunk) => {
         this._broadcastAgentToolEvent(parentToolCallId, next++, {
@@ -7309,6 +9552,13 @@ export class Agent<
           runId,
           body: chunk.body
         });
+        // A reserved `data-agent-progress` frame fires the parent `onProgress`
+        // hook + refreshes the cached liveness timestamp. Best-effort: never
+        // let a progress observation break the forward loop.
+        this._observeForwardedProgress(runId, chunk.body);
+        forwardedSinceProgress = true;
+        // Forward progress resets the no-progress budget.
+        armIdle();
       };
       const forwardLine = (line: string) => {
         try {
@@ -7336,17 +9586,29 @@ export class Agent<
           bufferedBytes = "";
         }
       };
+      // Arm the idle budget up front so a child that never emits anything still
+      // ends the wait after one no-progress window.
+      armIdle();
       while (true) {
-        let readResult: ReadableStreamReadResult<
-          AgentToolStoredChunk | Uint8Array
-        >;
-        try {
-          readResult = await reader.read();
-        } catch (error) {
-          if (signal?.aborted) break;
-          throw error;
+        // Pre-attach a catch so that if the abort wins the race below, a later
+        // rejection of this read (e.g. the child closing / DO RPC surfacing
+        // "Stream was cancelled") never bubbles up as an unhandled rejection.
+        const readPromise = reader.read();
+        readPromise.catch(() => {});
+        const raced = await Promise.race([
+          readPromise.then((result) => ({ kind: "read" as const, result })),
+          abortPromise.then(() => ({ kind: "abort" as const })),
+          idlePromise.then(() => ({ kind: "idle" as const }))
+        ]);
+        if (raced.kind === "abort" || raced.kind === "idle") {
+          // Both leave the pending read in place — we never cancel a live child
+          // facet stream (see the note below). The caller distinguishes a
+          // no-progress stall from terminal via a follow-up inspect.
+          aborted = true;
+          ended = raced.kind === "idle" ? "idle" : "aborted";
+          break;
         }
-        const { done, value } = readResult;
+        const { done, value } = raced.result;
         if (done) {
           bufferedBytes += decoder.decode();
           flushBufferedBytes(true);
@@ -7358,15 +9620,190 @@ export class Agent<
         } else {
           forwardChunk(value);
         }
+        if (forwardedSinceProgress) {
+          forwardedSinceProgress = false;
+          // Credit the parent's recovery progress for forwarding child output
+          // (no-op in the base Agent; chat-recovery subclasses override). Kept
+          // off the hot per-chunk path — runs once per read iteration and is
+          // throttled inside the override. Best-effort: progress crediting is
+          // advisory, so a bump failure must never break the child stream the
+          // user is watching.
+          try {
+            await this._onAgentToolStreamProgress();
+          } catch {
+            // Ignore and keep forwarding; the next iteration tries again.
+          }
+        }
       }
     } finally {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
       if (abortListener && signal) {
         signal.removeEventListener("abort", abortListener);
       }
-      reader.releaseLock();
+      if (!aborted) {
+        try {
+          reader.releaseLock();
+        } catch {
+          // A concurrently-cancelled reader can't release; safe to ignore.
+        }
+      }
+      // When `aborted` (re-attach budget expired with a read still pending) we
+      // deliberately do NOT cancel the reader: cancelling a remote child-facet
+      // RPC stream surfaces a "Stream was cancelled" rejection from the RPC pump
+      // that can't be reliably swallowed (verified). Instead we abandon the
+      // pre-caught read — it resolves harmlessly when the child reaches terminal
+      // and the adapter's tail fires its registered closer, releasing the reader
+      // + stream. That makes the hold BOUNDED by the child's own recovery
+      // (its turn is sealed within the chat-recovery ceiling), never unbounded.
+      // The re-attach loop re-arms only on `ended === "done"`, so at most ONE
+      // such read is ever left pending per re-attach (no per-cycle leak).
     }
-    return next;
+    return { next, ended };
   }
+
+  /**
+   * Hook invoked by `_forwardAgentToolStream` after a child produces output that
+   * was forwarded to the parent's connections. Forwarding a sub-agent's stream
+   * is genuine forward progress for the *parent* turn (the parent is
+   * orchestrating the child), so chat-recovery subclasses (Think / AIChatAgent)
+   * override this to advance their recovery progress marker.
+   *
+   * Without it, a parent whose turn merely `await`s a sub-agent banks zero
+   * progress of its own, so under deploy churn the parent's no-progress recovery
+   * window exhausts and abandons the turn as `interrupted` — even though the
+   * child is healthily streaming and ultimately completes (observed in the
+   * `deploy-churn --mode subagent` harness: `attempt 6/6, stable_timeout,
+   * progress: 1`).
+   *
+   * Called ONLY after at least one chunk was actually forwarded — never merely
+   * because a child is attached — so a silent / hung child still lets the parent
+   * exhaust on its own timer. The base Agent has no recovery budget, so this is
+   * a no-op; subclasses should throttle the (durable) bump since this can be
+   * called repeatedly while a child streams.
+   */
+  protected async _onAgentToolStreamProgress(): Promise<void> {}
+
+  /**
+   * Best-effort observation of a forwarded child chunk: if it is a reserved
+   * `data-agent-progress` frame, refresh the cached liveness timestamp on the
+   * run row (a hint for a still-warm parent) and fire the public `onProgress`
+   * hook. Never throws into the forward loop — the child's own persisted
+   * snapshot (read via `inspectAgentToolRun`) remains authoritative for the
+   * resetting no-progress budget after eviction.
+   */
+  private _observeForwardedProgress(runId: string, body: string): void {
+    let parsed:
+      | {
+          type?: unknown;
+          data?: AgentToolProgress & {
+            name?: string;
+            sequence?: number;
+            at?: number;
+          };
+        }
+      | undefined;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return;
+    }
+    if (!parsed) return;
+    const isMilestone = parsed.type === AGENT_TOOL_MILESTONE_PART;
+    if (parsed.type !== AGENT_TOOL_PROGRESS_PART && !isMilestone) return;
+    const data = parsed.data ?? {};
+    const at = Date.now();
+    const snapshot: AgentToolProgressSnapshot = {
+      ...(typeof data.fraction === "number" ? { fraction: data.fraction } : {}),
+      ...(typeof data.message === "string" ? { message: data.message } : {}),
+      ...(typeof data.phase === "string" ? { phase: data.phase } : {}),
+      ...(isMilestone && typeof data.name === "string"
+        ? { milestone: data.name }
+        : {}),
+      ...(data.data !== undefined ? { data: data.data } : {}),
+      at
+    };
+    const row = this._readAgentToolRun(runId);
+    if (!row) return;
+    // The cached liveness timestamp only feeds the DETACHED no-progress budget;
+    // skip the write for awaited runs (the `onProgress` hook still fires below).
+    if (row.detached) {
+      try {
+        this.sql`
+          UPDATE cf_agent_tool_runs SET last_progress_at = ${at}
+          WHERE run_id = ${runId}
+        `;
+      } catch {
+        // Row may have settled / been pruned; the hook still fires below.
+      }
+    }
+    const runInfo = this._agentToolRunInfoFromRow(row);
+    void Promise.resolve(this.onProgress(runInfo, snapshot)).catch((error) => {
+      console.error(
+        `[agents] onProgress hook threw for run ${runId}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+    // Chat-host `detached: { onMilestones }` convenience: when a CONFIGURED
+    // milestone lands on the warm path, deliver its idempotent notification.
+    // The cold backbone reconcile delivers the same set after eviction; the
+    // idempotency key makes the two paths converge to at-most-once.
+    if (isMilestone && typeof data.name === "string") {
+      this._maybeDeliverDetachedMilestone(row, runInfo, {
+        name: data.name,
+        sequence: typeof data.sequence === "number" ? data.sequence : 0,
+        at: typeof data.at === "number" ? data.at : at,
+        ...(data.data !== undefined ? { data: data.data } : {})
+      });
+    }
+  }
+
+  /**
+   * Deliver a milestone notification IF this run opted into it via
+   * `detached: { onMilestones }` and the milestone name is in that set. Routes
+   * to the overridable `_deliverDetachedMilestone` seam (a no-op on the base
+   * `Agent`; chat hosts inject an idempotent synthetic chat message).
+   */
+  private _maybeDeliverDetachedMilestone(
+    row: AgentToolRunStorageRow,
+    runInfo: AgentToolRunInfo,
+    milestone: AgentToolMilestone
+  ): void {
+    // Stored as `{ names, mode }`; tolerate a bare-array legacy/manual value.
+    const configured = this._parseAgentToolJson(
+      row.detached_on_milestones ?? null
+    ) as
+      | string[]
+      | { names?: string[]; mode?: "react" | "narrate" }
+      | undefined;
+    const names = Array.isArray(configured) ? configured : configured?.names;
+    const mode = Array.isArray(configured)
+      ? "narrate"
+      : (configured?.mode ?? "narrate");
+    if (!Array.isArray(names) || !names.includes(milestone.name)) {
+      return;
+    }
+    void Promise.resolve(
+      this._deliverDetachedMilestone(runInfo, milestone, mode)
+    ).catch((error) => {
+      console.error(
+        `[agents] detached milestone delivery threw for run ${runInfo.runId} (${milestone.name}):`,
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+  }
+
+  /**
+   * Overridable seam for the `detached: { onMilestones }` convenience. The base
+   * `Agent` has no chat surface, so this is a no-op; chat hosts
+   * (`@cloudflare/think`, `AIChatAgent`) override it to submit an idempotent
+   * synthetic message keyed on `(runId, milestone.name)`. Called from both the
+   * warm tail and the backbone reconcile, so it MUST be idempotent.
+   */
+  protected async _deliverDetachedMilestone(
+    _run: AgentToolRunInfo,
+    _milestone: AgentToolMilestone,
+    _mode: "react" | "narrate"
+  ): Promise<void> {}
 
   private _broadcastAgentToolTerminal<Output>(
     parentToolCallId: string | undefined,
@@ -7402,7 +9839,11 @@ export class Agent<
         {
           kind: "interrupted",
           runId: result.runId,
-          error: result.error ?? "Agent tool run was interrupted"
+          error: result.error ?? "Agent tool run was interrupted",
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          ...(result.childStillRunning !== undefined
+            ? { childStillRunning: result.childStillRunning }
+            : {})
         },
         replay,
         connection
@@ -7450,7 +9891,8 @@ export class Agent<
 
   private async _replayAndInterruptAgentToolRun<Output>(
     row: AgentToolRunStorageRow,
-    message: string
+    message: string,
+    extra?: { reason?: AgentToolInterruptedReason; childStillRunning?: boolean }
   ): Promise<RunAgentToolResult<Output>> {
     let sequence = 1;
     try {
@@ -7462,12 +9904,271 @@ export class Agent<
       runId: row.run_id,
       agentType: row.agent_type,
       status: "interrupted",
-      error: message
+      error: message,
+      ...(extra?.reason !== undefined ? { reason: extra.reason } : {}),
+      ...(extra?.childStillRunning !== undefined
+        ? { childStillRunning: extra.childStillRunning }
+        : {})
     };
     await this._finishAgentToolRun(this._agentToolRunInfoFromRow(row), result, {
       sequence
     });
     return result;
+  }
+
+  /**
+   * Human-readable prose for an `interrupted` seal. Kept in sync with
+   * {@link AgentToolInterruptedReason}; callers branch on the typed `reason`
+   * field, not this string.
+   */
+  private _interruptedMessageForReason(
+    reason: AgentToolInterruptedReason | undefined
+  ): string {
+    switch (reason) {
+      case "no-progress":
+        return "Agent tool run was still running but made no forward progress within the re-attach no-progress budget; the parent gave up.";
+      case "window-exceeded":
+        return "Agent tool run did not reach a terminal result within the maximum re-attach window; the parent gave up.";
+      case "not-tailable":
+        return "Agent tool run was still running, but live-tail reattachment is not supported in this runtime.";
+      case "inspect-timeout":
+        return "Agent tool run inspection timed out during parent recovery.";
+      case "inspect-failed":
+        return "Agent tool run could not be inspected during parent recovery.";
+      case "recovery-deadline":
+        return "Agent tool run recovery deadline exceeded.";
+      default:
+        return "Agent tool run was still running and did not reach a terminal result.";
+    }
+  }
+
+  /**
+   * Tear down a child agent-tool run the parent has genuinely given up on
+   * (#1630 follow-up). Teardown is scoped to `window-exceeded` ONLY — the hard
+   * ceiling, where the child has had its full recovery window and is therefore
+   * truly exhausted, so cancelling it reclaims its fiber / keep-alive. Every
+   * other give-up is deliberately left repairable: `no-progress` seals stay
+   * SOFT (`interrupted`, `childStillRunning: true`) so a re-issue can still
+   * re-attach and collect the child if it self-heals — tearing those down would
+   * defeat the repair-on-re-issue path and convert a retryable interrupt into a
+   * non-retryable `aborted`. Reasons where the child's state is unknown
+   * (`inspect-*`, `recovery-deadline`, `not-tailable`) are also left alone.
+   * Returns whether the child was torn down (so the caller reports
+   * `childStillRunning: false`).
+   */
+  private async _teardownGivenUpAgentToolChild(
+    adapter: AgentToolChildAdapter,
+    runId: string,
+    reason: AgentToolInterruptedReason | undefined
+  ): Promise<boolean> {
+    if (reason !== "window-exceeded") return false;
+    try {
+      await adapter.cancelAgentToolRun(
+        runId,
+        `agent tool run given up by parent recovery: ${reason}`
+      );
+      return true;
+    } catch {
+      // Best-effort: a failed teardown just means the child may still be alive.
+      return false;
+    }
+  }
+
+  /**
+   * Re-attach to a still-running child agent-tool run and tail it to its real
+   * terminal result, instead of abandoning it as `interrupted` (#1630). The
+   * child is a separate facet with its own `chatRecovery`, so resolving it via
+   * the adapter wakes it and lets it self-complete the interrupted turn; we tail
+   * its live stream (forwarding chunks to the parent's connections) until it
+   * reaches terminal, then inspect for the collected result.
+   *
+   * The wait is PROGRESS-KEYED, not a flat wall clock (which previously abandoned
+   * healthy, still-advancing children whose recovery simply outran a fixed
+   * budget). `noProgressTimeoutMs` bounds how long the parent waits with NO
+   * forward progress; it is reset on every forwarded chunk. As long as the child
+   * keeps streaming it is followed through to terminal. The loop also RE-ARMS
+   * across stream-closes (a child re-evicted mid-recovery, or a tail that ends
+   * before terminal) as long as the prior attempt made progress, so a child that
+   * dies and recovers again during deploy churn is still collected. A genuinely
+   * silent/hung child can never block recovery forever: it seals `interrupted`
+   * after one `noProgressTimeoutMs` window. `maxWindowMs` is an OPTIONAL hard
+   * wall-clock ceiling (default `Infinity` — uncapped, mirroring #1672's
+   * `maxRecoveryWork`); set it finite to also bound a child that keeps
+   * progressing, which seals `window-exceeded` and tears the child down.
+   *
+   * Returns the terminal `result` (and `completedAt`) when the child reaches a
+   * terminal status, plus the advanced broadcast `sequence`. Returns
+   * `{ result: undefined }` when there is no `tailAgentToolRun` adapter, the
+   * child makes no progress within a full no-progress window, or the ceiling is
+   * reached while the child is still non-terminal — the caller then seals
+   * `interrupted`.
+   */
+  private async _reattachAgentToolRunToTerminal<Output>(
+    adapter: AgentToolChildAdapter<unknown, Output>,
+    row: Pick<
+      AgentToolRunStorageRow,
+      "run_id" | "agent_type" | "parent_tool_call_id"
+    >,
+    sequence: number,
+    noProgressTimeoutMs: number = DEFAULT_AGENT_TOOL_REATTACH_NO_PROGRESS_TIMEOUT_MS,
+    maxWindowMs: number = DEFAULT_AGENT_TOOL_REATTACH_MAX_WINDOW_MS
+  ): Promise<{
+    sequence: number;
+    result?: RunAgentToolResult<Output>;
+    completedAt?: number;
+    reason?: AgentToolInterruptedReason;
+  }> {
+    if (typeof adapter.tailAgentToolRun !== "function") {
+      // Defensive: a real (RPC) child stub reports every method as a `function`,
+      // so this only fires for an in-process adapter that genuinely omits the
+      // method. A real child that can't tail surfaces as a tail-call failure
+      // below (caught → `no-progress`), not here.
+      return { sequence, reason: "not-tailable" };
+    }
+
+    this._emit("agent_tool:recovery:reattach", {
+      runId: row.run_id,
+      agentType: row.agent_type,
+      budgetMs: noProgressTimeoutMs
+    });
+
+    const collectTerminal = async (
+      seq: number
+    ): Promise<{
+      sequence: number;
+      result: RunAgentToolResult<Output>;
+      completedAt?: number;
+    } | null> => {
+      let inspection: AgentToolRunInspection<Output> | null = null;
+      try {
+        inspection = await adapter.inspectAgentToolRun(row.run_id);
+      } catch {
+        // Treat an un-inspectable child as still non-terminal.
+        return null;
+      }
+      if (
+        inspection &&
+        inspection.status !== "running" &&
+        inspection.status !== "starting"
+      ) {
+        return {
+          sequence: seq,
+          result: this._terminalResultFromInspection<Output>(
+            row.agent_type,
+            inspection
+          ),
+          completedAt: inspection.completedAt
+        };
+      }
+      return null;
+    };
+
+    let nextSequence = sequence;
+
+    // A non-positive no-progress budget means "do not wait" — only collect an
+    // already-terminal child without tailing. A non-finite (`Infinity`) budget
+    // is the OPPOSITE — "never seal on no-progress": it falls through to the
+    // tail loop below, where a non-finite budget disables the idle timer so a
+    // silent-but-alive child is followed until its stream closes (or the hard
+    // ceiling fires), matching the `maxWindowMs` "Infinity = off" convention.
+    if (!(noProgressTimeoutMs > 0)) {
+      return (
+        (await collectTerminal(nextSequence)) ?? {
+          sequence: nextSequence,
+          reason: "no-progress"
+        }
+      );
+    }
+
+    // Optional hard wall-clock ceiling (default Infinity = off). A hung child is
+    // already bounded by the no-progress budget; this only additionally bounds a
+    // child that keeps progressing, when an integrator opts into a finite cap.
+    const ceilingController = new AbortController();
+    let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
+    if (maxWindowMs > 0 && Number.isFinite(maxWindowMs)) {
+      ceilingTimer = setTimeout(() => ceilingController.abort(), maxWindowMs);
+    }
+
+    // Defaults to the no-progress cause; promoted to `window-exceeded` if the
+    // hard ceiling is what ends the wait.
+    let reason: AgentToolInterruptedReason = "no-progress";
+    try {
+      // Re-arm loop: keep tailing as long as the child makes forward progress.
+      // Each attempt forwards live chunks until the child reaches terminal (its
+      // stream closes), goes silent for a full no-progress window, or the ceiling
+      // fires. Only a full no-progress window with no terminal seals
+      // `interrupted`; a still-streaming or re-evicted-but-advancing child is
+      // followed through.
+      while (!ceilingController.signal.aborted) {
+        // Tail from the child's CURRENT last chunk, not from -1: stored chunks
+        // are already delivered to connected clients via `_replayAgentToolRuns`
+        // on reconnect, so replaying them here would duplicate parts (the client
+        // reducer appends by arrival order). Forwarding only chunks produced
+        // after this point keeps the live stream correct without dupes.
+        let afterSequence = -1;
+        try {
+          const existing = await adapter.getAgentToolChunks(row.run_id);
+          const last = existing[existing.length - 1];
+          if (last) afterSequence = last.sequence;
+        } catch {
+          // Fall back to a full tail if the chunk probe fails.
+        }
+
+        const beforeSequence = nextSequence;
+        // Defaults to a non-`done` end so a tail that throws below does NOT
+        // re-arm (we only re-arm on a verified clean stream-close).
+        let streamEnded: "done" | "idle" | "aborted" = "idle";
+        try {
+          // NOTE: the ceiling signal is NOT forwarded to `tailAgentToolRun` — an
+          // AbortSignal can't be serialized across the child-facet DO RPC. We
+          // bound the wait parent-side: the ceiling/no-progress budget ends our
+          // local forward loop and releases the read view, but never cancels the
+          // child (it must keep advancing toward its own terminal so this — or a
+          // later — inspect can still collect it).
+          const stream = await adapter.tailAgentToolRun(row.run_id, {
+            afterSequence
+          });
+          // Resolves when the child reaches terminal (the adapter closes the
+          // tail), goes silent for a full no-progress window, or the ceiling
+          // aborts our controller.
+          const forwarded = await this._forwardAgentToolStream(
+            stream,
+            row.parent_tool_call_id ?? undefined,
+            row.run_id,
+            nextSequence,
+            ceilingController.signal,
+            noProgressTimeoutMs
+          );
+          nextSequence = forwarded.next;
+          streamEnded = forwarded.ended;
+        } catch {
+          // Tail failures fall through to an inspect; the child remains
+          // authoritative for terminal status and durable chunk replay.
+        }
+
+        const terminal = await collectTerminal(nextSequence);
+        if (terminal) return terminal;
+
+        if (ceilingController.signal.aborted) {
+          reason = "window-exceeded";
+          break;
+        }
+
+        // Re-arm ONLY when the child's stream closed cleanly (`done`) AND it
+        // made forward progress this attempt — i.e. a re-evicted-but-advancing
+        // child that closed before terminal. An `idle` end means a full
+        // no-progress window elapsed (genuinely stalled) ⇒ seal `no-progress`
+        // now; re-arming there would both mis-read a stall as recoverable and
+        // abandon a fresh pending reader every cycle. No progress likewise
+        // seals.
+        if (streamEnded !== "done") break;
+        if (nextSequence <= beforeSequence) break;
+      }
+    } finally {
+      if (ceilingTimer !== undefined) clearTimeout(ceilingTimer);
+    }
+
+    return { sequence: nextSequence, reason };
   }
 
   private async _replayAgentToolRuns(connection: Connection): Promise<void> {
@@ -7480,11 +10181,14 @@ export class Agent<
       summary: string | null;
       output_json: string | null;
       error_message: string | null;
+      interrupted_reason: string | null;
+      child_still_running: number | null;
       display_metadata: string | null;
       display_order: number;
     }>`
       SELECT run_id, parent_tool_call_id, agent_type, input_preview, status,
-             summary, output_json, error_message, display_metadata, display_order
+             summary, output_json, error_message, interrupted_reason,
+             child_still_running, display_metadata, display_order
       FROM cf_agent_tool_runs
       ORDER BY started_at ASC
     `;
@@ -7530,7 +10234,8 @@ export class Agent<
             status: row.status as RunAgentToolResult["status"],
             output: this._parseAgentToolJson(row.output_json),
             summary: row.summary ?? undefined,
-            error: row.error_message ?? undefined
+            error: row.error_message ?? undefined,
+            ...this._agentToolInterruptedExtrasFromRow(row)
           },
           true,
           connection
@@ -7541,59 +10246,66 @@ export class Agent<
 
   private async _reconcileAgentToolRuns(options?: {
     deferFinishHooks?: boolean;
+    childInspectionTimeoutMs?: number;
+    totalRecoveryTimeoutMs?: number;
+    reattachTimeoutMs?: number;
+    reattachMaxWindowMs?: number;
+    runIds?: readonly string[];
   }): Promise<DeferredAgentToolFinish[]> {
+    const reattachTimeoutMs =
+      options?.reattachTimeoutMs ??
+      this._resolvedOptions.agentToolReattachNoProgressTimeoutMs;
+    const reattachMaxWindowMs =
+      options?.reattachMaxWindowMs ??
+      this._resolvedOptions.agentToolReattachMaxWindowMs;
+    const startedAt = Date.now();
+    const totalTimeoutMs =
+      options?.totalRecoveryTimeoutMs ??
+      DEFAULT_AGENT_TOOL_RECOVERY_TOTAL_TIMEOUT_MS;
+    const deadlineAt =
+      totalTimeoutMs > 0
+        ? startedAt + totalTimeoutMs
+        : Number.POSITIVE_INFINITY;
     const deferredFinishes: DeferredAgentToolFinish[] = [];
     const rows = this.sql<AgentToolRunStorageRow>`
       SELECT run_id, parent_tool_call_id, agent_type, input_preview, status,
-             summary, output_json, error_message, display_metadata, display_order,
+             summary, output_json, error_message, interrupted_reason,
+             child_still_running, display_metadata, display_order,
              started_at, completed_at
       FROM cf_agent_tool_runs
-      WHERE status IN ('starting', 'running')
+      WHERE status IN ('starting', 'running') AND detached = 0
       ORDER BY started_at ASC
     `;
-    for (const row of rows) {
-      let sequence = 1;
-      let completedAt: number | undefined;
-      let result: RunAgentToolResult;
-      try {
-        const child = await this._cf_resolveSubAgent(
-          row.agent_type,
-          row.run_id
-        );
-        const adapter = this._asAgentToolChildAdapter(child);
-        const inspection = await adapter.inspectAgentToolRun(row.run_id);
-        try {
-          sequence = await this._broadcastAgentToolStoredChunks(row, sequence);
-        } catch {
-          // Terminal reconciliation should still complete if chunk replay fails.
-        }
-        if (
-          !inspection ||
-          inspection.status === "running" ||
-          inspection.status === "starting"
-        ) {
-          result = {
-            runId: row.run_id,
-            agentType: row.agent_type,
-            status: "interrupted",
-            error:
-              "Agent tool run was still running, but live-tail reattachment is not supported in this runtime."
-          };
-        } else {
-          result = this._terminalResultFromInspection(
-            row.agent_type,
-            inspection
-          );
-          completedAt = inspection.completedAt;
-        }
-      } catch {
-        result = {
-          runId: row.run_id,
-          agentType: row.agent_type,
-          status: "interrupted",
-          error: "Agent tool run could not be inspected during parent recovery."
-        };
-      }
+    // NOTE: detached runs are deliberately excluded. The awaited reconcile seals
+    // a still-running, not-tailable run `interrupted` because a lost observer
+    // means the dispatching turn cannot continue. For a DETACHED run a lost
+    // observer is the NORMAL state — sealing it would defeat the feature — so
+    // detached runs are owned by the self-scheduling `_cfDetachedReconcileTick`
+    // backbone instead, which keeps them alive within budget and delivers on
+    // terminal. The backbone is (re-)armed on startup by
+    // `_scheduleAgentToolRunRecovery`.
+    const runIds =
+      options?.runIds !== undefined ? new Set(options.runIds) : undefined;
+    const recoveryRows = rows.filter(
+      (row) => !runIds || runIds.has(row.run_id)
+    );
+    this._emit("agent_tool:recovery:begin", {
+      runCount: recoveryRows.length,
+      totalTimeoutMs
+    });
+    const finalizeRow = async (
+      row: AgentToolRunStorageRow,
+      result: RunAgentToolResult,
+      sequence: number,
+      completedAt: number | undefined
+    ): Promise<void> => {
+      this._emit("agent_tool:recovery:row", {
+        runId: row.run_id,
+        agentType: row.agent_type,
+        status: result.status,
+        reason: result.error,
+        elapsedMs: Date.now() - startedAt
+      });
       const deferredFinish = await this._finishAgentToolRun(
         this._agentToolRunInfoFromRow(row),
         result,
@@ -7606,8 +10318,281 @@ export class Agent<
       if (deferredFinish) {
         deferredFinishes.push(deferredFinish);
       }
+    };
+
+    // Pass 1 — deadline-bounded inspect/classify sweep. Terminal and
+    // non-recoverable rows are finalized immediately; still-running tail-able
+    // children are queued for the parallel re-attach pass below. The shared
+    // `deadlineAt` only bounds this fast classification — re-attach (which can
+    // legitimately run for the child's lifetime) must NOT count against it, or
+    // one slow child would starve every later sibling of recovery (#1630).
+    const reattachQueue: Array<{
+      row: AgentToolRunStorageRow;
+      adapter: AgentToolChildAdapter;
+    }> = [];
+    for (const row of recoveryRows) {
+      const sequence = 1;
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        this._emit("agent_tool:recovery:deadline", {
+          runId: row.run_id,
+          agentType: row.agent_type,
+          elapsedMs: Date.now() - startedAt
+        });
+        await finalizeRow(
+          row,
+          {
+            runId: row.run_id,
+            agentType: row.agent_type,
+            status: "interrupted",
+            reason: "recovery-deadline",
+            error: this._interruptedMessageForReason("recovery-deadline")
+          },
+          sequence,
+          undefined
+        );
+        continue;
+      }
+      const childTimeout =
+        options?.childInspectionTimeoutMs ??
+        DEFAULT_AGENT_TOOL_RECOVERY_TIMEOUT_MS;
+      const boundedChildTimeout =
+        childTimeout > 0 ? Math.min(childTimeout, remainingMs) : remainingMs;
+      const recovery = await this._inspectAgentToolRunForRecovery(
+        row,
+        sequence,
+        boundedChildTimeout
+      );
+      if (recovery.status !== "inspected") {
+        await finalizeRow(
+          row,
+          (() => {
+            const reason: AgentToolInterruptedReason =
+              recovery.status === "timed-out"
+                ? "inspect-timeout"
+                : "inspect-failed";
+            return {
+              runId: row.run_id,
+              agentType: row.agent_type,
+              status: "interrupted" as const,
+              reason,
+              error: this._interruptedMessageForReason(reason)
+            };
+          })(),
+          sequence,
+          undefined
+        );
+        continue;
+      }
+      const inspection = recovery.inspection;
+      const stillRunning =
+        !inspection ||
+        inspection.status === "running" ||
+        inspection.status === "starting";
+      if (
+        stillRunning &&
+        typeof recovery.adapter.tailAgentToolRun === "function"
+      ) {
+        // Defer to the parallel re-attach pass — keep the row non-terminal so
+        // re-attach can collect the child's real terminal result. No stored-chunk
+        // broadcast here: re-attach forwards only new chunks, and a reconnected
+        // client already replays stored chunks via `_replayAgentToolRuns`.
+        reattachQueue.push({ row, adapter: recovery.adapter });
+        continue;
+      }
+      let sequenceAfterReplay = sequence;
+      try {
+        sequenceAfterReplay =
+          await this._broadcastAgentToolStoredChunksFromAdapter(
+            recovery.adapter,
+            row,
+            sequence,
+            undefined,
+            undefined,
+            boundedChildTimeout
+          );
+      } catch {
+        // Terminal reconciliation should still complete if chunk replay fails.
+      }
+      if (stillRunning) {
+        await finalizeRow(
+          row,
+          {
+            runId: row.run_id,
+            agentType: row.agent_type,
+            status: "interrupted",
+            reason: "not-tailable",
+            // The child has no live-tail adapter, so it was never torn down and
+            // may still self-complete and be collected by a later inspect.
+            childStillRunning: true,
+            error: this._interruptedMessageForReason("not-tailable")
+          },
+          sequenceAfterReplay,
+          undefined
+        );
+      } else {
+        await finalizeRow(
+          row,
+          this._terminalResultFromInspection(row.agent_type, inspection),
+          sequenceAfterReplay,
+          inspection.completedAt
+        );
+      }
     }
+
+    // Pass 2 — re-attach still-running children IN PARALLEL, each bounded by
+    // its own re-attach budget, so a slow/hung child only delays itself and can
+    // never cause a sibling run to be wrongly abandoned (#1630).
+    await Promise.all(
+      reattachQueue.map(async ({ row, adapter }) => {
+        const reattach = await this._reattachAgentToolRunToTerminal(
+          adapter,
+          row,
+          1,
+          reattachTimeoutMs,
+          reattachMaxWindowMs
+        );
+        if (reattach.result) {
+          await finalizeRow(
+            row,
+            reattach.result,
+            reattach.sequence,
+            reattach.completedAt
+          );
+          return;
+        }
+        // The parent has genuinely given up on this still-running child — tear
+        // it down so it stops consuming a fiber / keep-alive (#1630).
+        const tornDown = await this._teardownGivenUpAgentToolChild(
+          adapter,
+          row.run_id,
+          reattach.reason
+        );
+        await finalizeRow(
+          row,
+          {
+            runId: row.run_id,
+            agentType: row.agent_type,
+            status: "interrupted",
+            reason: reattach.reason,
+            childStillRunning: !tornDown,
+            error: this._interruptedMessageForReason(reattach.reason)
+          },
+          reattach.sequence,
+          reattach.completedAt
+        );
+      })
+    );
+    this._emit("agent_tool:recovery:complete", {
+      runCount: recoveryRows.length,
+      elapsedMs: Date.now() - startedAt
+    });
     return deferredFinishes;
+  }
+
+  private async _inspectAgentToolRunForRecovery(
+    row: AgentToolRunStorageRow,
+    _sequence: number,
+    timeoutMs = DEFAULT_AGENT_TOOL_RECOVERY_TIMEOUT_MS
+  ): Promise<AgentToolRecoveryInspection> {
+    const inspect = (async (): Promise<AgentToolRecoveryInspection> => {
+      const child = await this._cf_resolveSubAgent(row.agent_type, row.run_id);
+      const adapter = this._asAgentToolChildAdapter(child);
+      const inspection = await adapter.inspectAgentToolRun(row.run_id);
+      return { status: "inspected", adapter, inspection };
+    })().catch((): AgentToolRecoveryInspection => ({ status: "failed" }));
+
+    if (timeoutMs <= 0) return inspect;
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<AgentToolRecoveryInspection>((resolve) => {
+      timeoutId = setTimeout(() => {
+        resolve({ status: "timed-out" });
+      }, timeoutMs);
+    });
+
+    const result = await Promise.race([inspect, timeout]);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    return result;
+  }
+
+  private _scheduleAgentToolRunRecovery(options?: {
+    childInspectionTimeoutMs?: number;
+    totalRecoveryTimeoutMs?: number;
+    reattachTimeoutMs?: number;
+    reattachMaxWindowMs?: number;
+    runIds?: readonly string[];
+  }): Promise<void> {
+    if (this._agentToolRunRecoveryPromise) {
+      return this._agentToolRunRecoveryPromise;
+    }
+
+    if (options?.runIds && options.runIds.length === 0) {
+      return Promise.resolve();
+    }
+
+    const recovery = (async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const recoveredAgentToolFinishes = await this._reconcileAgentToolRuns({
+        deferFinishHooks: true,
+        childInspectionTimeoutMs: options?.childInspectionTimeoutMs,
+        totalRecoveryTimeoutMs: options?.totalRecoveryTimeoutMs,
+        reattachTimeoutMs: options?.reattachTimeoutMs,
+        reattachMaxWindowMs: options?.reattachMaxWindowMs,
+        runIds: options?.runIds
+      });
+      await this._runDeferredAgentToolFinishHooks(recoveredAgentToolFinishes);
+      // Re-arm the detached backbone if this DO woke with outstanding detached
+      // runs (the schedule row survives eviction, but this also recreates it if
+      // a dispatching turn crashed after inserting the run row but before
+      // arming the schedule).
+      if (this._hasOutstandingDetachedRuns()) {
+        await this._armDetachedBackbone();
+      }
+    })()
+      .catch(async (error) => {
+        this._emit("agent_tool:recovery:failed", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+        try {
+          await this.onError(error);
+        } catch {
+          // Background recovery must never make a started agent unreachable.
+        }
+      })
+      .finally(() => {
+        this._agentToolRunRecoveryPromise = undefined;
+      });
+
+    this._agentToolRunRecoveryPromise = recovery;
+    this.ctx.waitUntil(recovery);
+    return recovery;
+  }
+
+  private _agentToolRunRecoveryRunIds(): string[] {
+    return this.sql<{ run_id: string }>`
+      SELECT run_id
+      FROM cf_agent_tool_runs
+      WHERE status IN ('starting', 'running')
+      ORDER BY started_at ASC
+    `.map((row) => row.run_id);
+  }
+
+  private async _getAgentToolChunksForRecovery(
+    adapter: AgentToolChildAdapter,
+    runId: string,
+    timeoutMs?: number
+  ): Promise<AgentToolStoredChunk[] | undefined> {
+    const chunks = adapter.getAgentToolChunks(runId).catch(() => undefined);
+    if (timeoutMs === undefined || timeoutMs <= 0) return chunks;
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>((resolve) => {
+      timeoutId = setTimeout(() => resolve(undefined), timeoutMs);
+    });
+    const result = await Promise.race([chunks, timeout]);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    return result;
   }
 
   /**
@@ -7660,18 +10645,17 @@ export class Agent<
     // Composite key: class name + NUL + facet name, so two different
     // classes can share the same user-facing name.
     const facetKey = `${className}\0${name}`;
-    // Pass an explicit named `id` in FacetStartupOptions so the
-    // facet has its own `ctx.id.name === name` (not the parent's
-    // name). Without this, facets inherit the parent DO's `ctx.id`
-    // and `this.name` on the facet would silently return the
-    // parent's name. See:
-    // https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/
-    //
+
+    // Derive the child's ancestor chain: our own `parentPath` +
+    // `{ class: this.constructor.name, name: this.name }`. Inductive
+    // across recursive nesting.
+    const childParentPath = this.selfPath;
+    const childPath = [...childParentPath, { className, name }];
+
     // For nested facets, the immediate parent is itself facet-only
     // and is not expected to expose namespace helpers. Use the root
-    // supervisor namespace instead; the id is opaque for facet
-    // routing, but `idFromName(name)` gives PartyServer a stable
-    // `ctx.id.name`.
+    // supervisor namespace instead; path-v2 identities are scoped to
+    // the full logical path while legacy rows continue using bare names.
     const rootClassName =
       this._parentPath[0]?.className ??
       (this.constructor as { name: string }).name;
@@ -7697,16 +10681,26 @@ export class Agent<
         `Sub-agent bootstrap requires the root agent class "${rootClassName}" to be available as a Durable Object namespace, but ctx.exports["${rootClassName}"] is missing or doesn't expose idFromName.${minificationHint} Make sure the root agent class is exported under that class name and registered in your wrangler.jsonc durable_objects.bindings.`
       );
     }
-    const facetId = rootNs.idFromName(name);
+    const identity = await this._cf_subAgentIdentity(
+      className,
+      name,
+      childPath
+    );
+    const facetId = rootNs.idFromName(identity.name);
     const stub = ctx.facets.get(facetKey, () => ({
       class: Cls as DurableObjectClass,
       id: facetId
     }));
 
-    // Derive the child's ancestor chain: our own `parentPath` +
-    // `{ class: this.constructor.name, name: this.name }`. Inductive
-    // across recursive nesting.
-    const childParentPath = this.selfPath;
+    // Record before initialization so a successfully-initialized facet is
+    // not left without identity metadata if the parent is interrupted after
+    // the child RPC returns. Roll back only rows this call created.
+    //
+    // A facet may start a workflow from onStart(); workflow callbacks route
+    // through the parent registry and must be able to find this in-flight
+    // child, so recording before the init RPC is also what lets those
+    // callbacks resolve.
+    this._recordSubAgent(className, name, identity);
 
     // Initialize the child as a facet via a single RPC that runs
     // inside the child's isolate. Avoids the cross-DO I/O error that
@@ -7716,28 +10710,32 @@ export class Agent<
     // The parent may be inside a WebSocket/message request context here.
     // Clear native context handles before the child facet RPC so workerd
     // never sees parent-owned I/O attached to child initialization.
-    await agentContext.run(
-      {
-        agent: this,
-        connection: undefined,
-        request: undefined,
-        email: undefined
-      },
-      async () => {
-        await (
-          stub as unknown as {
-            _cf_initAsFacet(
-              name: string,
-              parentPath: ReadonlyArray<{ className: string; name: string }>
-            ): Promise<void>;
-          }
-        )._cf_initAsFacet(name, childParentPath);
+    try {
+      await runInInvocation(
+        {
+          agent: this,
+          connection: undefined,
+          request: undefined,
+          email: undefined
+        },
+        async () => {
+          await (
+            stub as unknown as {
+              _cf_initAsFacet(
+                name: string,
+                parentPath: ReadonlyArray<{ className: string; name: string }>,
+                identityName: string
+              ): Promise<void>;
+            }
+          )._cf_initAsFacet(name, childParentPath, identity.name);
+        }
+      );
+    } catch (error) {
+      if (!identity.existing) {
+        this._forgetSubAgent(className, name);
       }
-    );
-
-    // Record in the parent's sub-agent registry so `hasSubAgent` /
-    // `listSubAgents` reflect the spawn. Idempotent.
-    this._recordSubAgent(className, name);
+      throw error;
+    }
 
     return stub;
   }
@@ -7812,27 +10810,116 @@ export class Agent<
   /** @internal */
   private _subAgentRegistryReady = false;
 
+  private _addColumnIfNotExists(sql: string): void {
+    try {
+      this.ctx.storage.sql.exec(sql);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (!message.toLowerCase().includes("duplicate column")) {
+        throw e;
+      }
+    }
+  }
+
   /** @internal */
   private _ensureSubAgentRegistry(): void {
     if (this._subAgentRegistryReady) return;
+    // This registry is lazy because older agents may never create sub-agents.
+    // Keep its additive column migrations here instead of the global schema
+    // gate so first sub-agent access upgrades legacy registry tables in place.
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_sub_agents (
         class TEXT NOT NULL,
         name TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        identity_version TEXT,
+        identity_name TEXT,
         PRIMARY KEY (class, name)
       )
     `;
+    this._addColumnIfNotExists(
+      "ALTER TABLE cf_agents_sub_agents ADD COLUMN identity_version TEXT"
+    );
+    this._addColumnIfNotExists(
+      "ALTER TABLE cf_agents_sub_agents ADD COLUMN identity_name TEXT"
+    );
     this._subAgentRegistryReady = true;
   }
 
   /** @internal */
-  private _recordSubAgent(className: string, name: string): void {
+  private _recordSubAgent(
+    className: string,
+    name: string,
+    identity: { version: SubAgentIdentityVersion; name: string }
+  ): void {
     this._ensureSubAgentRegistry();
     this.sql`
-      INSERT OR IGNORE INTO cf_agents_sub_agents (class, name, created_at)
-      VALUES (${className}, ${name}, ${Date.now()})
+      INSERT OR IGNORE INTO cf_agents_sub_agents
+        (class, name, created_at, identity_version, identity_name)
+      VALUES
+        (${className}, ${name}, ${Date.now()}, ${identity.version}, ${identity.name})
     `;
+  }
+
+  /** @internal */
+  private _subAgentRegistryRow(
+    className: string,
+    name: string
+  ): {
+    identity_version: string | null;
+    identity_name: string | null;
+  } | null {
+    this._ensureSubAgentRegistry();
+    const rows = this.sql<{
+      identity_version: string | null;
+      identity_name: string | null;
+    }>`
+      SELECT identity_version, identity_name
+      FROM cf_agents_sub_agents
+      WHERE class = ${className} AND name = ${name}
+      LIMIT 1
+    `;
+    return rows[0] ?? null;
+  }
+
+  private async _cf_subAgentIdentity(
+    className: string,
+    name: string,
+    childPath: ReadonlyArray<AgentPathStep>
+  ): Promise<{
+    version: SubAgentIdentityVersion;
+    name: string;
+    existing: boolean;
+  }> {
+    const row = this._subAgentRegistryRow(className, name);
+    if (row) {
+      if (
+        row.identity_version === SUB_AGENT_IDENTITY_VERSION_PATH_V2 &&
+        typeof row.identity_name === "string"
+      ) {
+        return {
+          version: SUB_AGENT_IDENTITY_VERSION_PATH_V2,
+          name: row.identity_name,
+          existing: true
+        };
+      }
+      return {
+        version: SUB_AGENT_IDENTITY_VERSION_LEGACY,
+        name,
+        existing: true
+      };
+    }
+
+    // Do not probe the legacy bare-name facet here. `ctx.facets.get()` is
+    // create-on-access, so probing would create or wake legacy storage as a
+    // side effect and could reintroduce old id collisions. Existing registry
+    // rows remain the compatibility signal; new rows use path-v2.
+    const digest = await sha256Hex(JSON.stringify(childPath));
+    return {
+      version: SUB_AGENT_IDENTITY_VERSION_PATH_V2,
+      name: pathV2IdentityName(name, digest),
+      existing: false
+    };
   }
 
   /** @internal */
@@ -7939,6 +11026,15 @@ export class Agent<
       return;
     }
 
+    // Persist the teardown decision FIRST, so a destroy that gets cut short
+    // (e.g. the runtime cancelling a request-scoped `waitUntil` it was riding
+    // on, #1625) is finished by the next wake — see the `alarm()` preamble —
+    // instead of leaving a half-deleted agent whose tables get silently
+    // recreated by the constructor. The marker is removed by the
+    // `deleteAll()` below, which is also why it is a KV record rather than a
+    // SQL row: it must outlive `_dropInternalTablesForDestroy`.
+    await this.ctx.storage.put(DESTROY_PENDING_KEY, true);
+
     this._dropInternalTablesForDestroy();
 
     // delete all alarms
@@ -7957,6 +11053,60 @@ export class Agent<
     }, 0);
 
     this._emit("destroy");
+  }
+
+  /**
+   * @internal Defer this agent's destruction to its own alarm invocation
+   * instead of running it inline (#1625).
+   *
+   * `destroy()` is a multi-step I/O sequence (drop tables, delete alarm,
+   * delete all storage, dispose connections). Running it on the `waitUntil`
+   * of a request whose client has already disconnected — the MCP
+   * Streamable-HTTP session-DELETE path — gives it little to no
+   * post-invocation grace, so the runtime routinely cancels it mid-flight.
+   * This method instead performs two fast storage writes (a durable
+   * "condemned" marker and an immediate alarm) that the caller can await
+   * before responding; the alarm then fires as a fresh invocation with its
+   * own full execution budget and runs `destroy()` there. If even that
+   * invocation is interrupted, the marker survives and the next wake
+   * finishes teardown — see the `alarm()` preamble.
+   *
+   * Unlike `destroy()`, this method does not abort the isolate, so RPC
+   * callers don't need to swallow an abort error.
+   */
+  async _cf_scheduleDestroy(): Promise<void> {
+    // Hydrate facet state before deciding. `_isFacet` (and the `_parentPath`
+    // /`selfPath` the facet teardown path needs) is only populated by `onStart`
+    // /facet bootstrap, and `destroy()` below branches on the in-memory
+    // `_isFacet`. Without this, an RPC landing before init would see it as
+    // `false`, fall through to `destroy()`'s top-level path, and write the
+    // destroy marker on a facet — which the `alarm()`/`_scheduleNextAlarm()`
+    // guards forbid (only top-level agents write it; facet teardown is
+    // root-coordinated via `ctx.facets.delete`). Mirrors the other internal
+    // RPC entrypoints (`_workflow_*`). We must NOT push this into `destroy()`
+    // itself: the `alarm()` preamble calls `destroy()` precisely to avoid
+    // running `onStart` on a condemned agent.
+    await this.__unsafe_ensureInitialized();
+    if (this._isFacet) {
+      // Facet teardown is coordinated by the root (`ctx.facets.delete` wipes
+      // the facet's storage in one step), so there is nothing to defer.
+      await this.destroy();
+      return;
+    }
+    await this.ctx.storage.put(DESTROY_PENDING_KEY, true);
+    // Future, not immediate: see DESTROY_ALARM_DELAY_MS — an immediate alarm
+    // aborts the isolate fast enough to race this RPC's response back to the
+    // DELETE handler, turning the intended 204 into a 500.
+    await this.ctx.storage.setAlarm(Date.now() + DESTROY_ALARM_DELAY_MS);
+  }
+
+  /**
+   * Whether a (deferred or interrupted) destroy is pending. Reads the
+   * durable marker directly — the in-memory `_isFacet` flag may not be
+   * hydrated yet at the call sites, but facets never write the marker.
+   */
+  private async _hasPendingDestroy(): Promise<boolean> {
+    return (await this.ctx.storage.get<boolean>(DESTROY_PENDING_KEY)) === true;
   }
 
   /** @internal Drop every internal Agents SDK table during top-level destroy. */
@@ -8025,10 +11175,29 @@ export class Agent<
    * Start a workflow and track it in this Agent's database.
    * Automatically injects agent identity into the workflow params.
    *
+   * The originating Agent identity is persisted in the workflow params so
+   * callbacks (`this.agent` RPC, progress/completion/error, state updates)
+   * route back to the exact Agent or sub-agent facet that started the run.
+   * Note the following constraints:
+   *
+   * - **Resolution is by name.** Callbacks re-resolve the originating Agent via
+   *   `getAgentByName(...)`. Agents addressed by a raw Durable Object id
+   *   (`idFromString`/`get(id)`) rather than by name will not receive
+   *   callbacks on the same instance.
+   * - **Sub-agent runs are facet-local.** A workflow started from a sub-agent
+   *   is tracked in that facet's own storage; the parent's `getWorkflows()` /
+   *   `getWorkflowById()` do not see it. Aggregate across facets yourself if
+   *   you need a combined view.
+   * - **Class names must survive bundling.** The originating path is keyed by
+   *   `constructor.name`. Ensure your bundler preserves class names
+   *   (e.g. esbuild `keepNames: true`) so callbacks can be routed.
+   *
    * @template P - Type of params to pass to the workflow
    * @param workflowName - Name of the workflow binding in env (e.g., 'MY_WORKFLOW')
    * @param params - Params to pass to the workflow
-   * @param options - Optional workflow options
+   * @param options - Optional workflow options. For sub-agents, pass
+   *   `agentBinding` as the **root** Agent's Durable Object binding name, not a
+   *   child binding.
    * @returns The workflow instance ID
    *
    * @example
@@ -8052,25 +11221,29 @@ export class Agent<
       );
     }
 
-    // Find the binding name for this Agent's namespace
-    const agentBindingName =
-      options?.agentBinding ?? this._findAgentBindingName();
-    if (!agentBindingName) {
+    // Find the binding name for the top-level Agent namespace. Facets
+    // are resolved later from this root binding plus their selfPath.
+    const agentOrigin = this._workflowOrigin(options);
+    if (!agentOrigin) {
       throw new Error(
         "Could not detect Agent binding name from class name. " +
           "Pass it explicitly via options.agentBinding"
       );
     }
 
-    // Generate workflow ID if not provided
-    const workflowId = options?.id ?? nanoid();
+    // Workflows instance IDs must start with [a-zA-Z0-9_].
+    const workflowId = options?.id ?? `wf_${nanoid()}`;
 
     // Inject agent identity and workflow name into params
     const augmentedParams = {
       ...params,
       __agentName: this.name,
-      __agentBinding: agentBindingName,
-      __workflowName: workflowName
+      __agentBinding:
+        agentOrigin.kind === "agent"
+          ? agentOrigin.binding
+          : agentOrigin.rootBinding,
+      __workflowName: workflowName,
+      __agentOrigin: agentOrigin
     };
 
     // Create the workflow instance
@@ -8850,12 +12023,39 @@ export class Agent<
     };
   }
 
-  /**
-   * Find the binding name for this Agent's namespace by matching class name.
-   * Returns undefined if no match found - use options.agentBinding as fallback.
-   */
-  private _findAgentBindingName(): string | undefined {
-    const className = this._ParentClass.name;
+  private _workflowOrigin(
+    options: RunWorkflowOptions | undefined
+  ): AgentWorkflowOrigin | undefined {
+    if (this._isFacet) {
+      const root = this._parentPath[0];
+      const rootBindingName =
+        options?.agentBinding ??
+        (root ? this._findAgentBindingNameForClass(root.className) : undefined);
+
+      if (!rootBindingName) return undefined;
+
+      return {
+        kind: "facet",
+        version: 1,
+        rootBinding: rootBindingName,
+        path: this.selfPath.map((step) => ({ ...step }))
+      };
+    }
+
+    const agentBindingName =
+      options?.agentBinding ??
+      this._findAgentBindingNameForClass(this._ParentClass.name);
+    if (!agentBindingName) return undefined;
+
+    return {
+      kind: "agent",
+      version: 1,
+      binding: agentBindingName,
+      name: this.name
+    };
+  }
+
+  private _findAgentBindingNameForClass(className: string): string | undefined {
     for (const [key, value] of Object.entries(
       this.env as Record<string, unknown>
     )) {
@@ -8942,7 +12142,9 @@ export class Agent<
 
   /**
    * Handle a callback from a workflow.
-   * Called when the Agent receives a callback at /_workflow/callback.
+   * Invoked via the internal `_workflow_handleCallback` RPC whenever an
+   * {@link AgentWorkflow} reports progress, completion, an error, or a custom
+   * event back to its originating Agent (or sub-agent facet).
    * Override this to handle all callback types in one place.
    *
    * @param callback - The callback payload
@@ -9157,10 +12359,7 @@ export class Agent<
     url: string,
     callbackHostOrOptions?: string | AddMcpServerOptions,
     agentsPrefix?: string,
-    options?: {
-      client?: ConstructorParameters<typeof Client>[1];
-      transport?: { headers?: HeadersInit; type?: TransportType };
-    }
+    options?: Pick<AddMcpServerOptions, "client" | "transport">
   ): Promise<
     | {
         id: string;
@@ -9178,13 +12377,7 @@ export class Agent<
       | AddMcpServerOptions
       | AddRpcMcpServerOptions,
     agentsPrefix?: string,
-    options?: {
-      client?: ConstructorParameters<typeof Client>[1];
-      transport?: {
-        headers?: HeadersInit;
-        type?: TransportType;
-      };
-    }
+    options?: Pick<AddMcpServerOptions, "client" | "transport">
   ): Promise<
     | {
         id: string;
@@ -9201,24 +12394,116 @@ export class Agent<
     const normalizedUrl = isHttpTransport
       ? new URL(urlOrBinding).href
       : undefined;
-    const existingServer = this.mcp
-      .listServers()
-      .find(
-        (s) =>
-          s.name === serverName &&
-          (!isHttpTransport || new URL(s.server_url).href === normalizedUrl)
-      );
+
+    // Extract and normalize a caller-supplied stable id, if any. The same
+    // option field is accepted on both the HTTP and RPC option shapes.
+    let requestedId: string | undefined;
+    if (
+      typeof callbackHostOrOptions === "object" &&
+      callbackHostOrOptions !== null &&
+      typeof (callbackHostOrOptions as { id?: unknown }).id === "string"
+    ) {
+      const rawId = (callbackHostOrOptions as { id: string }).id;
+      requestedId = normalizeServerId(rawId);
+    }
+
+    const allServers = this.mcp.listServers();
+
+    const existingServer = allServers.find(
+      (s) =>
+        s.name === serverName &&
+        (!isHttpTransport || new URL(s.server_url).href === normalizedUrl)
+    );
+
+    if (requestedId) {
+      // Collision check 1: a caller-supplied id may only re-resolve to an
+      // existing server when the (name, url) also matches. Otherwise storage
+      // (INSERT OR REPLACE on id) would silently overwrite the existing row.
+      const idConflict = allServers.find((s) => {
+        if (s.id !== requestedId) return false;
+        if (s.name !== serverName) return true;
+        if (isHttpTransport) {
+          return new URL(s.server_url).href !== normalizedUrl;
+        }
+        return false;
+      });
+      if (idConflict) {
+        throw new Error(
+          `MCP server id "${requestedId}" is already in use by server "${idConflict.name}" (${idConflict.server_url}). ` +
+            `Stable ids must be unique per (name, url).`
+        );
+      }
+
+      // JIT-migrate: the same (name, url) is already registered under a
+      // different id (typically an auto-generated nanoid from a previous
+      // call that didn't supply `id`). This is the natural upgrade path —
+      // a user adds `{ id: "github" }` to an existing `addMcpServer` call.
+      // Rename the existing row + connection + OAuth keys to the new id in
+      // place so the caller's contract ("the id I get back is the id I
+      // asked for") holds and no stale storage rows are left behind.
+      if (existingServer && existingServer.id !== requestedId) {
+        await this.mcp.migrateServerId(
+          existingServer.id,
+          requestedId,
+          this.name
+        );
+        existingServer.id = requestedId;
+      }
+    }
+
     if (existingServer && this.mcp.mcpConnections[existingServer.id]) {
       const conn = this.mcp.mcpConnections[existingServer.id];
-      if (
-        conn.connectionState === MCPConnectionState.AUTHENTICATING &&
-        conn.options.transport.authProvider?.authUrl
-      ) {
-        return {
-          id: existingServer.id,
-          state: MCPConnectionState.AUTHENTICATING,
-          authUrl: conn.options.transport.authProvider.authUrl
-        };
+      if (conn.connectionState === MCPConnectionState.AUTHENTICATING) {
+        const authProvider = conn.options.transport.authProvider;
+        const authUrl =
+          (await this._redeemableAuthUrl(
+            existingServer.id,
+            authProvider?.authUrl,
+            authProvider
+          )) ??
+          (await this._redeemableAuthUrl(
+            existingServer.id,
+            existingServer.auth_url,
+            authProvider
+          ));
+        if (authUrl) {
+          return {
+            id: existingServer.id,
+            state: MCPConnectionState.AUTHENTICATING,
+            authUrl
+          };
+        }
+
+        const reconnectResult = await this.mcp.connectToServer(
+          existingServer.id
+        );
+        if (reconnectResult.state === MCPConnectionState.AUTHENTICATING) {
+          if (!reconnectResult.authUrl) {
+            throw new Error("OAuth configuration incomplete: missing authUrl");
+          }
+          return {
+            id: existingServer.id,
+            state: reconnectResult.state,
+            authUrl: reconnectResult.authUrl
+          };
+        }
+        if (reconnectResult.state === MCPConnectionState.CONNECTED) {
+          const discoverResult = await this.mcp.discoverIfConnected(
+            existingServer.id
+          );
+          if (!discoverResult?.success) {
+            throw new Error(
+              `Failed to discover MCP server capabilities: ${discoverResult?.error ?? "connection not found"}`
+            );
+          }
+          return {
+            id: existingServer.id,
+            state: MCPConnectionState.READY
+          };
+        }
+        throw new Error(
+          `Failed to connect to MCP server at ${normalizedUrl}: ${reconnectResult.error}`
+        );
       }
       if (conn.connectionState === MCPConnectionState.FAILED) {
         throw new Error(
@@ -9236,7 +12521,9 @@ export class Agent<
 
       const normalizedName = serverName.toLowerCase().replace(/\s+/g, "-");
 
-      const reconnectId = existingServer?.id;
+      // Prefer the caller-supplied stable id, falling back to the existing
+      // server's id (for restore-through-addMcpServer), then to a generated id.
+      const reconnectId = requestedId ?? existingServer?.id;
       const { id } = await this.mcp.connect(
         `${RPC_DO_PREFIX}${normalizedName}`,
         {
@@ -9290,14 +12577,7 @@ export class Agent<
     let resolvedCallbackHost: string | undefined;
     let resolvedAgentsPrefix: string;
     let resolvedOptions:
-      | {
-          client?: ConstructorParameters<typeof Client>[1];
-          transport?: {
-            headers?: HeadersInit;
-            type?: TransportType;
-          };
-          retry?: RetryOptions;
-        }
+      | Pick<AddMcpServerOptions, "client" | "transport" | "retry">
       | undefined;
 
     let resolvedCallbackPath: string | undefined;
@@ -9351,7 +12631,7 @@ export class Agent<
         : `${normalizedHost}/${resolvedAgentsPrefix}/${camelCaseToKebabCase(this._ParentClass.name)}/${this.name}/callback`;
     }
 
-    const id = nanoid(8);
+    const id = requestedId ?? existingServer?.id ?? nanoid(8);
 
     // Only create authProvider if we have a callbackUrl (needed for OAuth servers)
     let authProvider:
@@ -9393,7 +12673,9 @@ export class Agent<
       transport: {
         ...headerTransportOpts,
         authProvider,
-        type: transportType
+        type: transportType,
+        skipIssuerMetadataValidation:
+          resolvedOptions?.transport?.skipIssuerMetadataValidation
       },
       retry: resolvedOptions?.retry
     });
@@ -9428,6 +12710,35 @@ export class Agent<
     }
 
     return { id, state: MCPConnectionState.READY };
+  }
+
+  private async _redeemableAuthUrl(
+    serverId: string,
+    authUrl: string | null | undefined,
+    authProvider: AgentMcpOAuthProvider | undefined
+  ): Promise<string | undefined> {
+    if (!this._isAbsoluteHttpUrl(authUrl) || !authProvider) return;
+    const state = new URL(authUrl).searchParams.get("state");
+    if (!state) return authUrl;
+
+    authProvider.serverId = serverId;
+    try {
+      return (await authProvider.checkState(state)).valid ? authUrl : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private _isAbsoluteHttpUrl(
+    value: string | null | undefined
+  ): value is string {
+    if (!value) return false;
+    try {
+      const url = new URL(value);
+      return url.protocol === "http:" || url.protocol === "https:";
+    } catch {
+      return false;
+    }
   }
 
   async removeMcpServer(id: string) {
@@ -9874,8 +13185,7 @@ export class StreamingResponse {
       success: true,
       type: MessageType.RPC
     };
-    this._connection.send(JSON.stringify(response));
-    return true;
+    return sendRpcResponseIfOpen(this._connection, response);
   }
 
   /**
@@ -9895,8 +13205,7 @@ export class StreamingResponse {
       success: true,
       type: MessageType.RPC
     };
-    this._connection.send(JSON.stringify(response));
-    return true;
+    return sendRpcResponseIfOpen(this._connection, response);
   }
 
   /**
@@ -9915,7 +13224,6 @@ export class StreamingResponse {
       success: false,
       type: MessageType.RPC
     };
-    this._connection.send(JSON.stringify(response));
-    return true;
+    return sendRpcResponseIfOpen(this._connection, response);
   }
 }

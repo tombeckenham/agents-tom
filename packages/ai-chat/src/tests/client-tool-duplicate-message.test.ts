@@ -286,6 +286,168 @@ describe("Client-side tool duplicate message prevention", () => {
     ws.close(1000);
   });
 
+  it("waits for ALL parallel client-tool results before continuing (#1649)", async () => {
+    const room = crypto.randomUUID();
+    const res = await exports.default.fetch(
+      `http://example.com/agents/test-chat-agent/${room}`,
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(res.status).toBe(101);
+    const ws = res.webSocket as WebSocket;
+    ws.accept();
+
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // Assistant turn that emitted TWO parallel client tool calls.
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Use two tools" }]
+      },
+      {
+        id: "assistant-parallel",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-testTool",
+            toolCallId: "call_fast",
+            state: "input-available",
+            input: { which: "fast" }
+          },
+          {
+            type: "tool-testTool",
+            toolCallId: "call_slow",
+            state: "input-available",
+            input: { which: "slow" }
+          }
+        ] as ChatMessage["parts"]
+      }
+    ]);
+
+    // Fast result arrives first, with autoContinue. The slow sibling is still
+    // in flight, so NO continuation may run yet.
+    ws.send(
+      JSON.stringify({
+        type: "cf_agent_tool_result",
+        toolCallId: "call_fast",
+        toolName: "testTool",
+        output: { which: "fast" },
+        autoContinue: true
+      })
+    );
+
+    // Well past the coalesce window (and the no-active-stream settle delay).
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    // The batch is incomplete — the continuation (onChatMessage) must not have
+    // run.
+    expect(await agentStub.getChatMessageCallCountForTest()).toBe(0);
+
+    // Slow result completes the batch and triggers exactly one continuation.
+    ws.send(
+      JSON.stringify({
+        type: "cf_agent_tool_result",
+        toolCallId: "call_slow",
+        toolName: "testTool",
+        output: { which: "slow" },
+        autoContinue: true
+      })
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await agentStub.waitForIdleForTest();
+
+    expect(await agentStub.getChatMessageCallCountForTest()).toBe(1);
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const assistant = messages.find((m) => m.id === "assistant-parallel")!;
+    const partFor = (toolCallId: string) =>
+      assistant.parts.find(
+        (p) => "toolCallId" in p && p.toolCallId === toolCallId
+      ) as { state: string; output?: unknown };
+    expect(partFor("call_fast").state).toBe("output-available");
+    expect(partFor("call_fast").output).toEqual({ which: "fast" });
+    expect(partFor("call_slow").state).toBe("output-available");
+    expect(partFor("call_slow").output).toEqual({ which: "slow" });
+
+    ws.close(1000);
+  });
+
+  it("holds the barrier when a settled dynamic-tool sits beside a pending tool (#1649)", async () => {
+    const room = crypto.randomUUID();
+    const res = await exports.default.fetch(
+      `http://example.com/agents/test-chat-agent/${room}`,
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(res.status).toBe(101);
+    const ws = res.webSocket as WebSocket;
+    ws.accept();
+
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // Parallel batch mixing a `dynamic-tool` part with a regular tool part.
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Use a dynamic tool and a regular tool" }]
+      },
+      {
+        id: "assistant-dynamic",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "dynAction",
+            toolCallId: "call_dyn",
+            state: "input-available",
+            input: { which: "dyn" }
+          },
+          {
+            type: "tool-testTool",
+            toolCallId: "call_reg",
+            state: "input-available",
+            input: { which: "reg" }
+          }
+        ] as ChatMessage["parts"]
+      }
+    ]);
+
+    // Resolve the dynamic tool first (autoContinue). The regular tool is still
+    // pending → the continuation must NOT run yet.
+    ws.send(
+      JSON.stringify({
+        type: "cf_agent_tool_result",
+        toolCallId: "call_dyn",
+        toolName: "dynAction",
+        output: { which: "dyn" },
+        autoContinue: true
+      })
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    expect(await agentStub.getChatMessageCallCountForTest()).toBe(0);
+
+    // Resolve the regular tool: batch complete → exactly one continuation.
+    ws.send(
+      JSON.stringify({
+        type: "cf_agent_tool_result",
+        toolCallId: "call_reg",
+        toolName: "testTool",
+        output: { which: "reg" },
+        autoContinue: true
+      })
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await agentStub.waitForIdleForTest();
+
+    expect(await agentStub.getChatMessageCallCountForTest()).toBe(1);
+
+    ws.close(1000);
+  });
+
   it("preserves earlier assistant parts across chained continuation approvals (#1160)", async () => {
     const room = crypto.randomUUID();
     const res = await exports.default.fetch(
@@ -792,7 +954,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ approved: true });
+    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
 
     ws.close(1000);
   });
@@ -853,7 +1015,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("output-denied");
-    expect(toolPart.approval).toEqual({ approved: false });
+    expect(toolPart.approval).toEqual({ id: toolCallId, approved: false });
 
     ws.close(1000);
   });
@@ -1154,7 +1316,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ approved: true });
+    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
     expect(assistantMsg.parts.length).toBe(1);
 
     ws.close(1000);
@@ -1222,7 +1384,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ approved: true });
+    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
 
     // Continuation parts should be appended (TestChatAgent returns text response)
     expect(assistantMsg.parts.length).toBeGreaterThan(1);
@@ -1285,7 +1447,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("output-denied");
-    expect(toolPart.approval).toEqual({ approved: false });
+    expect(toolPart.approval).toEqual({ id: toolCallId, approved: false });
 
     // Continuation parts should be appended (LLM sees denial and responds)
     expect(assistantMsg.parts.length).toBeGreaterThan(1);
@@ -1400,6 +1562,57 @@ describe("applyChunkToParts: tool-approval-request", () => {
     expect(handled).toBe(true);
     expect(parts.length).toBe(0);
   });
+
+  it("does not regress an approval-responded (approved) part to approval-requested", () => {
+    // A continuation can replay the prior tool round-trip and re-emit
+    // tool-approval-request. That must not discard a decision the user already
+    // made (approval-responded) by flipping it back to approval-requested.
+    const parts: MessageParts = [
+      {
+        type: "tool-calculate",
+        toolCallId: "call_123",
+        toolName: "calculate",
+        state: "approval-responded",
+        input: { a: 5000, b: 3, operator: "*" },
+        approval: { id: "approval-abc", approved: true }
+      } as MessageParts[number]
+    ];
+
+    const handled = applyChunkToParts(parts, {
+      type: "tool-approval-request",
+      approvalId: "approval-abc",
+      toolCallId: "call_123"
+    } as StreamChunkData);
+
+    expect(handled).toBe(true);
+    const part = parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("approval-responded");
+    expect(part.approval).toEqual({ id: "approval-abc", approved: true });
+  });
+
+  it("does not regress a terminal output-available part to approval-requested", () => {
+    const parts: MessageParts = [
+      {
+        type: "tool-calculate",
+        toolCallId: "call_terminal",
+        toolName: "calculate",
+        state: "output-available",
+        input: { a: 2, b: 2, operator: "+" },
+        output: { result: 4 }
+      } as MessageParts[number]
+    ];
+
+    const handled = applyChunkToParts(parts, {
+      type: "tool-approval-request",
+      approvalId: "approval-late",
+      toolCallId: "call_terminal"
+    } as StreamChunkData);
+
+    expect(handled).toBe(true);
+    const part = parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("output-available");
+    expect(part.output).toEqual({ result: 4 });
+  });
 });
 
 describe("applyChunkToParts: tool-output-denied", () => {
@@ -1426,6 +1639,55 @@ describe("applyChunkToParts: tool-output-denied", () => {
     // Input and approval should be preserved
     expect(part.input).toEqual({ a: 5000, b: 3, operator: "*" });
     expect(part.approval).toEqual({ id: "approval-xyz" });
+  });
+
+  it("does not regress an approval-responded (approved) part to output-denied", () => {
+    // A continuation that re-validates the transcript can emit
+    // tool-output-denied for an approval the SDK deems unneeded. A granted
+    // approval (approval-responded) must not be silently flipped to a denial.
+    const parts: MessageParts = [
+      {
+        type: "tool-calculate",
+        toolCallId: "call_789",
+        toolName: "calculate",
+        state: "approval-responded",
+        input: { a: 5000, b: 3, operator: "*" },
+        approval: { id: "approval-xyz", approved: true }
+      } as MessageParts[number]
+    ];
+
+    const handled = applyChunkToParts(parts, {
+      type: "tool-output-denied",
+      toolCallId: "call_789"
+    } as StreamChunkData);
+
+    expect(handled).toBe(true);
+    const part = parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("approval-responded");
+    expect(part.approval).toEqual({ id: "approval-xyz", approved: true });
+  });
+
+  it("does not regress a terminal output-available part to output-denied", () => {
+    const parts: MessageParts = [
+      {
+        type: "tool-calculate",
+        toolCallId: "call_terminal",
+        toolName: "calculate",
+        state: "output-available",
+        input: { a: 2, b: 2, operator: "+" },
+        output: { result: 4 }
+      } as MessageParts[number]
+    ];
+
+    const handled = applyChunkToParts(parts, {
+      type: "tool-output-denied",
+      toolCallId: "call_terminal"
+    } as StreamChunkData);
+
+    expect(handled).toBe(true);
+    const part = parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("output-available");
+    expect(part.output).toEqual({ result: 4 });
   });
 });
 

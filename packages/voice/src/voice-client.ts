@@ -81,7 +81,23 @@ export interface VoiceClientOptions {
   interruptChunks?: number;
   /** Maximum transcript messages to keep in memory. @default 200 */
   maxTranscriptMessages?: number;
+
+  /**
+   * Preferred audio output device for assistant playback.
+   * Pass a MediaDeviceInfo.deviceId from an audiooutput device.
+   * Unsupported browsers continue playing through the default output.
+   * @default "default"
+   */
+  outputDeviceId?: string;
 }
+
+type AudioElementWithSinkId = HTMLAudioElement & {
+  setSinkId?: (sinkId: string) => Promise<void>;
+};
+
+const UNSUPPORTED_OUTPUT_DEVICE_ERROR =
+  "Audio output device selection is not supported in this browser.";
+const OUTPUT_DEVICE_SWITCH_ERROR = "Could not switch audio output device.";
 
 /** Maps each event name to the data type passed to its listeners. */
 export interface VoiceClientEventMap {
@@ -92,6 +108,7 @@ export interface VoiceClientEventMap {
   audiolevelchange: number;
   connectionchange: boolean;
   error: string | null;
+  outputdeviceerror: string | null;
   mutechange: boolean;
   custommessage: unknown;
 }
@@ -249,11 +266,16 @@ export class VoiceClient {
   #isMuted = false;
   #connected = false;
   #error: string | null = null;
+  #outputDeviceError: string | null = null;
   #lastCustomMessage: unknown = null;
   #audioFormat: VoiceAudioFormat | null = null;
+  /** Sample rate for raw pcm16 payloads; set from server `audio_config`. */
+  #sampleRate = 16000;
   #interimTranscript: string | null = null;
   #serverProtocolVersion: number | null = null;
   #inCall = false;
+  #callGeneration = 0;
+  #serverCallAcknowledged = false;
 
   // Options (with defaults applied)
   #silenceThreshold: number;
@@ -275,7 +297,20 @@ export class VoiceClient {
   #isSpeaking = false;
   #playbackQueue: ArrayBuffer[] = [];
   #isPlaying = false;
-  #activeSource: AudioBufferSourceNode | null = null;
+  #isScheduling = false;
+  #scheduledSources = new Set<AudioBufferSourceNode>();
+  #playbackCursor = 0;
+  // End time (on the AudioContext clock) of the most recently scheduled chunk.
+  // Used to detect when the playback bridge has been idle across the gap
+  // between turns so it can be rebuilt (see #playAudio).
+  #lastPlaybackEnd: number | null = null;
+  #playbackElement: HTMLAudioElement | null = null;
+  #playbackDestination: MediaStreamAudioDestinationNode | null = null;
+  #playbackDestinationPromise: Promise<AudioNode> | null = null;
+  #useDefaultPlaybackDestination = false;
+  #outputDeviceId: string;
+  #outputDeviceSwitchGeneration = 0;
+  #playbackOutputGeneration = 0;
   #playbackGeneration = 0;
   #interruptChunkCount = 0;
 
@@ -289,6 +324,7 @@ export class VoiceClient {
     this.#interruptThreshold = options.interruptThreshold ?? 0.05;
     this.#interruptChunks = options.interruptChunks ?? 2;
     this.#maxTranscriptMessages = options.maxTranscriptMessages ?? 200;
+    this.#outputDeviceId = options.outputDeviceId ?? "default";
   }
 
   // --- Public getters ---
@@ -319,6 +355,10 @@ export class VoiceClient {
 
   get error(): string | null {
     return this.#error;
+  }
+
+  get outputDeviceError(): string | null {
+    return this.#outputDeviceError;
   }
 
   /**
@@ -377,6 +417,12 @@ export class VoiceClient {
     }
   }
 
+  #setOutputDeviceError(error: string | null): void {
+    if (this.#outputDeviceError === error) return;
+    this.#outputDeviceError = error;
+    this.#emit("outputdeviceerror", error);
+  }
+
   // --- Connection ---
 
   connect(): void {
@@ -407,6 +453,7 @@ export class VoiceClient {
       // still running (not stopped on disconnect), so audio resumes
       // flowing as soon as the server processes start_call.
       if (this.#inCall) {
+        this.#serverCallAcknowledged = false;
         transport.sendJSON({ type: "start_call" });
       }
     };
@@ -455,7 +502,11 @@ export class VoiceClient {
       this.#emit("error", this.#error);
       return;
     }
+    if (this.#inCall) return;
+
+    const callGeneration = ++this.#callGeneration;
     this.#inCall = true;
+    this.#serverCallAcknowledged = false;
     this.#error = null;
     this.#metrics = null;
     this.#emit("error", null);
@@ -465,6 +516,10 @@ export class VoiceClient {
       startMsg.preferred_format = this.#options.preferredFormat;
     }
     this.#transport.sendJSON(startMsg);
+    const ctx = await this.#getAudioContext();
+    if (this.#abortStaleCallStartup(callGeneration)) return;
+    await this.#getPlaybackDestination(ctx);
+    if (this.#abortStaleCallStartup(callGeneration)) return;
     if (this.#options.audioInput) {
       this.#options.audioInput.onAudioLevel = (rms) =>
         this.#processAudioLevel(rms);
@@ -477,13 +532,32 @@ export class VoiceClient {
     } else {
       await this.#startMic();
     }
+    this.#abortStaleCallStartup(callGeneration);
   }
 
   endCall(): void {
+    this.#callGeneration++;
     this.#inCall = false;
+    this.#serverCallAcknowledged = false;
     if (this.#transport?.connected) {
       this.#transport.sendJSON({ type: "end_call" });
     }
+    this.#stopLocalCall();
+    this.#status = "idle";
+    this.#emit("statuschange", "idle");
+  }
+
+  #isCurrentCallStartup(callGeneration: number): boolean {
+    return this.#inCall && this.#callGeneration === callGeneration;
+  }
+
+  #abortStaleCallStartup(callGeneration: number): boolean {
+    if (this.#isCurrentCallStartup(callGeneration)) return false;
+    if (!this.#inCall) this.#stopLocalCall();
+    return true;
+  }
+
+  #stopLocalCall(): void {
     if (this.#options.audioInput) {
       this.#options.audioInput.stop();
       this.#options.audioInput.onAudioLevel = null;
@@ -494,8 +568,6 @@ export class VoiceClient {
     this.#stopPlayback();
     this.#closeAudioContext();
     this.#resetDetection();
-    this.#status = "idle";
-    this.#emit("statuschange", "idle");
   }
 
   toggleMute(): void {
@@ -547,6 +619,18 @@ export class VoiceClient {
   }
 
   /**
+   * Set the preferred audio output device for assistant playback.
+   * Unsupported browsers continue playing through the default output.
+   */
+  async setOutputDevice(outputDeviceId?: string): Promise<void> {
+    this.#outputDeviceId = outputDeviceId ?? "default";
+    const generation = ++this.#outputDeviceSwitchGeneration;
+    if (this.#playbackElement) {
+      await this.#applyOutputDevice(this.#playbackElement, generation);
+    }
+  }
+
+  /**
    * The last custom (non-voice-protocol) message received from the server.
    * Listen for the `"custommessage"` event to be notified when this changes.
    */
@@ -560,6 +644,14 @@ export class VoiceClient {
    */
   get audioFormat(): VoiceAudioFormat | null {
     return this.#audioFormat;
+  }
+
+  /**
+   * The sample rate (Hz) the server declared for raw pcm16 payloads.
+   * Set when the server sends `audio_config` at call start. Defaults to 16000.
+   */
+  get sampleRate(): number {
+    return this.#sampleRate;
   }
 
   // --- Voice protocol handler ---
@@ -583,13 +675,33 @@ export class VoiceClient {
         }
         break;
       case "audio_config":
+        this.#serverCallAcknowledged = true;
         this.#audioFormat = msg.format as VoiceAudioFormat;
+        this.#sampleRate =
+          typeof msg.sampleRate === "number" && msg.sampleRate > 0
+            ? msg.sampleRate
+            : 16000;
         break;
       case "status":
         this.#status = msg.status as VoiceStatus;
-        if (msg.status === "listening" || msg.status === "idle") {
+        if (msg.status === "idle" && this.#inCall) {
+          const shouldEndLocalCall =
+            this.#serverCallAcknowledged || this.#error !== null;
+          if (!shouldEndLocalCall) {
+            this.#emit("statuschange", this.#status);
+            break;
+          }
+          this.#callGeneration++;
+          this.#inCall = false;
+          this.#serverCallAcknowledged = false;
+          this.#stopLocalCall();
+        }
+        if (msg.status === "listening") {
+          this.#serverCallAcknowledged = true;
           this.#error = null;
           this.#emit("error", null);
+        } else if (msg.status === "thinking" || msg.status === "speaking") {
+          this.#serverCallAcknowledged = true;
         }
         this.#emit("statuschange", this.#status);
         break;
@@ -695,10 +807,141 @@ export class VoiceClient {
   /** Close the AudioContext and release resources. */
   #closeAudioContext(): void {
     if (this.#audioContext) {
+      this.#closePlaybackOutput();
       this.#audioContext.close().catch(() => {});
       this.#audioContext = null;
       this.#workletRegistered = false;
     }
+  }
+
+  async #getPlaybackDestination(ctx: AudioContext): Promise<AudioNode> {
+    if (this.#playbackDestinationPromise) {
+      return this.#playbackDestinationPromise;
+    }
+    if (this.#playbackDestination) return this.#playbackDestination;
+    if (this.#useDefaultPlaybackDestination) return ctx.destination;
+
+    const outputGeneration = this.#playbackOutputGeneration;
+    const promise = this.#initializePlaybackDestination(ctx, outputGeneration);
+    this.#playbackDestinationPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.#playbackDestinationPromise === promise) {
+        this.#playbackDestinationPromise = null;
+      }
+    }
+  }
+
+  async #initializePlaybackDestination(
+    ctx: AudioContext,
+    outputGeneration: number
+  ): Promise<AudioNode> {
+    try {
+      const destination = ctx.createMediaStreamDestination();
+      const audio = new Audio();
+      audio.autoplay = true;
+      audio.srcObject = destination.stream;
+      this.#playbackElement = audio;
+      this.#playbackDestination = destination;
+      await this.#applyOutputDevice(audio, this.#outputDeviceSwitchGeneration);
+      if (!this.#isCurrentPlaybackOutput(audio, outputGeneration)) {
+        this.#releasePlaybackElement(audio);
+        return ctx.destination;
+      }
+      await audio.play();
+      if (!this.#isCurrentPlaybackOutput(audio, outputGeneration)) {
+        this.#releasePlaybackElement(audio);
+        return ctx.destination;
+      }
+      return destination;
+    } catch (err) {
+      console.warn(
+        "[VoiceClient] HTMLAudioElement playback output unavailable; using default AudioContext destination.",
+        err
+      );
+      this.#closePlaybackOutput();
+      this.#useDefaultPlaybackDestination = true;
+      return ctx.destination;
+    }
+  }
+
+  #isCurrentPlaybackOutput(
+    audio: HTMLAudioElement,
+    outputGeneration: number
+  ): boolean {
+    return (
+      this.#playbackElement === audio &&
+      this.#playbackOutputGeneration === outputGeneration
+    );
+  }
+
+  async #applyOutputDevice(
+    audio: HTMLAudioElement,
+    generation: number
+  ): Promise<void> {
+    const sinkId = this.#outputDeviceId;
+    const setSinkId = (audio as AudioElementWithSinkId).setSinkId;
+    if (!setSinkId) {
+      if (sinkId === "default") {
+        this.#setOutputDeviceError(null);
+        return;
+      }
+      this.#setOutputDeviceError(UNSUPPORTED_OUTPUT_DEVICE_ERROR);
+      return;
+    }
+
+    try {
+      await setSinkId.call(audio, sinkId);
+      if (
+        generation !== this.#outputDeviceSwitchGeneration ||
+        sinkId !== this.#outputDeviceId
+      ) {
+        if (this.#playbackElement === audio) {
+          await this.#applyOutputDevice(
+            audio,
+            this.#outputDeviceSwitchGeneration
+          );
+        }
+        return;
+      }
+      if (
+        this.#outputDeviceError === UNSUPPORTED_OUTPUT_DEVICE_ERROR ||
+        this.#outputDeviceError === OUTPUT_DEVICE_SWITCH_ERROR
+      ) {
+        this.#setOutputDeviceError(null);
+      }
+    } catch {
+      if (
+        generation !== this.#outputDeviceSwitchGeneration ||
+        sinkId !== this.#outputDeviceId
+      ) {
+        if (this.#playbackElement === audio) {
+          await this.#applyOutputDevice(
+            audio,
+            this.#outputDeviceSwitchGeneration
+          );
+        }
+        return;
+      }
+      this.#setOutputDeviceError(OUTPUT_DEVICE_SWITCH_ERROR);
+    }
+  }
+
+  #closePlaybackOutput(): void {
+    this.#playbackOutputGeneration++;
+    if (this.#playbackElement) {
+      this.#releasePlaybackElement(this.#playbackElement);
+      this.#playbackElement = null;
+    }
+    this.#playbackDestination = null;
+    this.#playbackDestinationPromise = null;
+    this.#useDefaultPlaybackDestination = false;
+  }
+
+  #releasePlaybackElement(audio: HTMLAudioElement): void {
+    audio.pause();
+    audio.srcObject = null;
   }
 
   // --- Audio playback ---
@@ -709,9 +952,9 @@ export class VoiceClient {
 
       let audioBuffer: AudioBuffer;
       if (this.#audioFormat === "pcm16") {
-        // Raw 16-bit LE mono PCM at 16kHz — manually construct AudioBuffer
+        // Raw 16-bit LE mono PCM — sample rate comes from server audio_config
         const int16 = new Int16Array(audioData);
-        audioBuffer = ctx.createBuffer(1, int16.length, 16000);
+        audioBuffer = ctx.createBuffer(1, int16.length, this.#sampleRate);
         const channel = audioBuffer.getChannelData(0);
         for (let i = 0; i < int16.length; i++) {
           channel[i] = int16[i] / 32768;
@@ -722,28 +965,63 @@ export class VoiceClient {
       }
       if (generation !== this.#playbackGeneration) return;
 
+      // Assistant playback is routed through a MediaStreamAudioDestinationNode
+      // -> HTMLAudioElement bridge (so a selected output device can be honored
+      // via HTMLMediaElement.setSinkId). That bridge is a live playout path:
+      // when it is reused for a new turn after sitting idle through the gap
+      // between turns, the element resumes the fresh burst at the wrong rate and
+      // the new turn plays back noticeably slow (it then re-converges to normal
+      // over the turn). A freshly created element does not show this, so once
+      // the bridge has fully drained and been idle past a short threshold, tear
+      // it down; #getPlaybackDestination rebuilds a fresh element for this turn.
+      // The scheduledSources.size === 0 guard means this never fires mid-turn:
+      // chunks within a turn are scheduled ahead on the cursor, keeping at least
+      // one source live until the turn finishes.
+      const BRIDGE_IDLE_REBUILD_SECONDS = 0.3;
+      if (
+        this.#playbackElement &&
+        this.#scheduledSources.size === 0 &&
+        this.#lastPlaybackEnd !== null &&
+        ctx.currentTime - this.#lastPlaybackEnd > BRIDGE_IDLE_REBUILD_SECONDS
+      ) {
+        this.#closePlaybackOutput();
+      }
+
+      const destination = await this.#getPlaybackDestination(ctx);
+      if (generation !== this.#playbackGeneration) return;
+
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(ctx.destination);
-      if (generation !== this.#playbackGeneration) return;
-      this.#activeSource = source;
+      source.connect(destination);
+      this.#scheduledSources.add(source);
+      source.onended = () => {
+        this.#scheduledSources.delete(source);
+        if (
+          generation === this.#playbackGeneration &&
+          !this.#isScheduling &&
+          this.#scheduledSources.size === 0 &&
+          this.#playbackQueue.length === 0
+        ) {
+          this.#isPlaying = false;
+        }
+      };
 
-      return new Promise<void>((resolve) => {
-        source.onended = () => {
-          if (this.#activeSource === source) {
-            this.#activeSource = null;
-          }
-          resolve();
-        };
-        source.start();
-      });
+      // Schedule on the audio clock, butted against the previous chunk.
+      // Starting at currentTime only after the previous chunk's `ended`
+      // event leaves a few ms of silence at every chunk seam, audible as
+      // a periodic click during agent speech.
+      const startAt = Math.max(ctx.currentTime, this.#playbackCursor);
+      this.#playbackCursor = startAt + audioBuffer.duration;
+      this.#lastPlaybackEnd = this.#playbackCursor;
+      source.start(startAt);
     } catch (err) {
       console.error("[VoiceClient] Audio playback error:", err);
     }
   }
 
   async #processPlaybackQueue(): Promise<void> {
-    if (this.#isPlaying || this.#playbackQueue.length === 0) return;
+    if (this.#isScheduling || this.#playbackQueue.length === 0) return;
+    this.#isScheduling = true;
     this.#isPlaying = true;
     const generation = this.#playbackGeneration;
 
@@ -756,15 +1034,18 @@ export class VoiceClient {
     }
 
     if (generation === this.#playbackGeneration) {
-      this.#isPlaying = false;
+      this.#isScheduling = false;
+      if (this.#scheduledSources.size === 0) {
+        this.#isPlaying = false;
+      }
     }
   }
 
   #stopPlayback(): void {
-    const source = this.#activeSource;
     this.#playbackGeneration++;
-    this.#activeSource = null;
-    if (source) {
+    const sources = [...this.#scheduledSources];
+    this.#scheduledSources.clear();
+    for (const source of sources) {
       try {
         source.stop();
       } catch {
@@ -773,6 +1054,17 @@ export class VoiceClient {
     }
     this.#playbackQueue = [];
     this.#isPlaying = false;
+    this.#isScheduling = false;
+    this.#playbackCursor = 0;
+    // An interrupt (barge-in or a user transcript) stops playback abruptly, so
+    // the bridge goes idle from now, not from the cut chunk's scheduled end.
+    // Record the current audio-clock time as the idle start so the next turn's
+    // rebuild check in #playAudio still fires after interrupt -> long pause ->
+    // new turn. Nulling this here would disable that check and let the slow-
+    // playback symptom reappear on the post-interrupt turn.
+    this.#lastPlaybackEnd = this.#audioContext
+      ? this.#audioContext.currentTime
+      : null;
   }
 
   // --- Mic capture ---

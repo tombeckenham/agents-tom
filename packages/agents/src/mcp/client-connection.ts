@@ -1,36 +1,37 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
+  Client,
   SSEClientTransport,
-  type SSEClientTransportOptions
-} from "@modelcontextprotocol/sdk/client/sse.js";
-import {
   StreamableHTTPClientTransport,
-  type StreamableHTTPClientTransportOptions
-} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-// Import types directly from MCP SDK
-import type {
-  Prompt,
-  Resource,
-  Tool
-} from "@modelcontextprotocol/sdk/types.js";
-import {
+  SdkHttpError,
   type ClientCapabilities,
+  type ClientContext,
+  type DiscoverResult,
   type ElicitRequest,
-  ElicitRequestSchema,
   type ElicitResult,
-  type ListPromptsResult,
-  type ListResourceTemplatesResult,
-  type ListResourcesResult,
-  type ListToolsResult,
-  PromptListChangedNotificationSchema,
-  ResourceListChangedNotificationSchema,
-  type ResourceTemplate,
+  type McpSubscription,
+  type Prompt,
+  type Resource,
+  type ResourceTemplateType as ResourceTemplate,
   type ServerCapabilities,
-  ToolListChangedNotificationSchema
-} from "@modelcontextprotocol/sdk/types.js";
+  type SSEClientTransportOptions,
+  type StreamableHTTPClientTransportOptions,
+  type Tool
+} from "@modelcontextprotocol/client";
 import { Emitter, type Event } from "../core/events";
 import type { MCPObservabilityEvent } from "../observability/mcp";
+import { raceWithSignal } from "./abort";
+import {
+  fetchMcpPrompts,
+  fetchMcpResources,
+  fetchMcpResourceTemplates,
+  fetchMcpTools
+} from "./client-catalog";
 import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
+import {
+  createMcpSdkClient,
+  normalizeMcpClientOptions
+} from "./client-runtime";
+export { elicitationCapabilitiesFromHandlers } from "./client-runtime";
 import {
   isTransportNotImplemented,
   isUnauthorized,
@@ -92,14 +93,25 @@ export type MCPClientConnectionResult = {
   transport?: BaseTransportType;
 };
 
+/** Result of discovering server capabilities. */
+export type MCPDiscoveryResult =
+  | { success: true }
+  | { success: false; reason: "error" | "stale-session"; error: string };
+
 /**
- * Result of a discovery operation.
- * success indicates whether discovery completed successfully.
- * error is present when success is false.
+ * Handler for server-initiated `elicitation/create` requests.
+ * Held in memory only — never persisted — so it must be re-supplied when a
+ * connection is recreated (e.g. after Durable Object hibernation).
  */
-export type MCPDiscoveryResult = {
-  success: boolean;
-  error?: string;
+export type MCPElicitationHandler = (
+  request: ElicitRequest,
+  /** Aborts when the originating MCP call is cancelled or exhausts its total-time budget. */
+  signal?: AbortSignal
+) => Promise<ElicitResult>;
+
+export type MCPElicitationHandlers = {
+  form?: MCPElicitationHandler;
+  url?: MCPElicitationHandler;
 };
 
 export class MCPClientConnection {
@@ -113,6 +125,19 @@ export class MCPClientConnection {
     | StreamableHTTPClientTransport
     | SSEClientTransport
     | RPCClientTransport;
+
+  /**
+   * Transport that received the 401 during the initial connect attempt.
+   * Kept so finishAuth() runs on the transport that captured the resource
+   * metadata URL from the WWW-Authenticate header — a fresh transport would
+   * rediscover from defaults and exchange the code at the wrong token
+   * endpoint when the authorization server is not at the default location.
+   */
+  private _pendingAuthTransport?:
+    | StreamableHTTPClientTransport
+    | SSEClientTransport
+    | RPCClientTransport;
+  private _restoredListSubscription?: McpSubscription;
   prompts: Prompt[] = [];
   resources: Resource[] = [];
   resourceTemplates: ResourceTemplate[] = [];
@@ -128,23 +153,87 @@ export class MCPClientConnection {
   public readonly onObservabilityEvent: Event<MCPObservabilityEvent> =
     this._onObservabilityEvent.event;
 
+  private readonly _onListChanged = new Emitter<void>();
+  public readonly onListChanged: Event<void> = this._onListChanged.event;
+
+  /**
+   * Whether the connection advertised the elicitation capability. The SDK
+   * client refuses to register an `elicitation/create` request handler when
+   * the capability was not declared, so handler registration is gated on
+   * this.
+   */
+  private _elicitationEnabled = false;
+
   constructor(
     public url: URL,
-    info: ConstructorParameters<typeof Client>[0],
+    private readonly _info: ConstructorParameters<typeof Client>[0],
     public options: {
       transport: MCPTransportOptions;
-      client: McpClientOptions;
+      client: NonNullable<McpClientOptions>;
+      elicitationHandlers?: MCPElicitationHandlers;
+      /**
+       * Client capabilities persisted from a previous session, advertised
+       * until handlers are reconfigured after a hibernation restore. Cleared
+       * by {@link configureElicitationHandlers} — reconfigured handlers are
+       * the source of truth. Explicit `client.capabilities` win per key.
+       */
+      capabilitySeed?: ClientCapabilities;
+      /** SDK discovery result paired with a resumed Stateless HTTP session. */
+      discoverResult?: DiscoverResult;
     } = { client: {}, transport: {} }
   ) {
-    const clientOptions = {
-      ...options.client,
-      capabilities: {
-        ...options.client?.capabilities,
-        elicitation: {}
-      } as ClientCapabilities
+    this.options = {
+      ...options,
+      client: normalizeMcpClientOptions(options.client)
     };
 
-    this.client = new Client(info, clientOptions);
+    this.client = this.createClient();
+  }
+
+  private createClient(): Client {
+    const created = createMcpSdkClient(
+      this._info,
+      this.options.client,
+      this.options.capabilitySeed,
+      this.options.elicitationHandlers,
+      {
+        tools: (error, tools) => {
+          if (!error && tools) this.tools = tools;
+          this._onListChanged.fire();
+        },
+        prompts: (error, prompts) => {
+          if (!error && prompts) this.prompts = prompts;
+          this._onListChanged.fire();
+        },
+        resources: (error, resources) => {
+          if (!error && resources) this.resources = resources;
+          this._onListChanged.fire();
+        }
+      }
+    );
+    this._elicitationEnabled = created.elicitationEnabled;
+    return created.client;
+  }
+
+  /**
+   * Configure the handler used for server-initiated elicitation requests.
+   *
+   * If the connection has not been initialized yet, rebuild the SDK client so
+   * handler-driven elicitation capabilities are reflected in the initial
+   * handshake. A rebuild (rather than `Client.registerCapabilities`) is
+   * required because SDK capability registration is merge-only — it cannot
+   * un-advertise a mode when handlers are cleared before connecting. Active
+   * connections keep their negotiated capabilities until they reconnect.
+   */
+  configureElicitationHandlers(handlers?: MCPElicitationHandlers): void {
+    this.options.elicitationHandlers = handlers;
+    // Handlers are now the source of truth — drop the restore seed so
+    // clearing the handlers un-advertises the capability on rebuild.
+    this.options.capabilitySeed = undefined;
+
+    if (!this._transport) {
+      this.client = this.createClient();
+    }
   }
 
   /**
@@ -159,6 +248,22 @@ export class MCPClientConnection {
       throw new Error("Transport type must be specified");
     }
 
+    // init() can be re-entered after a mid-session 401 → OAuth → reconnect
+    // cycle (e.g. scope step-up, token revocation). The SDK client refuses
+    // to connect while a previous transport is still attached, so detach it
+    // first. Rebuild the client so the new handshake advertises the current
+    // handler-derived capabilities — reconnects are documented as the point
+    // where handler changes on a live connection take effect.
+    if (this._transport) {
+      this._transport = undefined;
+      try {
+        await this.client.close();
+      } catch {
+        // Closing a transport that just failed auth is best-effort.
+      }
+      this.client = this.createClient();
+    }
+
     const res = await this.tryConnect(transportType);
 
     // Set the connection state
@@ -166,13 +271,16 @@ export class MCPClientConnection {
 
     // Handle the result and emit appropriate events
     if (res.state === MCPConnectionState.CONNECTED && res.transport) {
-      // Set up elicitation request handler after successful connection
-      this.client.setRequestHandler(
-        ElicitRequestSchema,
-        async (request: ElicitRequest) => {
-          return await this.handleElicitationRequest(request);
-        }
-      );
+      // Set up the elicitation request handler after a successful
+      // connection. Only when the capability was advertised — the SDK
+      // client throws on registering a handler for an undeclared capability.
+      if (this._elicitationEnabled) {
+        this.client.setRequestHandler(
+          "elicitation/create",
+          async (request: ElicitRequest, context: ClientContext) =>
+            await this.handleElicitationRequest(request, context.mcpReq.signal)
+        );
+      }
 
       this.lastConnectedTransport = res.transport;
 
@@ -208,7 +316,9 @@ export class MCPClientConnection {
    * - Explicit: finish on that transport
    * - Auto: try streamable-http, then sse on 404/405/Not Implemented
    */
-  private async finishAuthProbe(code: string): Promise<void> {
+  private async finishAuthProbe(
+    callbackParams: URLSearchParams
+  ): Promise<void> {
     if (!this.options.transport.authProvider) {
       throw new Error("No auth provider configured");
     }
@@ -220,16 +330,50 @@ export class MCPClientConnection {
 
     const finishAuth = async (base: HttpTransportType) => {
       const transport = this.getTransport(base);
-      if (
-        "finishAuth" in transport &&
-        typeof transport.finishAuth === "function"
-      ) {
-        await transport.finishAuth(code);
+      let completed = false;
+      try {
+        if (
+          "finishAuth" in transport &&
+          typeof transport.finishAuth === "function"
+        ) {
+          await transport.finishAuth(callbackParams);
+          completed = true;
+        }
+      } finally {
+        if (typeof transport.close === "function") {
+          await transport.close().catch(() => {});
+        }
       }
+      if (completed) this.client = this.createClient();
     };
 
     if (configuredType === "rpc") {
       throw new Error("RPC transport does not support authentication");
+    }
+
+    // Prefer the transport that triggered authentication (initial-connect
+    // 401, or the active transport for a mid-session 401 such as a scope
+    // step-up): it holds the resource metadata URL from the WWW-Authenticate
+    // header that finishAuth() needs to locate the authorization server.
+    const authTransport = this._pendingAuthTransport ?? this._transport;
+    this._pendingAuthTransport = undefined;
+    if (
+      authTransport &&
+      "finishAuth" in authTransport &&
+      typeof authTransport.finishAuth === "function"
+    ) {
+      let completed = false;
+      try {
+        await authTransport.finishAuth(callbackParams);
+        completed = true;
+      } finally {
+        if (typeof authTransport.close === "function") {
+          await authTransport.close().catch(() => {});
+        }
+        if (this._transport === authTransport) this._transport = undefined;
+      }
+      if (completed) this.client = this.createClient();
+      return;
     }
 
     if (configuredType === "sse" || configuredType === "streamable-http") {
@@ -252,19 +396,30 @@ export class MCPClientConnection {
   /**
    * Complete OAuth authorization
    */
-  async completeAuthorization(code: string): Promise<void> {
-    if (this.connectionState !== MCPConnectionState.AUTHENTICATING) {
+  async completeAuthorization(
+    callback: string | URLSearchParams,
+    options: { alreadyAccepted?: boolean } = {}
+  ): Promise<void> {
+    const expectedState = options.alreadyAccepted
+      ? MCPConnectionState.CONNECTING
+      : MCPConnectionState.AUTHENTICATING;
+    if (this.connectionState !== expectedState) {
       throw new Error(
-        "Connection must be in authenticating state to complete authorization"
+        `Connection must be in ${expectedState} state to complete authorization`
       );
+    }
+
+    if (!options.alreadyAccepted) {
+      this.connectionState = MCPConnectionState.CONNECTING;
     }
 
     try {
       // Finish OAuth by probing transports per configuration
-      await this.finishAuthProbe(code);
-
-      // Mark as connecting
-      this.connectionState = MCPConnectionState.CONNECTING;
+      const callbackParams =
+        typeof callback === "string"
+          ? new URLSearchParams({ code: callback })
+          : callback;
+      await this.finishAuthProbe(callbackParams);
     } catch (error) {
       this.connectionState = MCPConnectionState.FAILED;
       throw error;
@@ -392,6 +547,7 @@ export class MCPClientConnection {
       });
       return {
         success: false,
+        reason: "error",
         error: `Discovery skipped - connection in ${this.connectionState} state`
       };
     }
@@ -460,11 +616,26 @@ export class MCPClientConnection {
         clearTimeout(timeoutId);
       }
 
-      // Return to CONNECTED state so user can retry discovery
-      this.connectionState = MCPConnectionState.CONNECTED;
+      // Ordinary discovery failures return to CONNECTED so callers can retry.
+      // A 401 is different: the live transport has already produced an OAuth
+      // authorization URL, so preserve AUTHENTICATING for the manager to
+      // persist and expose that continuation.
+      this.connectionState = isUnauthorized(e)
+        ? MCPConnectionState.AUTHENTICATING
+        : MCPConnectionState.CONNECTED;
 
       const error = e instanceof Error ? e.message : String(e);
-      return { success: false, error };
+      // A restored streamable HTTP session rejected with 404 must be
+      // initialized again without its persisted session id.
+      const staleSession =
+        this._probingCapabilities &&
+        e instanceof SdkHttpError &&
+        e.status === 404;
+      return {
+        success: false,
+        reason: staleSession ? "stale-session" : "error",
+        error
+      };
     } finally {
       // Clean up the abort controller
       this._discoveryAbortController = undefined;
@@ -487,18 +658,15 @@ export class MCPClientConnection {
    * Should only be called if serverCapabilities.tools exists
    */
   async registerTools(): Promise<Tool[]> {
-    if (
-      this.serverCapabilities?.tools?.listChanged ||
-      this._probingCapabilities
-    ) {
+    if (this._probingCapabilities) {
       this.client.setNotificationHandler(
-        ToolListChangedNotificationSchema,
-        async (_notification) => {
+        "notifications/tools/list_changed",
+        async () => {
           this.tools = await this.fetchTools();
+          this._onListChanged.fire();
         }
       );
     }
-
     return this.fetchTools();
   }
 
@@ -507,18 +675,15 @@ export class MCPClientConnection {
    * Should only be called if serverCapabilities.resources exists
    */
   async registerResources(): Promise<Resource[]> {
-    if (
-      this.serverCapabilities?.resources?.listChanged ||
-      this._probingCapabilities
-    ) {
+    if (this._probingCapabilities) {
       this.client.setNotificationHandler(
-        ResourceListChangedNotificationSchema,
-        async (_notification) => {
+        "notifications/resources/list_changed",
+        async () => {
           this.resources = await this.fetchResources();
+          this._onListChanged.fire();
         }
       );
     }
-
     return this.fetchResources();
   }
 
@@ -527,18 +692,15 @@ export class MCPClientConnection {
    * Should only be called if serverCapabilities.prompts exists
    */
   async registerPrompts(): Promise<Prompt[]> {
-    if (
-      this.serverCapabilities?.prompts?.listChanged ||
-      this._probingCapabilities
-    ) {
+    if (this._probingCapabilities) {
       this.client.setNotificationHandler(
-        PromptListChangedNotificationSchema,
-        async (_notification) => {
+        "notifications/prompts/list_changed",
+        async () => {
           this.prompts = await this.fetchPrompts();
+          this._onListChanged.fire();
         }
       );
     }
-
     return this.fetchPrompts();
   }
 
@@ -546,82 +708,54 @@ export class MCPClientConnection {
     return this.fetchResourceTemplates();
   }
 
+  private catalogFetchOptions() {
+    return {
+      probing: this._probingCapabilities,
+      onCapabilityError: this._capabilityErrorHandler.bind(this)
+    };
+  }
+
   async fetchTools() {
-    let toolsAgg: Tool[] = [];
-    let toolsResult: ListToolsResult = { tools: [] };
-    do {
-      toolsResult = await this.client
-        .listTools({
-          cursor: toolsResult.nextCursor
-        })
-        .catch(this._capabilityErrorHandler({ tools: [] }, "tools/list"));
-      toolsAgg = toolsAgg.concat(toolsResult.tools);
-    } while (toolsResult.nextCursor);
-    return toolsAgg;
+    return fetchMcpTools(this.client, this.catalogFetchOptions());
   }
 
   async fetchResources() {
-    let resourcesAgg: Resource[] = [];
-    let resourcesResult: ListResourcesResult = { resources: [] };
-    do {
-      resourcesResult = await this.client
-        .listResources({
-          cursor: resourcesResult.nextCursor
-        })
-        .catch(
-          this._capabilityErrorHandler({ resources: [] }, "resources/list")
-        );
-      resourcesAgg = resourcesAgg.concat(resourcesResult.resources);
-    } while (resourcesResult.nextCursor);
-    return resourcesAgg;
+    return fetchMcpResources(this.client, this.catalogFetchOptions());
   }
 
   async fetchPrompts() {
-    let promptsAgg: Prompt[] = [];
-    let promptsResult: ListPromptsResult = { prompts: [] };
-    do {
-      promptsResult = await this.client
-        .listPrompts({
-          cursor: promptsResult.nextCursor
-        })
-        .catch(this._capabilityErrorHandler({ prompts: [] }, "prompts/list"));
-      promptsAgg = promptsAgg.concat(promptsResult.prompts);
-    } while (promptsResult.nextCursor);
-    return promptsAgg;
+    return fetchMcpPrompts(this.client, this.catalogFetchOptions());
   }
 
   async fetchResourceTemplates() {
-    let templatesAgg: ResourceTemplate[] = [];
-    let templatesResult: ListResourceTemplatesResult = {
-      resourceTemplates: []
-    };
-    do {
-      templatesResult = await this.client
-        .listResourceTemplates({
-          cursor: templatesResult.nextCursor
-        })
-        .catch(
-          this._capabilityErrorHandler(
-            { resourceTemplates: [] },
-            "resources/templates/list"
-          )
-        );
-      templatesAgg = templatesAgg.concat(templatesResult.resourceTemplates);
-    } while (templatesResult.nextCursor);
-    return templatesAgg;
+    return fetchMcpResourceTemplates(this.client, this.catalogFetchOptions());
   }
 
   /**
-   * Handle elicitation request from server
-   * Automatically uses the Agent's built-in elicitation handling if available
+   * Handle elicitation request from server.
+   *
+   * Delegates to the `elicitationHandlers` connection option when provided.
+   *
+   * @deprecated Overriding or instance-patching this method directly is
+   * deprecated — pass the `elicitationHandlers` connection option instead.
    */
   async handleElicitationRequest(
-    _request: ElicitRequest
+    request: ElicitRequest,
+    signal?: AbortSignal
   ): Promise<ElicitResult> {
-    // Elicitation handling must be implemented by the platform
-    // For MCP servers, this should be handled by McpAgent.elicitInput()
+    const mode = request.params.mode === "url" ? "url" : "form";
+    const handler = this.options.elicitationHandlers?.[mode];
+    if (handler) {
+      const pending = signal ? handler(request, signal) : handler(request);
+      return raceWithSignal(pending, signal);
+    }
+    if (this.options.elicitationHandlers) {
+      throw new Error(
+        `No MCP ${mode}-mode elicitation handler configured for this connection.`
+      );
+    }
     throw new Error(
-      "Elicitation handler must be implemented for your platform. Override handleElicitationRequest method."
+      "Elicitation handler must be implemented for your platform. Provide the MCPClientConnection elicitationHandlers option, or register handlers through the MCP client manager before connecting."
     );
   }
 
@@ -638,6 +772,47 @@ export class MCPClientConnection {
     }
 
     return undefined;
+  }
+
+  /** @internal Clear a restored session before reconnecting. */
+  clearResumedSession(): void {
+    if ("sessionId" in this.options.transport) {
+      delete this.options.transport.sessionId;
+    }
+  }
+
+  get protocolVersion(): string | undefined {
+    if (this._transport instanceof StreamableHTTPClientTransport) {
+      return this._transport.protocolVersion;
+    }
+
+    return undefined;
+  }
+
+  get discoverResult(): DiscoverResult | undefined {
+    return this.client.getDiscoverResult();
+  }
+
+  private async openRestoredListSubscription(): Promise<void> {
+    const capabilities = this.client.getServerCapabilities();
+    const filter = {
+      ...(capabilities?.tools?.listChanged && { toolsListChanged: true }),
+      ...(capabilities?.prompts?.listChanged && { promptsListChanged: true }),
+      ...(capabilities?.resources?.listChanged && {
+        resourcesListChanged: true
+      })
+    };
+    if (Object.keys(filter).length === 0) return;
+
+    try {
+      this._restoredListSubscription = await this.client.listen(filter);
+    } catch (error) {
+      // A restored session is still usable when its optional listen stream
+      // cannot be reopened. Surface the error without failing the connection.
+      this.client.onerror?.(
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
   }
 
   private getTransportName(
@@ -664,6 +839,8 @@ export class MCPClientConnection {
   async close(): Promise<void> {
     const transport = this._transport;
     this._transport = undefined;
+    await this._restoredListSubscription?.close().catch(() => {});
+    this._restoredListSubscription = undefined;
     const url = this.url.toString();
     const transportName = this.getTransportName(transport);
 
@@ -759,8 +936,16 @@ export class MCPClientConnection {
       const transport = this.getTransport(currentTransportType);
 
       try {
-        await this.client.connect(transport);
+        const prior =
+          transport instanceof StreamableHTTPClientTransport &&
+          transport.sessionId &&
+          this.options.discoverResult
+            ? { kind: "modern" as const, discover: this.options.discoverResult }
+            : undefined;
+        await this.client.connect(transport, prior ? { prior } : undefined);
         this._transport = transport;
+        this._pendingAuthTransport = undefined;
+        if (prior) await this.openRestoredListSubscription();
 
         return {
           state: MCPConnectionState.CONNECTED,
@@ -770,6 +955,7 @@ export class MCPClientConnection {
         const error = e instanceof Error ? e : new Error(String(e));
 
         if (isUnauthorized(error)) {
+          this._pendingAuthTransport = transport;
           return {
             state: MCPConnectionState.AUTHENTICATING
           };

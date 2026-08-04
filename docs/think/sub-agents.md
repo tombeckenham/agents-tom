@@ -2,7 +2,7 @@
 
 Think works as both a top-level agent (WebSocket to browser) and a sub-agent (RPC from a parent agent). It also supports programmatic turns — injecting messages and triggering model turns without a WebSocket connection.
 
-This page focuses on Think's `chat()` RPC surface and programmatic turns. For the generic framework primitives underneath (`subAgent`, `onBeforeSubAgent`, `useAgent({ sub })`, `parentAgent`, `hasSubAgent`, `listSubAgents`, routing shape), see [Sub-agents](../sub-agents.md).
+This page focuses on Think's `chat()` RPC surface and programmatic turns. For the generic framework primitives underneath (`subAgent`, `onBeforeSubAgent`, `useAgent({ sub })`, `parentAgent`, `hasSubAgent`, `listSubAgents`, routing shape), see [Sub-agents](https://github.com/cloudflare/agents/blob/main/docs/agents/sub-agents.md).
 
 For a quick comparison of `chat()`, `saveMessages()`, `submitMessages()`, and
 agent tools, see [Choosing a turn API](./index.md#choosing-a-turn-api).
@@ -23,10 +23,10 @@ async chat(
 
 ```typescript
 interface StreamCallback {
-  onStart?(event: { requestId: string }): void | Promise<void>;
+  onStart(event: { requestId: string }): void | Promise<void>;
   onEvent(json: string): void | Promise<void>;
   onDone(): void | Promise<void>;
-  onError?(error: string): void | Promise<void>;
+  onError(error: string): void | Promise<void>;
 }
 ```
 
@@ -35,7 +35,7 @@ interface StreamCallback {
 | `onStart(event)` | Before work starts; exposes the request id for cancellation     |
 | `onEvent(json)`  | For each streaming chunk (JSON-serialized UIMessageChunk)       |
 | `onDone()`       | After the turn completes and the assistant message is persisted |
-| `onError(error)` | On error during the turn (if not provided, the error is thrown) |
+| `onError(error)` | On error during the turn                                        |
 
 ### ChatOptions
 
@@ -67,6 +67,9 @@ export class ParentAgent extends Think<Env> {
 
     const chunks: string[] = [];
     await child.chat(task, {
+      onStart: (event) => {
+        console.log("Child started:", event.requestId);
+      },
       onEvent: (json) => {
         chunks.push(json);
         // Optionally forward to a connected client
@@ -170,11 +173,12 @@ async saveMessages(
 ): Promise<SaveMessagesResult>
 ```
 
-Returns `{ requestId, status }` where `status` is `"completed"`, `"skipped"`, or `"aborted"`.
+Returns `{ requestId, status, error? }` where `status` is `"completed"`, `"error"`, `"skipped"`, or `"aborted"`.
 
 | `status`      | When                                                                                                                      |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `"completed"` | Turn ran to completion.                                                                                                   |
+| `"error"`     | Turn started but the stream reported an error. `error` contains the stream error message when available.                  |
 | `"skipped"`   | Turn invalidated mid-flight (e.g. by `chat-clear`); user message persisted, no model run.                                 |
 | `"aborted"`   | Turn cancelled before completion via `options.signal` or `chat-request-cancel`. Partial assistant chunks still persisted. |
 
@@ -207,7 +211,7 @@ await this.saveMessages((current) => [
 
 ### Scheduled responses
 
-Trigger a turn from a cron schedule:
+Trigger a recurring prompt turn with `getScheduledTasks()`:
 
 ```typescript
 export class MyAgent extends Think<Env> {
@@ -215,14 +219,14 @@ export class MyAgent extends Think<Env> {
     /* ... */
   }
 
-  async onScheduled() {
-    await this.saveMessages([
-      {
-        id: crypto.randomUUID(),
-        role: "user",
-        parts: [{ type: "text", text: "Generate the daily report." }]
+  getScheduledTasks() {
+    return {
+      dailyReport: {
+        schedule: "every day at 09:00",
+        timezone: "UTC",
+        prompt: "Generate the daily report."
       }
-    ]);
+    };
   }
 }
 ```
@@ -282,7 +286,7 @@ class MyAgent extends Think<Env> {
 
 `AbortSignal` cannot be passed as an RPC argument across Durable Object boundaries — workerd's JSRPC layer rejects it at serialization time. Construct the controller **inside** the DO that calls `saveMessages` and bridge the parent's intent through a serializable mechanism.
 
-For agent orchestration, prefer [Agent Tools](../agent-tools.md). `runAgentTool()`
+For agent orchestration, prefer [Agent Tools](https://github.com/cloudflare/agents/blob/main/docs/agents/agent-tools.md). `runAgentTool()`
 and `agentTool()` handle the parent abort signal, child-local `saveMessages({
 signal })`, event forwarding, replay, and cleanup for Think and `AIChatAgent`
 child agents.
@@ -305,7 +309,7 @@ In practice this means:
 - Recovery is best for long-lived chat sub-agents that have their own client reconnect path. Agent tools define a parent-side replay and terminal-state policy for cases where the original parent forwarding loop is gone.
 - If the parent restarts mid-agent-tool run, stored child chunks can replay, but the parent marks the run `interrupted` unless a future live-tail policy reattaches to recovered work.
 
-See [`cloudflare/agents#1406`](https://github.com/cloudflare/agents/issues/1406) for the original motivation, and [Agent Tools](../agent-tools.md) for the shipped orchestration API.
+See [`cloudflare/agents#1406`](https://github.com/cloudflare/agents/issues/1406) for the original motivation, and [Agent Tools](https://github.com/cloudflare/agents/blob/main/docs/agents/agent-tools.md) for the shipped orchestration API.
 
 ---
 
@@ -374,24 +378,28 @@ onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions | void
 
 ### ChatRecoveryContext
 
-| Field             | Type                       | Description                                          |
-| ----------------- | -------------------------- | ---------------------------------------------------- |
-| `streamId`        | `string`                   | The stream ID of the interrupted turn                |
-| `requestId`       | `string`                   | The request ID of the interrupted turn               |
-| `partialText`     | `string`                   | Text generated before the interruption               |
-| `partialParts`    | `MessagePart[]`            | Parts accumulated before the interruption            |
-| `recoveryData`    | `unknown \| null`          | Data from `this.stash()` during the turn             |
-| `messages`        | `UIMessage[]`              | Current conversation history                         |
-| `lastBody`        | `Record<string, unknown>?` | Body from the interrupted turn                       |
-| `lastClientTools` | `ClientToolSchema[]?`      | Client tools from the interrupted turn               |
-| `createdAt`       | `number`                   | Epoch milliseconds when the underlying fiber started |
+| Field             | Type                       | Description                                                                            |
+| ----------------- | -------------------------- | -------------------------------------------------------------------------------------- |
+| `incidentId`      | `string`                   | Stable ID for this recovery incident                                                   |
+| `attempt`         | `number`                   | Current attempt number for this incident, starting at 1                                |
+| `maxAttempts`     | `number`                   | Configured attempt cap before terminal exhaustion                                      |
+| `recoveryKind`    | `"retry" \| "continue"`    | Whether recovery retries an unanswered user turn or continues a partial assistant turn |
+| `streamId`        | `string`                   | The stream ID of the interrupted turn                                                  |
+| `requestId`       | `string`                   | The request ID of the interrupted turn                                                 |
+| `partialText`     | `string`                   | Text generated before the interruption                                                 |
+| `partialParts`    | `MessagePart[]`            | Parts accumulated before the interruption                                              |
+| `recoveryData`    | `unknown \| null`          | Data from `this.stash()` during the turn                                               |
+| `messages`        | `UIMessage[]`              | Current conversation history                                                           |
+| `lastBody`        | `Record<string, unknown>?` | Body from the interrupted turn                                                         |
+| `lastClientTools` | `ClientToolSchema[]?`      | Client tools from the interrupted turn                                                 |
+| `createdAt`       | `number`                   | Epoch milliseconds when the underlying fiber started                                   |
 
 ### ChatRecoveryOptions
 
-| Field      | Type       | Description                                      |
-| ---------- | ---------- | ------------------------------------------------ |
-| `persist`  | `boolean?` | Whether to persist the partial assistant message |
-| `continue` | `boolean?` | Whether to auto-continue with a new turn         |
+| Field      | Type       | Description                                                       |
+| ---------- | ---------- | ----------------------------------------------------------------- |
+| `persist`  | `boolean?` | Whether to persist the partial assistant message                  |
+| `continue` | `boolean?` | Whether to auto-continue with a new turn via `continueLastTurn()` |
 
 ### Example
 
@@ -417,6 +425,17 @@ export class MyAgent extends Think<Env> {
 
 With `persist: true`, the partial message is saved. With `continue: true`, Think calls `continueLastTurn()` after the agent reaches a stable state.
 
+For pre-stream interruptions, where `ctx.streamId === ""` and `ctx.partialText === ""` but the latest persisted message is still the unanswered user message, Think retries that turn automatically unless `continue` is `false`.
+
+```typescript
+onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions {
+  if (!ctx.streamId && !ctx.partialText) {
+    console.log("Recovering a pre-stream interruption");
+  }
+  return {};
+}
+```
+
 To suppress continuation for turns that have been orphaned too long to safely replay, gate on `ctx.createdAt`:
 
 ```typescript
@@ -427,6 +446,47 @@ onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions {
   return {};
 }
 ```
+
+### Recovery budgets and limits
+
+Instead of `chatRecovery = true`, assign an object to tune how long recovery is allowed to run and when it is given up on. A turn that keeps making forward progress survives unbounded interruption — duration is not a bound — as long as it stays under the `maxRecoveryWork` backstop. Recovery is only sealed by one of the limits below.
+
+```typescript
+export class MyAgent extends Think<Env> {
+  chatRecovery = {
+    maxAttempts: 10,
+    noProgressTimeoutMs: 5 * 60 * 1000,
+    maxRecoveryWork: 1000,
+    maxOomRetries: 3,
+    terminalMessage: "The assistant was interrupted and could not recover.",
+    // Consulted from the second recovery attempt onward. Return false to stop.
+    // Called as `config.shouldKeepRecovering(ctx)`, so it is NOT bound to the
+    // agent instance — track real token/cost spend in your own store keyed by
+    // `ctx.recoveryRootRequestId`.
+    async shouldKeepRecovering(ctx) {
+      return (await getSpendForTurn(ctx.recoveryRootRequestId)) < MAX_SPEND;
+    },
+    async onExhausted(ctx) {
+      console.warn("Recovery exhausted", ctx.incidentId, ctx.reason);
+    }
+  };
+}
+```
+
+| Field                  | Default           | Description                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maxAttempts`          | `10`              | Attempt cap. Resets on forward progress, so it catches a tight no-progress alarm loop, not a healthy long turn.                                                                                                                                                                                                                                                                                      |
+| `stableTimeoutMs`      | `10_000`          | How long an attempt waits for the isolate to reach stable state before rescheduling.                                                                                                                                                                                                                                                                                                                 |
+| `noProgressTimeoutMs`  | `300_000` (5 min) | Primary stuck-turn bound: max time without forward progress before sealing. **Resets on every progress-bearing attempt.**                                                                                                                                                                                                                                                                            |
+| `maxRecoveryWork`      | `1000`            | Runaway-loop guard: max produced content/tool units since the incident opened before a still-progressing turn is sealed (`work_budget_exceeded`). A generous finite backstop so a turn that keeps emitting content but never converges (for example an isolate that runs out of memory mid-stream on every recovery) cannot loop forever. Raise it, or set `Infinity`, for a very long agentic turn. |
+| `maxOomRetries`        | `3`               | Tight retry budget for a Durable Object memory-limit reset (the isolate exceeded its 128 MB limit). An OOM usually re-OOMs on re-run, but can be a transient spike, so recovery retries a few times then seals with `out_of_memory`. Counts only attempts that ended in an OOM. Set `0` to seal on the first OOM.                                                                                    |
+| `shouldKeepRecovering` | —                 | Caller policy consulted from the second attempt onward. Return `false` to stop recovery. The hook point for a token/cost budget (`ctx.work` is a coarse segment count, not tokens).                                                                                                                                                                                                                  |
+| `terminalMessage`      | generic message   | Message shown to the user when recovery is given up on.                                                                                                                                                                                                                                                                                                                                              |
+| `onExhausted`          | —                 | Called once when recovery is given up on. Inspect `ctx.reason`.                                                                                                                                                                                                                                                                                                                                      |
+
+`ctx.reason` on the exhausted hook is one of: `no_progress_timeout` (stuck), `max_attempts_exceeded` (no-progress alarm loop), `work_budget_exceeded` (runaway), `out_of_memory` (repeated memory-limit resets), `recovery_aborted` (your `shouldKeepRecovering` returned `false`), or `stable_timeout` (extreme churn). See [`chat-agents.md`](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery) for the full shared reference — Think and `@cloudflare/ai-chat` use the same recovery configuration.
+
+> **Last-resort OOM backstop.** A memory-limit reset severe enough to bypass the budgets above (for example the Durable Object out-of-memories while loading state on wake, before recovery runs) is caught at the alarm boundary: after `maxAlarmMemoryLimitStrikes` (a base `Agent` static option, default `3`) consecutive alarms end in a memory-limit reset, the interrupted turn is sealed with `out_of_memory` and the platform's alarm-retry loop is stopped (emitting an `alarm:memory_limit_reset` event). This bounds the loop and the bill but does not shrink the working set — a turn that genuinely no longer fits in 128 MB needs a smaller context.
 
 ---
 

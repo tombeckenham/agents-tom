@@ -331,13 +331,41 @@ describe("McpAgent.elicitInput() in-memory resolver", () => {
   });
 
   describe("RPC Transport", () => {
-    it("should complete elicitation accept round-trip via RPC", async () => {
-      const { connection } = await establishRPCConnection();
+    it("should keep a normal concurrent tool call separate from an eliciting tool call via RPC", async () => {
+      const { connection } = await establishRPCConnection({
+        form: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return { action: "accept", content: { name: "Alice" } };
+        }
+      });
 
-      // Override the elicitation handler to auto-accept with a name
-      connection.handleElicitationRequest = async () => {
-        return { action: "accept", content: { name: "Alice" } };
-      };
+      const [elicitResult, greetResult] = await Promise.all([
+        connection.client.callTool({
+          name: "elicitNameCustom",
+          arguments: {}
+        }),
+        connection.client.callTool({
+          name: "greet",
+          arguments: { name: "Concurrent" }
+        })
+      ]);
+
+      expect(elicitResult.content).toEqual([
+        { type: "text", text: "Custom elicit: Alice" }
+      ]);
+      expect(greetResult.content).toEqual([
+        { type: "text", text: "Hello, Concurrent!" }
+      ]);
+    });
+
+    it("should complete elicitation accept round-trip via RPC", async () => {
+      // Inject an elicitation handler that auto-accepts with a name
+      const { connection } = await establishRPCConnection({
+        form: async () => ({
+          action: "accept",
+          content: { name: "Alice" }
+        })
+      });
 
       const result = await connection.client.callTool({
         name: "elicitNameCustom",
@@ -350,11 +378,12 @@ describe("McpAgent.elicitInput() in-memory resolver", () => {
     });
 
     it("should handle elicitation cancel response via RPC", async () => {
-      const { connection } = await establishRPCConnection();
-
-      connection.handleElicitationRequest = async () => {
-        return { action: "cancel", content: {} };
-      };
+      const { connection } = await establishRPCConnection({
+        form: async () => ({
+          action: "cancel",
+          content: {}
+        })
+      });
 
       const result = await connection.client.callTool({
         name: "elicitNameCustom",
@@ -367,11 +396,12 @@ describe("McpAgent.elicitInput() in-memory resolver", () => {
     });
 
     it("should handle elicitation decline response via RPC", async () => {
-      const { connection } = await establishRPCConnection();
-
-      connection.handleElicitationRequest = async () => {
-        return { action: "decline", content: {} };
-      };
+      const { connection } = await establishRPCConnection({
+        form: async () => ({
+          action: "decline",
+          content: {}
+        })
+      });
 
       const result = await connection.client.callTool({
         name: "elicitNameCustom",

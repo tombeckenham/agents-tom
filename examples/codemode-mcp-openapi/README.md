@@ -2,6 +2,8 @@
 
 Demonstrates how to turn any OpenAPI spec into a pair of MCP tools (`search` + `execute`) using `openApiMcpServer`.
 
+> `@cloudflare/codemode` currently produces an MCP SDK v1 server, so this example intentionally uses the retained `createLegacyMcpHandler` API until Codemode's in-memory MCP bridge migrates separately.
+
 ## What this shows
 
 `openApiMcpServer` takes a raw OpenAPI spec and creates two tools:
@@ -9,7 +11,7 @@ Demonstrates how to turn any OpenAPI spec into a pair of MCP tools (`search` + `
 - **`search`** — the LLM queries the spec as a JavaScript object to find endpoints, parameters, and schemas
 - **`execute`** — the LLM calls the API via a host-side `request()` function you provide
 
-Auth tokens and base URLs live in your `request()` function on the host. The sandbox that runs LLM-generated code has no outbound network access and never sees secrets.
+Auth tokens and base URLs live in your `request()` function on the host. The sandbox has no outbound network access and never sees secrets. The callback's second argument is the MCP context for the outer `execute` tool call. Use it when an elicitation, sampling request, roots request, or notification belongs to that call.
 
 This example connects to the live [Cloudflare API](https://api.cloudflare.com/) using the official OpenAPI spec. Pass a Cloudflare API token via the `Authorization` header.
 
@@ -36,9 +38,9 @@ import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 const server = openApiMcpServer({
   spec,
   executor,
-  request: async (opts) => {
-    // Runs on the host — put auth, base URL, and headers here.
-    // The sandbox never sees the token.
+  request: async (opts, context) => {
+    // Runs on the host. Put auth, base URL, and headers here.
+    // The sandbox sees neither the token nor the MCP context.
     const url = new URL(`https://api.example.com${opts.path}`);
     const res = await fetch(url, {
       method: opts.method,
@@ -47,6 +49,57 @@ const server = openApiMcpServer({
     });
     return res.json();
   }
+});
+```
+
+The second argument is the MCP SDK's request-scoped context. For example, a host callback can elicit confirmation through the same response stream as the outer tool call:
+
+```ts
+request: async (opts, context) => {
+  const result = await server.server.elicitInput(
+    {
+      message: `Allow ${opts.method} ${opts.path}?`,
+      requestedSchema: {
+        type: "object",
+        properties: { approved: { type: "boolean" } },
+        required: ["approved"]
+      }
+    },
+    {
+      relatedRequestId: context.requestId,
+      signal: context.signal
+    }
+  );
+
+  if (result.action !== "accept" || !result.content?.approved) {
+    throw new Error("Request declined");
+  }
+
+  return callApi(opts);
+};
+```
+
+The context stays in trusted host code and should only be used while the outer tool call is active. Existing callbacks that only accept `opts` continue to work.
+
+### Timeouts: keep the sandbox budget at or above the elicitation timeout
+
+The `request()` callback runs while the sandbox is still suspended on its
+`codemode.request()` call — that call is a blocking RPC round-trip, so the
+executor's timeout covers the whole wait, including the time a human spends
+answering the elicitation. The default `DynamicWorkerExecutor` timeout is
+**60s**, which matches the MCP elicitation timeout (both the SDK's
+`DEFAULT_REQUEST_TIMEOUT_MSEC` and `McpAgent.elicitInput` default to 60s), so
+the default config already lets an elicitation run to completion.
+
+If you lower the executor timeout, a tool that elicits user input (or samples,
+or lists roots) will abort with `Execution timed out` once the sandbox budget
+expires, before the user can respond. Keep the executor timeout at least as
+long as the elicitation timeout:
+
+```ts
+const executor = new DynamicWorkerExecutor({
+  loader: env.LOADER,
+  timeout: 60_000 // do not drop below the 60s elicitation timeout
 });
 ```
 

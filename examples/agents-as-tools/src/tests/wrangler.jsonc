@@ -1,8 +1,8 @@
 {
-  "$schema": "../../../../node_modules/wrangler/config-schema.json",
+  "$schema": "../../node_modules/wrangler/config-schema.json",
   // Same compat date as the production example so partyserver 0.5.x
   // can rely on `ctx.id.name` inside alarm handlers.
-  "compatibility_date": "2026-04-15",
+  "compatibility_date": "2026-06-11",
   "compatibility_flags": [
     "nodejs_compat",
     // vitest-pool-workers needs these flags on top of nodejs_compat.
@@ -24,16 +24,25 @@
       {
         "class_name": "Assistant",
         "name": "Assistant"
+      },
+      // Test-harness-only bindings: production only needs to export these
+      // facet classes, but vitest-pool-workers needs them here for ctx.exports.
+      {
+        "class_name": "Researcher",
+        "name": "Researcher"
+      },
+      {
+        "class_name": "Planner",
+        "name": "Planner"
       }
-      // `Researcher` is addressed as a facet of `Assistant` and
-      // doesn't need a top-level binding — only a `new_sqlite_classes`
-      // entry.
+      // `Researcher` and `Planner` are addressed as facets of `Assistant`
+      // and do not need migration entries.
     ]
   },
   "main": "worker.ts",
   "migrations": [
     {
-      "new_sqlite_classes": ["Assistant", "Researcher", "Planner"],
+      "new_sqlite_classes": ["Assistant"],
       "tag": "v1"
     }
   ]

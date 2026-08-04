@@ -1,11 +1,59 @@
-import { Agent } from "agents";
-import { Message } from "chat";
+import { Agent, routeAgentRequest } from "agents";
+import type { RetryOptions, Schedule } from "agents";
 import {
-  AgentChatStateAdapter,
-  ChatStateAgent,
+  ChatSdkStateAdapter,
+  ChatSdkStateAgent,
   defaultKeyShard,
   defaultThreadShard
-} from "../state";
+} from "agents/chat-sdk";
+import { Message } from "chat";
+import appWorker, { ChatIngressAgent, ConversationAgent } from "../index";
+import { shardTelegramStateKey } from "@cloudflare/think/messengers/telegram";
+
+export { ChatSdkStateAgent } from "agents/chat-sdk";
+
+export class TestChatSdkStateAgent extends ChatSdkStateAgent {
+  override async schedule<T = string>(
+    when: Date | string | number,
+    callback: keyof this,
+    payload?: T,
+    _options?: { retry?: RetryOptions; idempotent?: boolean }
+  ): Promise<Schedule<T>> {
+    if (callback !== "cleanupExpired") {
+      return super.schedule(when, callback, payload, _options);
+    }
+
+    const base = {
+      id: crypto.randomUUID(),
+      callback: String(callback),
+      payload: payload as T
+    };
+
+    if (when instanceof Date) {
+      return {
+        ...base,
+        type: "scheduled",
+        time: Math.floor(when.getTime() / 1000)
+      };
+    }
+
+    if (typeof when === "string") {
+      return {
+        ...base,
+        type: "cron",
+        time: Math.floor(Date.now() / 1000),
+        cron: when
+      };
+    }
+
+    return {
+      ...base,
+      type: "delayed",
+      time: Math.floor(Date.now() / 1000) + when,
+      delayInSeconds: when
+    };
+  }
+}
 
 interface TestLockResult {
   first: boolean;
@@ -145,14 +193,28 @@ export class TestHostAgent extends Agent {
       thread: defaultKeyShard("thread-state:telegram:123:456"),
       channel: defaultKeyShard("channel-state:telegram:123"),
       history: defaultKeyShard("msg-history:telegram:123:456"),
-      dedupe: defaultKeyShard("dedupe:telegram:123:999"),
+      dedupe: shardTelegramStateKey(
+        "dedupe:telegram:123:999",
+        defaultThreadShard
+      ),
       callback: defaultKeyShard("chat:callback:opaque"),
       fallbackThread: defaultThreadShard("telegram:123:456")
     };
   }
 
-  private async createState(): Promise<AgentChatStateAdapter> {
-    const state = new AgentChatStateAdapter({ parent: this });
+  async testConversationFacet(): Promise<string> {
+    await this.subAgent(
+      ConversationAgent,
+      `conversation:${crypto.randomUUID()}`
+    );
+    return "ok";
+  }
+
+  private async createState(): Promise<ChatSdkStateAdapter> {
+    const state = new ChatSdkStateAdapter({
+      parent: this,
+      agent: TestChatSdkStateAgent
+    });
     await state.connect();
     return state;
   }
@@ -186,10 +248,13 @@ export class TestHostAgent extends Agent {
   }
 }
 
-export { ChatStateAgent };
+export { ChatIngressAgent, ConversationAgent };
 
 export default {
-  fetch() {
-    return new Response("Not found", { status: 404 });
+  async fetch(request: Request, env: Cloudflare.Env) {
+    return (
+      (await routeAgentRequest(request, env, { cors: true })) ||
+      appWorker.fetch(request, env, {} as ExecutionContext)
+    );
   }
 } satisfies ExportedHandler<Cloudflare.Env>;

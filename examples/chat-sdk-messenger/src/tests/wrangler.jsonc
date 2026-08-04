@@ -1,6 +1,6 @@
 {
-  "$schema": "../../../../node_modules/wrangler/config-schema.json",
-  "compatibility_date": "2026-01-28",
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "compatibility_date": "2026-06-11",
   "compatibility_flags": [
     "nodejs_compat",
     "enable_nodejs_tty_module",
@@ -15,13 +15,33 @@
       {
         "class_name": "TestHostAgent",
         "name": "TestHostAgent"
+      },
+      {
+        "class_name": "ChatIngressAgent",
+        "name": "ChatIngressAgent"
+      },
+      // Test-harness-only binding: production only needs to export this
+      // facet class, but vitest-pool-workers needs it here for ctx.exports.
+      {
+        "class_name": "ConversationAgent",
+        "name": "ConversationAgent"
+      },
+      // Test-harness-only binding: production only needs to export this
+      // facet class, but vitest-pool-workers needs it here for ctx.exports.
+      {
+        "class_name": "ChatSdkStateAgent",
+        "name": "ChatSdkStateAgent"
+      },
+      {
+        "class_name": "TestChatSdkStateAgent",
+        "name": "TestChatSdkStateAgent"
       }
     ]
   },
   "main": "worker.ts",
   "migrations": [
     {
-      "new_sqlite_classes": ["TestHostAgent", "ChatStateAgent"],
+      "new_sqlite_classes": ["TestHostAgent", "ChatIngressAgent"],
       "tag": "v1"
     }
   ]

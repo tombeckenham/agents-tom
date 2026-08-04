@@ -38,6 +38,10 @@ interface ChatRecoveryTestStub {
     persist?: boolean;
     continue?: boolean;
   }): Promise<void>;
+  setRequestContextForTest(
+    body: Record<string, unknown> | undefined,
+    clientTools: Array<{ name: string }>
+  ): Promise<void>;
   setIncludeReasoning(value: boolean): Promise<void>;
   insertInterruptedStream(
     streamId: string,
@@ -593,6 +597,178 @@ describe("continueLastTurn", () => {
     expect(
       messages.filter((m: ChatMessage) => m.role === "assistant")
     ).toHaveLength(1);
+  });
+
+  it("repairs a dead server-tool orphan before continuing (pre-inference chokepoint, no recovery callback)", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getTestAgent(room);
+
+    // Seed an assistant turn that was cut off mid-flight: a SERVER tool left at
+    // `input-available` (its `execute()` died with the isolate, nothing will
+    // resolve it). `previewTool` is NOT a client tool and no clientTools are set
+    // for this agent, so `hasPendingClientInteraction()` is false — the repair
+    // guard lets it through. This drives `continueLastTurn` DIRECTLY (not via a
+    // chat-recovery callback), proving the repair runs at the pre-inference
+    // chokepoint, so the next `convertToModelMessages` won't 400 with
+    // `AI_MissingToolResultsError`. Mirrors `@cloudflare/think` repairing before
+    // every inference, independent of `chatRecovery`.
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Preview it" }]
+      },
+      {
+        id: "assistant-orphan",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "Working on it" },
+          {
+            type: "tool-previewTool",
+            toolCallId: "call_assistant-orphan",
+            state: "input-available",
+            input: {}
+          }
+        ] as ChatMessage["parts"]
+      }
+    ] as ChatMessage[]);
+
+    await agentStub.callContinueLastTurn();
+    await agentStub.waitForIdleForTest();
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const orphan = messages.find((m) => m.id === "assistant-orphan")!;
+    const toolPart = orphan.parts.find(
+      (p) =>
+        "toolCallId" in p &&
+        (p as { toolCallId?: string }).toolCallId === "call_assistant-orphan"
+    ) as { state?: string } | undefined;
+    // The dead orphan was flipped to a settled (errored) result.
+    expect(toolPart?.state).toBe("output-error");
+
+    // It actually CONTINUED (ran inference once) rather than wedging on the
+    // dangling tool call.
+    expect(await agentStub.getOnChatMessageCallCount()).toBe(1);
+  });
+
+  it("does NOT repair a pending CLIENT-tool interaction on continue (per-part skip)", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getTestAgent(room);
+
+    // A CLIENT tool genuinely awaiting the user must NOT be repaired — flipping
+    // it to an error would clobber a result the client may still replay. Mark
+    // `chooseOption` as a registered client tool, then leave it at
+    // `input-available`: the shared `shouldRepair` skip leaves that part verbatim
+    // so it stays pending.
+    await agentStub.setRequestContextForTest(undefined, [
+      { name: "chooseOption" }
+    ]);
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Pick one" }]
+      },
+      {
+        id: "assistant-client",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-chooseOption",
+            toolCallId: "call_assistant-client",
+            state: "input-available",
+            input: {}
+          }
+        ] as ChatMessage["parts"]
+      }
+    ] as ChatMessage[]);
+
+    await agentStub.callContinueLastTurn();
+    await agentStub.waitForIdleForTest();
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const assistant = messages.find((m) => m.id === "assistant-client")!;
+    const toolPart = assistant.parts.find(
+      (p) =>
+        "toolCallId" in p &&
+        (p as { toolCallId?: string }).toolCallId === "call_assistant-client"
+    ) as { state?: string } | undefined;
+    // Still pending — the per-part skip left the client interaction untouched.
+    expect(toolPart?.state).toBe("input-available");
+  });
+
+  it("repairs a leaf server orphan even when an abandoned client orphan sits earlier (per-part, not whole-transcript)", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getTestAgent(room);
+
+    // `chooseOption` is a registered client tool; `previewTool` is not (server).
+    // An EARLIER assistant message holds an abandoned client orphan
+    // (`input-available` chooseOption), and the LEAF assistant holds a fresh dead
+    // SERVER orphan. A whole-transcript guard would skip ALL repair because a
+    // client interaction is "pending" somewhere; the per-part `shouldRepair` skip
+    // must instead leave the buried client orphan alone AND still repair the leaf
+    // server orphan so the next inference doesn't 400.
+    await agentStub.setRequestContextForTest(undefined, [
+      { name: "chooseOption" }
+    ]);
+    await agentStub.persistMessages([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "First" }]
+      },
+      {
+        id: "assistant-buried-client",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-chooseOption",
+            toolCallId: "call_buried-client",
+            state: "input-available",
+            input: {}
+          }
+        ] as ChatMessage["parts"]
+      },
+      {
+        id: "user-2",
+        role: "user",
+        parts: [{ type: "text", text: "Second" }]
+      },
+      {
+        id: "assistant-leaf-server",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-previewTool",
+            toolCallId: "call_leaf-server",
+            state: "input-available",
+            input: {}
+          }
+        ] as ChatMessage["parts"]
+      }
+    ] as ChatMessage[]);
+
+    await agentStub.callContinueLastTurn();
+    await agentStub.waitForIdleForTest();
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const partState = (messageId: string, toolCallId: string) => {
+      const m = messages.find((msg) => msg.id === messageId)!;
+      const p = m.parts.find(
+        (part) =>
+          "toolCallId" in part &&
+          (part as { toolCallId?: string }).toolCallId === toolCallId
+      ) as { state?: string } | undefined;
+      return p?.state;
+    };
+
+    // Buried client orphan untouched; leaf server orphan repaired.
+    expect(partState("assistant-buried-client", "call_buried-client")).toBe(
+      "input-available"
+    );
+    expect(partState("assistant-leaf-server", "call_leaf-server")).toBe(
+      "output-error"
+    );
   });
 
   it("should not recurse infinitely — recovery converges", async () => {

@@ -1,6 +1,6 @@
 # Voice Pipeline — Design (Experimental)
 
-> **Status: experimental.** The voice API is in `@cloudflare/voice` and will break between releases. See `docs/voice.md` for user-facing docs.
+> **Status: experimental.** The voice API is in `@cloudflare/voice` and will break between releases. See `docs/voice/index.md` for user-facing docs.
 
 How the voice pipeline works and why it is built this way.
 
@@ -35,7 +35,7 @@ What you give up:
 - WebRTC-grade network resilience (TCP head-of-line blocking on bad networks)
 - Tightly coupled echo cancellation (browser AEC via `getUserMedia` constraints still works)
 
-SFU integration is documented as an advanced option in `docs/voice.md`.
+SFU integration is documented as an advanced option in `docs/voice/index.md`.
 
 ## Two mixins
 
@@ -88,9 +88,9 @@ class MyAgent extends VoiceAgent<Env> {
 
 Class field initializers run after `super()`, so `this.env` is available. Override `createTranscriber(connection)` for runtime model switching. Workers AI convenience classes accept a loose `AiLike` interface. Any object satisfying the `Transcriber` interface works.
 
-### `onTurn` return type: `string | AsyncIterable<string> | ReadableStream`
+### `onTurn` return type: `string | AI SDK fullStream | AsyncIterable<string> | ReadableStream`
 
-Simple responses return a string (one TTS call). Streaming responses return an `AsyncIterable` or `ReadableStream` (sentence-chunked TTS). `iterateText()` normalizes all three into `AsyncIterable<string>`.
+Simple responses return a string (one TTS call). Streaming responses return AI SDK `fullStream`, an `AsyncIterable<string>`, or a `ReadableStream` (sentence-chunked TTS). AI SDK `textStream` still works but is deprecated for voice because it omits non-text events that mark speech boundaries. `iterateText()` normalizes supported sources into `AsyncIterable<string>`.
 
 ### Eager async iterables
 
@@ -309,6 +309,8 @@ Callbacks fire during the session:
 - `onUtterance(text)` — model-driven utterance boundary, triggers pipeline
 
 Session is created at `start_call` and lives for the entire call. All audio is fed continuously — no pre-roll needed since there is no gap between speech onset and session creation. The model handles turn detection (Flux `EndOfTurn`, Nova 3 `speech_final` + endpointing). On interrupt, the LLM+TTS pipeline is aborted but the transcriber session stays alive. On `end_call` or disconnect, `session.close()` releases resources.
+
+`TranscriberSession` may implement `waitUntilReady()`. `withVoice()` waits for that optional readiness signal before sending `listening` or running `onCallStart()`, and reports a visible startup error if readiness rejects. This sequencing is currently implemented by `WorkersAIFluxSTT`; `withVoiceInput()` and Nova 3 readiness are intentionally left for a follow-up.
 
 ### Interaction with VAD
 

@@ -263,10 +263,12 @@ export class Assistant extends Think<Env> {
 ```
 
 For deterministic fan-out, call `this.runAgentTool(Researcher, { input })`
-directly. In React, use `useAgentToolEvents({ agent })` to render retained and
-replayed child timelines. AIChatAgent children run headlessly, so browser
-client tools require a separate bridge; server-side tools work normally. See
-the full [Agent Tools guide](../../docs/agent-tools.md).
+directly. Parent recovery reconciles stale child rows after restarts and marks
+unrecoverable runs `interrupted` instead of hanging. In React, use
+`useAgentToolEvents({ agent })` to render retained and replayed child timelines.
+AIChatAgent children run headlessly, so browser client tools require a separate
+bridge; server-side tools work normally. See the full
+[Agent Tools guide](../../docs/agents/agent-tools.md).
 
 ### WebSocket Connections
 
@@ -380,7 +382,7 @@ Workflows provide:
 - **Long-running tasks** — run for days or weeks
 - **Progress tracking** — report status back to the agent
 
-See [Workflows](../../docs/workflows.md) and [Human in the Loop](../../docs/human-in-the-loop.md).
+See [Workflows](../../docs/agents/workflows.md) and [Human in the Loop](../../docs/agents/human-in-the-loop.md).
 
 ---
 
@@ -425,29 +427,34 @@ Features:
 
 Agents integrate with MCP to act as servers (providing tools to AI assistants) or clients (using tools from other services).
 
-### Creating an MCP Server
+### Creating a Stateless MCP server
 
 ```typescript
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
+import { z } from "zod";
 
-export class MyMCP extends McpAgent<Env, State, {}> {
-  server = new McpServer({ name: "my-tools", version: "1.0.0" });
-
-  async init() {
-    this.server.registerTool(
-      "lookup",
-      { description: "Look up data", inputSchema: { query: z.string() } },
-      async ({ query }) => {
-        const result = await this.search(query);
-        return { content: [{ type: "text", text: result }] };
-      }
-    );
-  }
+function createServer() {
+  const server = new McpServer({ name: "my-tools", version: "1.0.0" });
+  server.registerTool(
+    "lookup",
+    { description: "Look up data", inputSchema: { query: z.string() } },
+    async ({ query }) => ({
+      content: [{ type: "text", text: await lookup(query) }]
+    })
+  );
+  return server;
 }
 
-export default MyMCP.serve("/mcp", { binding: "MyMCP" });
+export default {
+  fetch(request, env, ctx) {
+    return createMcpHandler(createServer)(request, env, ctx);
+  }
+} satisfies ExportedHandler;
 ```
+
+Use `McpAgent`, `createLegacyMcpHandler`, and `WorkerTransport` from
+`agents/mcp` only when retaining Legacy session behavior.
 
 ### Using MCP Tools
 
@@ -464,7 +471,7 @@ await this.addMcpServer(
 // Use with AI SDK
 const result = await generateText({
   model: openai("gpt-4o"),
-  tools: this.mcp.getTools(),
+  tools: this.mcp.getAITools(),
   prompt: "What's the weather in Tokyo?"
 });
 ```
@@ -511,12 +518,15 @@ export default {
 
 ## Learn More
 
-[Getting Started](../../docs/getting-started.md) ·
-[State Management](../../docs/state.md) ·
-[Scheduling](../../docs/scheduling.md) ·
-[Callable Methods](../../docs/callable-methods.md) ·
-[MCP Integration](../../docs/mcp-client.md) ·
-[Full Documentation](../../docs/index.md)
+The published package includes the complete documentation tree at
+`docs/index.md`.
+
+[Getting Started](../../docs/agents/getting-started.md) ·
+[State Management](../../docs/agents/state.md) ·
+[Scheduling](../../docs/agents/scheduling.md) ·
+[Callable Methods](../../docs/agents/callable-methods.md) ·
+[MCP Integration](../../docs/agents/mcp-client.md) ·
+[Full Documentation](../../docs/agents/index.md)
 
 ---
 

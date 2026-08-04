@@ -25,7 +25,7 @@ export class MyAgent extends VoiceAgent<Env> {
     const ai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: ai("@cf/moonshotai/kimi-k2.6"),
+      model: ai("@cf/moonshotai/kimi-k2.7-code"),
       system: "You are a helpful voice assistant. Be concise.",
       messages: [
         ...context.messages.map((m) => ({
@@ -37,7 +37,7 @@ export class MyAgent extends VoiceAgent<Env> {
       abortSignal: context.signal
     });
 
-    return result.textStream;
+    return result.fullStream;
   }
 }
 
@@ -188,7 +188,7 @@ async onTurn(
 **Return value:**
 
 - `string` — The agent's full response. Synthesized as a single TTS call.
-- `AsyncIterable<string>` — A token stream (e.g. from `streamText().textStream`). The pipeline chunks it into sentences and synthesizes TTS per-sentence for lower latency.
+- AI SDK `fullStream` or `AsyncIterable<string>` — The pipeline chunks text into sentences and synthesizes TTS per-sentence for lower latency.
 
 ### Lifecycle hooks — optional
 

@@ -1,17 +1,21 @@
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
   CallToolRequest,
-  CallToolResultSchema,
-  CompatibilityCallToolResultSchema,
+  CallToolRequestOptions,
+  CacheableRequestOptions,
+  Client,
+  ClientCapabilities,
+  DiscoverResult,
+  ElicitRequest,
+  ElicitResult,
   GetPromptRequest,
   Prompt,
   ReadResourceRequest,
+  RequestOptions,
   Resource,
-  ResourceTemplate,
+  ResourceTemplateType as ResourceTemplate,
   Tool
-} from "@modelcontextprotocol/sdk/types.js";
-import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
+} from "@modelcontextprotocol/client";
+export type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import { type RetryOptions, tryN } from "../retries";
 import type { ToolSet } from "ai";
 import { toolDefinition, type ServerTool } from "@tanstack/ai";
@@ -20,20 +24,119 @@ import { nanoid } from "nanoid";
 import { Emitter, type Event, DisposableStore } from "../core/events";
 import type { MCPObservabilityEvent } from "../observability/mcp";
 import {
+  elicitationCapabilitiesFromHandlers,
   MCPClientConnection,
   MCPConnectionState,
+  type MCPDiscoveryResult,
+  type MCPElicitationHandlers,
   type MCPTransportOptions
 } from "./client-connection";
+import {
+  callV2Tool,
+  type CallToolSchemaOrOptions,
+  type LegacyCallToolResultSchema
+} from "./client-invoker";
 import { toErrorMessage } from "./errors";
 import { RPC_DO_PREFIX } from "./rpc";
-import type { TransportType } from "./types";
-import type { MCPServerRow } from "./client-storage";
+import type { McpClientOptions, TransportType } from "./types";
+import {
+  decodeMcpServerOptions,
+  encodeMcpServerOptions,
+  withMcpSession,
+  type MCPServerRow,
+  type PersistedMcpServerOptions
+} from "./client-storage";
 import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
 import { DurableObjectOAuthClientProvider } from "./do-oauth-client-provider";
 
-const defaultClientOptions: ConstructorParameters<typeof Client>[1] = {
-  jsonSchemaValidator: new CfWorkerJsonSchemaValidator()
+export type MCPAITool = {
+  description?: string;
+  title?: string;
+  execute: (
+    args: Record<string, unknown>,
+    options?: unknown
+  ) => Promise<unknown>;
+  inputSchema: z.ZodType;
+  outputSchema?: z.ZodType;
 };
+
+/**
+ * Structural tool set returned by {@link MCPClientManager.getAITools}.
+ * Compatible with the AI SDK without importing its types into the core
+ * `agents` declaration graph.
+ */
+export type MCPAIToolSet = Record<string, MCPAITool>;
+
+type MCPAIConvertedSchemas = {
+  inputSchema: z.ZodType;
+  outputSchema?: z.ZodType;
+};
+
+type MCPAISchemaSource = {
+  tool: Tool;
+  inputSchema: Tool["inputSchema"] | undefined;
+  outputSchema: Tool["outputSchema"] | undefined;
+};
+
+type MCPAISchemaCacheSlot = MCPAISchemaSource &
+  (
+    | { status: "converted"; converted: MCPAIConvertedSchemas }
+    | { status: "failed"; error: string }
+  );
+
+type MCPAISchemaCacheEntry = {
+  catalog: Tool[];
+  converted: Array<MCPAISchemaCacheSlot | undefined>;
+};
+
+/** Maximum length of a normalized MCP server id. */
+export const MCP_SERVER_ID_MAX_LENGTH = 64;
+
+/**
+ * Normalize a caller-supplied MCP server id into a stable, storage- and
+ * tool-name-safe form.
+ *
+ * The id is surfaced in several places where the character set matters:
+ *  - as the primary key in the `cf_agents_mcp_servers` SQLite table
+ *  - embedded in AI SDK tool names as `` `tool_${id.replace(/-/g, "")}_${tool}` ``
+ *    (tool names must match `/^[A-Za-z0-9_]+$/`)
+ *  - as a key on the `mcpConnections` map and OAuth provider storage
+ *
+ * Rules:
+ *  1. Lowercase.
+ *  2. Replace any run of disallowed characters with a single `-`.
+ *  3. Collapse repeated `-` and trim leading/trailing `-`/`_`.
+ *  4. Prefix with `id-` if the result is empty or doesn't start with a letter.
+ *  5. Truncate to {@link MCP_SERVER_ID_MAX_LENGTH} characters.
+ *
+ * @example
+ * normalizeServerId("my-supplied-id");  // "my-supplied-id"
+ * normalizeServerId("GitHub MCP!");     // "github-mcp"
+ * normalizeServerId("42-things");       // "id-42-things"
+ */
+export function normalizeServerId(input: string): string {
+  if (typeof input !== "string") {
+    throw new TypeError(
+      `normalizeServerId: expected string, got ${typeof input}`
+    );
+  }
+
+  let id = input
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+
+  if (id.length === 0 || !/^[a-z]/.test(id)) {
+    id = `id-${id}`.replace(/-+$/g, "");
+  }
+
+  if (id.length > MCP_SERVER_ID_MAX_LENGTH) {
+    id = id.slice(0, MCP_SERVER_ID_MAX_LENGTH).replace(/-+$/g, "");
+  }
+
+  return id;
+}
 
 /**
  * Blocked hostname patterns for SSRF protection.
@@ -161,20 +264,7 @@ function isBlockedUrl(url: string): boolean {
   return false;
 }
 
-/**
- * Options that can be stored in the server_options column
- * This is what gets JSON.stringify'd and stored in the database
- */
-export type MCPServerOptions = {
-  client?: ConstructorParameters<typeof Client>[1];
-  transport?: {
-    headers?: HeadersInit;
-    type?: TransportType;
-    sessionId?: string;
-  };
-  /** Retry options for connection and reconnection attempts */
-  retry?: RetryOptions;
-};
+export type MCPServerOptions = PersistedMcpServerOptions;
 
 /**
  * Result of an OAuth callback request
@@ -190,7 +280,7 @@ export type RegisterServerOptions = {
   url: string;
   name: string;
   callbackUrl?: string;
-  client?: ConstructorParameters<typeof Client>[1];
+  client?: McpClientOptions;
   transport?: MCPTransportOptions;
   authUrl?: string;
   clientId?: string;
@@ -215,6 +305,13 @@ export type MCPConnectionResult =
   | {
       state: typeof MCPConnectionState.CONNECTED;
     };
+
+/** Converts a resolved connection failure into a retry signal. */
+class ConnectRetryError extends Error {
+  constructor(readonly result: MCPConnectionResult) {
+    super("MCP connection attempt failed");
+  }
+}
 
 /**
  * Result of discovering server capabilities.
@@ -243,6 +340,18 @@ export type MCPClientOAuthResult =
       authError: string;
     };
 
+export type MCPClientElicitationHandler = (
+  request: ElicitRequest,
+  serverId: string,
+  /** Aborts when the originating MCP operation is cancelled. */
+  signal?: AbortSignal
+) => Promise<ElicitResult>;
+
+export type MCPClientElicitationHandlers = {
+  form?: MCPClientElicitationHandler;
+  url?: MCPClientElicitationHandler;
+};
+
 export type MCPClientManagerOptions = {
   storage: DurableObjectStorage;
   createAuthProvider?: (callbackUrl: string) => AgentMcpOAuthProvider;
@@ -266,6 +375,11 @@ export type MCPServerFilter = {
  */
 export class MCPClientManager {
   public mcpConnections: Record<string, MCPClientConnection> = {};
+  /** Cache only the current catalog so old schema graphs are not retained. */
+  private readonly _aiToolSchemas = new WeakMap<
+    MCPClientConnection,
+    MCPAISchemaCacheEntry
+  >();
   private _didWarnAboutUnstableGetAITools = false;
   private _oauthCallbackConfig?: MCPClientOAuthCallbackConfig;
   private _connectionDisposables = new Map<string, DisposableStore>();
@@ -275,6 +389,7 @@ export class MCPClientManager {
   ) => AgentMcpOAuthProvider;
   private _isRestored = false;
   private _pendingConnections = new Map<string, Promise<void>>();
+  private _elicitationHandlers?: MCPClientElicitationHandlers;
 
   /** @internal Protected for testing purposes. */
   protected readonly _onObservabilityEvent =
@@ -309,6 +424,31 @@ export class MCPClientManager {
     this._createAuthProviderFn = options.createAuthProvider;
   }
 
+  /**
+   * Scope the manager-level elicitation handler to a single connection.
+   * Returns undefined when no handler is configured so the connection keeps
+   * its default throwing behavior.
+   */
+  private scopedElicitationHandlers(
+    serverId: string
+  ): MCPElicitationHandlers | undefined {
+    const handlers = this._elicitationHandlers;
+    if (!handlers) return undefined;
+
+    const form = handlers.form;
+    const url = handlers.url;
+    return {
+      form: form
+        ? (request, signal) =>
+            signal ? form(request, serverId, signal) : form(request, serverId)
+        : undefined,
+      url: url
+        ? (request, signal) =>
+            signal ? url(request, serverId, signal) : url(request, serverId)
+        : undefined
+    };
+  }
+
   // SQL helper - runs a query and returns results as array
   private sql<T extends Record<string, SqlStorageValue>>(
     query: string,
@@ -335,6 +475,129 @@ export class MCPClientManager {
 
   private removeServerFromStorage(serverId: string): void {
     this.sql("DELETE FROM cf_agents_mcp_servers WHERE id = ?", serverId);
+  }
+
+  /**
+   * Rename a server's id, in-place, across every place the id is used as a
+   * key. Used to JIT-migrate servers that were originally registered under an
+   * auto-generated nanoid to a caller-supplied stable id (see
+   * `Agent.addMcpServer`'s `{ id }` option).
+   *
+   * Migrates:
+   *  - the `cf_agents_mcp_servers` row (primary key)
+   *  - the in-memory `mcpConnections` map key
+   *  - the connection disposables map key
+   *  - the attached `authProvider.serverId`, if any
+   *  - OAuth-related storage keys under `/{clientName}/{oldId}/...`
+   *
+   * Safe to call when no OAuth keys exist (RPC / bearer-token HTTP servers).
+   * If `oldId === newId` this is a no-op. If a row already exists under
+   * `newId`, throws — the caller is expected to have verified uniqueness.
+   *
+   * @internal Exposed for `Agent.addMcpServer` JIT-migration.
+   */
+  async migrateServerId(
+    oldId: string,
+    newId: string,
+    clientName: string
+  ): Promise<void> {
+    if (oldId === newId) return;
+
+    // Restore work closes over oldId. Drain it before renaming, including
+    // replacement work registered while an earlier task settles.
+    while (true) {
+      const pending = this._pendingConnections.get(oldId);
+      if (!pending) break;
+      await pending.catch(() => {});
+    }
+
+    const existing = this.sql<MCPServerRow>(
+      "SELECT id FROM cf_agents_mcp_servers WHERE id = ?",
+      oldId
+    );
+    if (existing.length === 0) {
+      // Nothing in storage to rename; just rename the in-memory connection if any.
+      this._renameInMemoryConnection(oldId, newId);
+      return;
+    }
+
+    const collision = this.sql<MCPServerRow>(
+      "SELECT id FROM cf_agents_mcp_servers WHERE id = ?",
+      newId
+    );
+    if (collision.length > 0) {
+      throw new Error(
+        `Cannot migrate MCP server id "${oldId}" → "${newId}": new id is already in use.`
+      );
+    }
+
+    // 1. Storage: rename the SQL row.
+    this.sql(
+      "UPDATE cf_agents_mcp_servers SET id = ? WHERE id = ?",
+      newId,
+      oldId
+    );
+
+    // 2. OAuth-related storage keys. The DurableObjectOAuthClientProvider
+    //    keys everything under `/{clientName}/{serverId}/...`. Other servers
+    //    won't have any keys with this prefix, so the list will be empty and
+    //    this is a no-op for them.
+    const oldPrefix = `/${clientName}/${oldId}/`;
+    const newPrefix = `/${clientName}/${newId}/`;
+    try {
+      const keys = await this._storage.list({ prefix: oldPrefix });
+      if (keys.size > 0) {
+        const writes: Record<string, unknown> = {};
+        const deletes: string[] = [];
+        for (const [oldKey, value] of keys) {
+          const newKey = newPrefix + oldKey.slice(oldPrefix.length);
+          writes[newKey] = value;
+          deletes.push(oldKey);
+        }
+        await this._storage.put(writes);
+        await this._storage.delete(deletes);
+      }
+    } catch (error) {
+      // Best-effort: storage rename failures shouldn't break the SQL-level
+      // rename that already succeeded. Log and continue.
+      console.warn(
+        `[MCPClientManager] OAuth key migration ${oldPrefix} → ${newPrefix} failed:`,
+        error
+      );
+    }
+
+    // 3. In-memory connection + disposables + authProvider.
+    this._renameInMemoryConnection(oldId, newId);
+
+    this._onServerStateChanged.fire();
+  }
+
+  private _renameInMemoryConnection(oldId: string, newId: string): void {
+    if (oldId === newId) return;
+
+    const conn = this.mcpConnections[oldId];
+    if (conn) {
+      this.mcpConnections[newId] = conn;
+      delete this.mcpConnections[oldId];
+      const authProvider = conn.options.transport.authProvider;
+      if (authProvider) {
+        authProvider.serverId = newId;
+      }
+      // The elicitation handler closes over the server id it was created
+      // with — rescope it so elicitation requests report the new id. With no
+      // handlers there is nothing to rescope, and configuring would wipe the
+      // connection's restored capability seed.
+      const scoped = this.scopedElicitationHandlers(newId);
+      if (scoped) {
+        conn.configureElicitationHandlers(scoped);
+      }
+    }
+
+    const disposables = this._connectionDisposables.get(oldId);
+    if (disposables) {
+      this._connectionDisposables.set(newId, disposables);
+      this._connectionDisposables.delete(oldId);
+    }
   }
 
   private getServersFromStorage(): MCPServerRow[] {
@@ -385,16 +648,48 @@ export class MCPClientManager {
   }
 
   /**
-   * Get the retry options for a server from stored server_options
+   * Get the parsed server_options for a stored server, if any.
    */
-  private getServerRetryOptions(serverId: string): RetryOptions | undefined {
+  private getStoredServerOptions(
+    serverId: string
+  ): MCPServerOptions | undefined {
     const rows = this.sql<MCPServerRow>(
       "SELECT server_options FROM cf_agents_mcp_servers WHERE id = ?",
       serverId
     );
     if (!rows.length || !rows[0].server_options) return undefined;
-    const parsed: MCPServerOptions = JSON.parse(rows[0].server_options);
-    return parsed.retry;
+    return decodeMcpServerOptions(rows[0].server_options);
+  }
+
+  /**
+   * Clear the capabilities persisted on a stored server row. Called once a
+   * seeded connection's handshake completes (see `createConnection`): the
+   * stamp is valid for one successful restore — sessions that configure
+   * handlers re-stamp every row, so a deploy that stops configuring them
+   * stops advertising stale modes after its first connected wake instead of
+   * forever, while wakes that never handshake don't burn the stamp.
+   */
+  private clearStoredCapabilities(serverId: string): void {
+    const rows = this.sql<MCPServerRow>(
+      "SELECT id, name, server_url, client_id, auth_url, callback_url, server_options FROM cf_agents_mcp_servers WHERE id = ?",
+      serverId
+    );
+    const row = rows[0];
+    if (!row?.server_options) return;
+    const options = decodeMcpServerOptions(row.server_options);
+    if (!options.capabilities) return;
+    options.capabilities = undefined;
+    this.saveServerToStorage({
+      ...row,
+      server_options: encodeMcpServerOptions(options)
+    });
+  }
+
+  /**
+   * Get the retry options for a server from stored server_options
+   */
+  private getServerRetryOptions(serverId: string): RetryOptions | undefined {
+    return this.getStoredServerOptions(serverId)?.retry;
   }
 
   private clearServerAuthUrl(serverId: string): void {
@@ -404,37 +699,30 @@ export class MCPClientManager {
     );
   }
 
-  private updateStoredSessionId(id: string, sessionId?: string): void {
+  private updateStoredSession(
+    id: string,
+    sessionId?: string,
+    protocolVersion?: string,
+    discoverResult?: DiscoverResult
+  ): void {
     const servers = this.getServersFromStorage();
     const serverRow = servers.find((server) => server.id === id);
     if (!serverRow) {
       return;
     }
 
-    const parsedOptions: MCPServerOptions = serverRow.server_options
-      ? JSON.parse(serverRow.server_options)
-      : {};
-
-    const currentSessionId = parsedOptions.transport?.sessionId;
-    if (currentSessionId === sessionId) {
-      return;
-    }
-
-    const nextTransport = {
-      ...(parsedOptions.transport ?? {}),
-      ...(sessionId ? { sessionId } : {})
-    };
-
-    if (!sessionId) {
-      delete nextTransport.sessionId;
-    }
-
+    const options = decodeMcpServerOptions(serverRow.server_options);
+    const next =
+      sessionId && protocolVersion
+        ? withMcpSession(options, {
+            id: sessionId,
+            protocolVersion,
+            discoverResult
+          })
+        : withMcpSession(options);
     this.saveServerToStorage({
       ...serverRow,
-      server_options: JSON.stringify({
-        ...parsedOptions,
-        transport: nextTransport
-      })
+      server_options: encodeMcpServerOptions(next)
     });
   }
 
@@ -449,6 +737,123 @@ export class MCPClientManager {
     }
     this._onServerStateChanged.fire();
     return { serverId, authSuccess: false, authError: error };
+  }
+
+  private isAuthAcceptedConnection(conn: MCPClientConnection): boolean {
+    return (
+      conn.connectionState === MCPConnectionState.READY ||
+      conn.connectionState === MCPConnectionState.CONNECTED ||
+      conn.connectionState === MCPConnectionState.CONNECTING ||
+      conn.connectionState === MCPConnectionState.DISCOVERING
+    );
+  }
+
+  private oauthCallbackSuccess(
+    serverId: string,
+    conn: MCPClientConnection
+  ): MCPOAuthCallbackResult {
+    this.clearServerAuthUrl(serverId);
+    conn.connectionError = null;
+    return { serverId, authSuccess: true };
+  }
+
+  private async runWithCodeVerifierState<T>(
+    authProvider: AgentMcpOAuthProvider,
+    state: string,
+    callback: () => Promise<T>
+  ): Promise<T> {
+    if (authProvider.runWithCodeVerifierState) {
+      return authProvider.runWithCodeVerifierState(state, callback);
+    }
+    return callback();
+  }
+
+  private async hasRedeemableOAuthState(
+    serverId: string,
+    authProvider: AgentMcpOAuthProvider,
+    state: string
+  ): Promise<boolean> {
+    authProvider.serverId = serverId;
+    try {
+      return (await authProvider.checkState(state)).valid;
+    } catch {
+      return false;
+    }
+  }
+
+  private ignoreUnverifiedCallback(
+    serverId: string,
+    error: string
+  ): MCPOAuthCallbackResult {
+    console.warn(
+      `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${serverId}": ${error}`
+    );
+    return { serverId, authSuccess: false, authError: error };
+  }
+
+  private async consumeStaleOAuthState(
+    serverId: string,
+    authProvider: AgentMcpOAuthProvider,
+    state: string
+  ): Promise<void> {
+    try {
+      const stateValidation = await authProvider.checkState(state);
+      if (!stateValidation.valid) {
+        console.warn(
+          `[MCPClientManager] Ignoring stale OAuth callback with invalid state for server "${serverId}": ${
+            stateValidation.error ?? "Invalid state"
+          }`
+        );
+        return;
+      }
+      await authProvider.consumeState(state);
+    } catch (cleanupError) {
+      console.warn(
+        `[MCPClientManager] Failed to clean up stale OAuth callback state for server "${serverId}":`,
+        cleanupError
+      );
+    }
+  }
+
+  private async completeAuthorizationAndCleanupVerifier(
+    serverId: string,
+    conn: MCPClientConnection,
+    authProvider: AgentMcpOAuthProvider,
+    state: string,
+    callbackParams: URLSearchParams
+  ): Promise<void> {
+    await this.runWithCodeVerifierState(authProvider, state, async () => {
+      let completeError: unknown;
+      let cleanupError: unknown;
+
+      try {
+        await conn.completeAuthorization(callbackParams, {
+          alreadyAccepted: true
+        });
+      } catch (error) {
+        completeError = error;
+      }
+
+      try {
+        await authProvider.deleteCodeVerifier();
+      } catch (deleteError) {
+        cleanupError = deleteError;
+      }
+
+      if (completeError) {
+        if (cleanupError) {
+          console.warn(
+            `[MCPClientManager] Failed to clean up OAuth code verifier for server "${serverId}":`,
+            cleanupError
+          );
+        }
+        throw completeError;
+      }
+
+      if (cleanupError) {
+        throw cleanupError;
+      }
+    });
   }
 
   /**
@@ -507,7 +912,11 @@ export class MCPClientManager {
       client_id: null,
       auth_url: null,
       callback_url: "",
-      server_options: JSON.stringify({ bindingName, props })
+      server_options: encodeMcpServerOptions({
+        bindingName,
+        props,
+        capabilities: this.advertisedHandlerCapabilities()
+      })
     });
   }
 
@@ -572,9 +981,7 @@ export class MCPClientManager {
         }
       }
 
-      const parsedOptions: MCPServerOptions | null = server.server_options
-        ? JSON.parse(server.server_options)
-        : null;
+      const parsedOptions = decodeMcpServerOptions(server.server_options);
 
       let authProvider: AgentMcpOAuthProvider | undefined;
       if (server.callback_url) {
@@ -599,7 +1006,8 @@ export class MCPClientManager {
           ...(parsedOptions?.transport ?? {}),
           type: parsedOptions?.transport?.type ?? ("auto" as TransportType),
           authProvider
-        }
+        },
+        discoverResult: parsedOptions?.discoverResult
       });
 
       // If auth_url exists, OAuth flow is in progress - set state and wait for callback
@@ -664,6 +1072,34 @@ export class MCPClientManager {
     }
   }
 
+  private async _connectWithRetry(
+    serverId: string,
+    retry?: RetryOptions
+  ): Promise<MCPConnectionResult> {
+    const maxAttempts = retry?.maxAttempts ?? 3;
+    const baseDelayMs = retry?.baseDelayMs ?? 500;
+    const maxDelayMs = retry?.maxDelayMs ?? 5000;
+
+    try {
+      return await tryN(
+        maxAttempts,
+        async () => {
+          const result = await this.connectToServer(serverId);
+          if (result.state === MCPConnectionState.FAILED) {
+            throw new ConnectRetryError(result);
+          }
+          return result;
+        },
+        { baseDelayMs, maxDelayMs }
+      );
+    } catch (error) {
+      if (error instanceof ConnectRetryError) {
+        return error.result;
+      }
+      throw error;
+    }
+  }
+
   /**
    * Internal method to restore a single server connection and discovery
    */
@@ -675,21 +1111,12 @@ export class MCPClientManager {
     // If stored OAuth tokens are valid, connection will succeed automatically
     // If tokens are missing/invalid, connection will fail with Unauthorized
     // and state will be set to "authenticating"
-    const maxAttempts = retry?.maxAttempts ?? 3;
-    const baseDelayMs = retry?.baseDelayMs ?? 500;
-    const maxDelayMs = retry?.maxDelayMs ?? 5000;
-
-    const connectResult = await tryN(
-      maxAttempts,
-      async () => this.connectToServer(serverId),
-      { baseDelayMs, maxDelayMs }
-    ).catch((error) => {
-      console.error(
-        `Error connecting to ${serverId} after ${maxAttempts} attempts:`,
-        error
-      );
-      return null;
-    });
+    const connectResult = await this._connectWithRetry(serverId, retry).catch(
+      (error) => {
+        console.error(`Error connecting to ${serverId}:`, error);
+        return null;
+      }
+    );
 
     if (connectResult?.state === MCPConnectionState.CONNECTED) {
       const discoverResult = await this.discoverIfConnected(serverId);
@@ -721,7 +1148,7 @@ export class MCPClientManager {
       };
       // we're overriding authProvider here because we want to be able to access the auth URL
       transport?: MCPTransportOptions;
-      client?: ConstructorParameters<typeof Client>[1];
+      client?: McpClientOptions;
     } = {}
   ): Promise<{
     id: string;
@@ -745,37 +1172,20 @@ export class MCPClientManager {
       );
     }
 
-    // During OAuth reconnect, reuse existing connection to preserve state
+    // During OAuth reconnect, reuse existing connection to preserve state;
+    // otherwise drop any existing connection and rebuild it.
     if (!options.reconnect?.oauthCode || !this.mcpConnections[id]) {
-      const normalizedTransport = {
-        ...options.transport,
-        type: options.transport?.type ?? ("auto" as TransportType)
-      };
-
-      this.mcpConnections[id] = new MCPClientConnection(
-        new URL(url),
-        {
-          name: this._name,
-          version: this._version
-        },
-        {
-          client: options.client ?? {},
-          transport: normalizedTransport
-        }
-      );
-
-      // Pipe connection-level observability events to the manager-level emitter
-      // and track the subscription for cleanup.
-      const store = new DisposableStore();
-      // If we somehow already had disposables for this id, clear them first
-      const existing = this._connectionDisposables.get(id);
-      if (existing) existing.dispose();
-      this._connectionDisposables.set(id, store);
-      store.add(
-        this.mcpConnections[id].onObservabilityEvent((event) => {
-          this._onObservabilityEvent.fire(event);
-        })
-      );
+      const replaced = this.mcpConnections[id];
+      if (replaced) {
+        delete this.mcpConnections[id];
+        // Once removed from the map, nothing else can close this transport.
+        await replaced.close().catch(() => {});
+        this.updateStoredSession(id, undefined);
+      }
+      this.createConnection(id, url, {
+        client: options.client,
+        transport: options.transport ?? {}
+      });
     }
 
     // Initialize connection first. this will try connect
@@ -784,9 +1194,29 @@ export class MCPClientManager {
     // Handle OAuth completion if we have a reconnect code
     if (options.reconnect?.oauthCode) {
       try {
-        await this.mcpConnections[id].completeAuthorization(
-          options.reconnect.oauthCode
-        );
+        const authProvider =
+          this.mcpConnections[id].options.transport.authProvider;
+        let completeError: unknown;
+        try {
+          await this.mcpConnections[id].completeAuthorization(
+            options.reconnect.oauthCode
+          );
+        } catch (error) {
+          completeError = error;
+        }
+
+        try {
+          await authProvider?.deleteCodeVerifier();
+        } catch (cleanupError) {
+          console.warn(
+            `[MCPClientManager] Failed to clean up OAuth code verifier for server "${id}":`,
+            cleanupError
+          );
+        }
+
+        if (completeError) {
+          throw completeError;
+        }
 
         // Reinitialize connection
         await this.mcpConnections[id].init();
@@ -843,8 +1273,9 @@ export class MCPClientManager {
     id: string,
     url: string,
     options: {
-      client?: ConstructorParameters<typeof Client>[1];
+      client?: McpClientOptions;
       transport: MCPTransportOptions;
+      discoverResult?: DiscoverResult;
     }
   ): MCPClientConnection {
     // Return existing connection if already exists
@@ -857,6 +1288,14 @@ export class MCPClientManager {
       type: options.transport?.type ?? ("auto" as TransportType)
     };
 
+    // Stored servers re-advertise the capabilities persisted on their row
+    // (see MCPServerOptions.capabilities); fresh registrations have no row
+    // yet and rely on the handlers below. The stamp is read without
+    // clearing so a wake that never handshakes (OAuth still pending, isolate
+    // death before connect) doesn't burn it — it is consumed at first use,
+    // once a seeded handshake completes.
+    const capabilitySeed = this.getStoredServerOptions(id)?.capabilities;
+
     this.mcpConnections[id] = new MCPClientConnection(
       new URL(url),
       {
@@ -864,8 +1303,11 @@ export class MCPClientManager {
         version: this._version
       },
       {
-        client: { ...defaultClientOptions, ...options.client },
-        transport: normalizedTransport
+        client: options.client ?? {},
+        transport: normalizedTransport,
+        elicitationHandlers: this.scopedElicitationHandlers(id),
+        capabilitySeed,
+        discoverResult: options.discoverResult
       }
     );
 
@@ -879,6 +1321,41 @@ export class MCPClientManager {
         this._onObservabilityEvent.fire(event);
       })
     );
+    store.add(
+      this.mcpConnections[id].onListChanged(() => {
+        this._onServerStateChanged.fire();
+      })
+    );
+
+    if (capabilitySeed) {
+      const conn = this.mcpConnections[id];
+      // Every handshake reports its success through this event, so it marks
+      // the seed's first use. The burn only targets deploys that stopped
+      // configuring handlers: a session with handlers configured owns the
+      // row stamps (each configure call re-stamps them, and re-registering
+      // a server writes a fresh one), and configureElicitationHandlers
+      // drops the in-memory seed on live connections — either way a fresh
+      // stamp meant for the next wake is never wiped here.
+      const seedClear = conn.onObservabilityEvent((event) => {
+        if (
+          event.type !== "mcp:client:connect" ||
+          event.payload.state !== MCPConnectionState.CONNECTED
+        ) {
+          return;
+        }
+        seedClear.dispose();
+        if (this._elicitationHandlers || !conn.options.capabilitySeed) return;
+        // migrateServerId may have renamed the row while the handshake was
+        // in flight — clear under the connection's current id.
+        const currentId = Object.keys(this.mcpConnections).find(
+          (key) => this.mcpConnections[key] === conn
+        );
+        if (currentId) {
+          this.clearStoredCapabilities(currentId);
+        }
+      });
+      store.add(seedClear);
+    }
 
     return this.mcpConnections[id];
   }
@@ -910,9 +1387,6 @@ export class MCPClientManager {
       }
     });
 
-    // Save to storage (exclude authProvider since it's recreated during restore)
-    const { authProvider: _, ...transportWithoutAuth } =
-      options.transport ?? {};
     this.saveServerToStorage({
       id,
       name: options.name,
@@ -920,16 +1394,44 @@ export class MCPClientManager {
       callback_url: options.callbackUrl ?? "",
       client_id: options.clientId ?? null,
       auth_url: options.authUrl ?? null,
-      server_options: JSON.stringify({
+      server_options: encodeMcpServerOptions({
         client: options.client,
-        transport: transportWithoutAuth,
-        retry: options.retry
+        transport: options.transport,
+        retry: options.retry,
+        capabilities: this.advertisedHandlerCapabilities()
       })
     });
 
     this._onServerStateChanged.fire();
 
     return id;
+  }
+
+  /** Persist and emit an OAuth continuation produced by connect or discovery. */
+  private persistAuthContinuation(
+    id: string,
+    conn: MCPClientConnection
+  ): { authUrl: string; clientId?: string } | undefined {
+    const authProvider = conn.options.transport.authProvider;
+    const authUrl = authProvider?.authUrl;
+    if (!authUrl || !authProvider.redirectUrl) return undefined;
+
+    const clientId = authProvider.clientId;
+    const serverRow = this.getServersFromStorage().find((s) => s.id === id);
+    if (serverRow) {
+      this.saveServerToStorage({
+        ...serverRow,
+        auth_url: authUrl,
+        client_id: clientId ?? null
+      });
+    }
+
+    this._onObservabilityEvent.fire({
+      type: "mcp:client:authorize",
+      payload: { serverId: id, authUrl, clientId },
+      timestamp: Date.now()
+    });
+    return { authUrl, clientId };
   }
 
   /**
@@ -955,7 +1457,12 @@ export class MCPClientManager {
     }
 
     const error = await conn.init();
-    this.updateStoredSessionId(id, conn.sessionId);
+    this.updateStoredSession(
+      id,
+      conn.sessionId,
+      conn.protocolVersion,
+      conn.discoverResult
+    );
     this._onServerStateChanged.fire();
 
     switch (conn.connectionState) {
@@ -966,42 +1473,20 @@ export class MCPClientManager {
         };
 
       case MCPConnectionState.AUTHENTICATING: {
-        const authUrl = conn.options.transport.authProvider?.authUrl;
-        const redirectUrl = conn.options.transport.authProvider?.redirectUrl;
-
-        if (!authUrl || !redirectUrl) {
+        const auth = this.persistAuthContinuation(id, conn);
+        if (!auth) {
+          const provider = conn.options.transport.authProvider;
           return {
             state: MCPConnectionState.FAILED,
-            error: `OAuth configuration incomplete: missing ${!authUrl ? "authUrl" : "redirectUrl"}`
+            error: `OAuth configuration incomplete: missing ${
+              !provider?.authUrl ? "authUrl" : "redirectUrl"
+            }`
           };
         }
 
-        const clientId = conn.options.transport.authProvider?.clientId;
-
-        // Update storage with auth URL and client ID
-        const servers = this.getServersFromStorage();
-        const serverRow = servers.find((s) => s.id === id);
-        if (serverRow) {
-          this.saveServerToStorage({
-            ...serverRow,
-            auth_url: authUrl,
-            client_id: clientId ?? null
-          });
-          // Broadcast again so clients receive the auth_url
-          this._onServerStateChanged.fire();
-        }
-
-        this._onObservabilityEvent.fire({
-          type: "mcp:client:authorize",
-          payload: { serverId: id, authUrl, clientId },
-          timestamp: Date.now()
-        });
-
-        return {
-          state: conn.connectionState,
-          authUrl,
-          clientId
-        };
+        // Broadcast again after auth_url is durable so clients can serve it.
+        this._onServerStateChanged.fire();
+        return { state: conn.connectionState, ...auth };
       }
 
       case MCPConnectionState.CONNECTED:
@@ -1049,16 +1534,18 @@ export class MCPClientManager {
     });
   }
 
-  private validateCallbackRequest(
-    req: Request
-  ):
-    | { valid: true; serverId: string; code: string; state: string }
-    | { valid: false; serverId?: string; error: string } {
+  private validateCallbackRequest(req: Request):
+    | {
+        valid: true;
+        serverId: string;
+        state: string;
+        callbackParams: URLSearchParams;
+      }
+    | { valid: false; serverId?: string; state?: string; error: string } {
     const url = new URL(req.url);
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
     const error = url.searchParams.get("error");
-    const errorDescription = url.searchParams.get("error_description");
 
     // Early validation - return errors because we can't identify the connection
     if (!state) {
@@ -1077,17 +1564,10 @@ export class MCPClientManager {
       };
     }
 
-    if (error) {
+    if (!code && !error) {
       return {
-        serverId: serverId,
-        valid: false,
-        error: errorDescription || error
-      };
-    }
-
-    if (!code) {
-      return {
-        serverId: serverId,
+        serverId,
+        state,
         valid: false,
         error: "Unauthorized: no code provided"
       };
@@ -1114,8 +1594,8 @@ export class MCPClientManager {
     return {
       valid: true,
       serverId,
-      code: code,
-      state: state
+      state,
+      callbackParams: url.searchParams
     };
   }
 
@@ -1123,7 +1603,40 @@ export class MCPClientManager {
     const validation = this.validateCallbackRequest(req);
 
     if (!validation.valid) {
-      if (validation.serverId && this.mcpConnections[validation.serverId]) {
+      const conn = validation.serverId
+        ? this.mcpConnections[validation.serverId]
+        : undefined;
+      if (validation.serverId && conn) {
+        if (this.isAuthAcceptedConnection(conn)) {
+          const authProvider = conn.options.transport.authProvider;
+          if (validation.state && authProvider) {
+            authProvider.serverId = validation.serverId;
+            await this.consumeStaleOAuthState(
+              validation.serverId,
+              authProvider,
+              validation.state
+            );
+          }
+          return this.oauthCallbackSuccess(validation.serverId, conn);
+        }
+        // Only a callback carrying a genuine state nonce may fail the
+        // connection; a stray or invalid callback must not alter the
+        // connection state machine.
+        const authProvider = conn.options.transport.authProvider;
+        if (
+          validation.state &&
+          authProvider &&
+          !(await this.hasRedeemableOAuthState(
+            validation.serverId,
+            authProvider,
+            validation.state
+          ))
+        ) {
+          return this.ignoreUnverifiedCallback(
+            validation.serverId,
+            validation.error
+          );
+        }
         return this.failConnection(validation.serverId, validation.error);
       }
 
@@ -1134,7 +1647,7 @@ export class MCPClientManager {
       };
     }
 
-    const { serverId, code, state } = validation;
+    const { serverId, state, callbackParams } = validation;
     const conn = this.mcpConnections[serverId]; // We have a valid connection - all errors from here should fail the connection
 
     try {
@@ -1151,33 +1664,57 @@ export class MCPClientManager {
       // This prevents DoS attacks where attacker consumes valid state before legitimate callback
       const stateValidation = await authProvider.checkState(state);
       if (!stateValidation.valid) {
-        throw new Error(stateValidation.error || "Invalid state");
-      }
-
-      // Already authenticated - just return success
-      if (
-        conn.connectionState === MCPConnectionState.READY ||
-        conn.connectionState === MCPConnectionState.CONNECTED
-      ) {
-        this.clearServerAuthUrl(serverId);
-        return { serverId, authSuccess: true };
-      }
-
-      if (conn.connectionState !== MCPConnectionState.AUTHENTICATING) {
-        throw new Error(
-          `Failed to authenticate: the client is in "${conn.connectionState}" state, expected "authenticating"`
+        if (this.isAuthAcceptedConnection(conn)) {
+          await this.consumeStaleOAuthState(serverId, authProvider, state);
+          return this.oauthCallbackSuccess(serverId, conn);
+        }
+        // Same rule as the invalid branch above: a callback whose nonce
+        // cannot be verified must not alter the connection state machine.
+        return this.ignoreUnverifiedCallback(
+          serverId,
+          callbackParams.get("error_description") ??
+            callbackParams.get("error") ??
+            stateValidation.error ??
+            "Invalid state"
         );
       }
 
+      // A stale popup can complete after another callback already exchanged tokens.
+      // Treat it as success, but consume its state so it cannot be replayed.
+      if (this.isAuthAcceptedConnection(conn)) {
+        await this.consumeStaleOAuthState(serverId, authProvider, state);
+        return this.oauthCallbackSuccess(serverId, conn);
+      }
+
+      if (
+        conn.connectionState !== MCPConnectionState.AUTHENTICATING &&
+        conn.connectionState !== MCPConnectionState.FAILED
+      ) {
+        throw new Error(
+          `Failed to authenticate from "${conn.connectionState}" state`
+        );
+      }
+
+      // A genuine callback can recover a flow that previously entered FAILED.
+      conn.connectionState = MCPConnectionState.CONNECTING;
       await authProvider.consumeState(state);
-      await conn.completeAuthorization(code);
-      this.updateStoredSessionId(serverId, conn.sessionId);
-      await authProvider.deleteCodeVerifier();
-      this.clearServerAuthUrl(serverId);
-      conn.connectionError = null;
+      await this.completeAuthorizationAndCleanupVerifier(
+        serverId,
+        conn,
+        authProvider,
+        state,
+        callbackParams
+      );
+      this.updateStoredSession(
+        serverId,
+        conn.sessionId,
+        conn.protocolVersion,
+        conn.discoverResult
+      );
+      const result = this.oauthCallbackSuccess(serverId, conn);
       this._onServerStateChanged.fire();
 
-      return { serverId, authSuccess: true };
+      return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return this.failConnection(serverId, message);
@@ -1213,12 +1750,60 @@ export class MCPClientManager {
 
     // Delegate to connection's discover method which handles cancellation and timeout
     const result = await conn.discover(options);
+    if (!result.success && result.reason === "stale-session") {
+      return this._recoverStaleSession(conn, serverId, options);
+    }
+    if (conn.connectionState === MCPConnectionState.AUTHENTICATING) {
+      this.persistAuthContinuation(serverId, conn);
+    }
     this._onServerStateChanged.fire();
 
-    return {
-      ...result,
-      state: conn.connectionState
-    };
+    return this._toDiscoverResult(conn, result);
+  }
+
+  private _toDiscoverResult(
+    conn: MCPClientConnection,
+    result: MCPDiscoveryResult
+  ): MCPDiscoverResult {
+    return result.success
+      ? { success: true, state: conn.connectionState }
+      : { success: false, error: result.error, state: conn.connectionState };
+  }
+
+  private async _recoverStaleSession(
+    conn: MCPClientConnection,
+    serverId: string,
+    options: { timeoutMs?: number }
+  ): Promise<MCPDiscoverResult> {
+    conn.clearResumedSession();
+    this.updateStoredSession(serverId, undefined);
+
+    let connectResult: MCPConnectionResult;
+    try {
+      connectResult = await this.connectToServer(serverId);
+    } catch (error) {
+      return {
+        success: false,
+        error: toErrorMessage(error),
+        state: conn.connectionState
+      };
+    }
+
+    if (connectResult.state !== MCPConnectionState.CONNECTED) {
+      return {
+        success: false,
+        error:
+          connectResult.state === MCPConnectionState.FAILED
+            ? connectResult.error
+            : `Connection in ${connectResult.state} state after session re-initialization`,
+        state: conn.connectionState
+      };
+    }
+
+    const result = await conn.discover(options);
+    this._onServerStateChanged.fire();
+
+    return this._toDiscoverResult(conn, result);
   }
 
   /**
@@ -1263,15 +1848,7 @@ export class MCPClientManager {
     }
 
     const retry = this.getServerRetryOptions(serverId);
-    const maxAttempts = retry?.maxAttempts ?? 3;
-    const baseDelayMs = retry?.baseDelayMs ?? 500;
-    const maxDelayMs = retry?.maxDelayMs ?? 5000;
-
-    const connectResult = await tryN(
-      maxAttempts,
-      async () => this.connectToServer(serverId),
-      { baseDelayMs, maxDelayMs }
-    );
+    const connectResult = await this._connectWithRetry(serverId, retry);
     this._onServerStateChanged.fire();
 
     if (connectResult.state === MCPConnectionState.CONNECTED) {
@@ -1298,6 +1875,65 @@ export class MCPClientManager {
   }
 
   /**
+   * Configure handling for server-initiated `elicitation/create` requests.
+   *
+   * The handler is held in memory only and applied to every MCP connection
+   * created or restored by this manager. Call this before registering
+   * connections when you want the initial MCP handshake to advertise
+   * handler-driven form- and url-mode elicitation. Existing active connections
+   * keep their negotiated capabilities until they reconnect.
+   *
+   * The advertised modes are persisted with each stored server, so
+   * connections restored after hibernation re-advertise them at the handshake
+   * even when this is called later in the wake-up (e.g. from onStart) — the
+   * handlers attach to the live connections as soon as this runs.
+   *
+   * Pass undefined to clear the handler.
+   *
+   * @param handlers Elicitation handlers keyed by mode, each scoped with the server id that sent the request
+   */
+  configureElicitationHandlers(handlers?: MCPClientElicitationHandlers): void {
+    this._elicitationHandlers =
+      handlers && (handlers.form || handlers.url) ? handlers : undefined;
+    this.persistAdvertisedCapabilities();
+    for (const [id, connection] of Object.entries(this.mcpConnections)) {
+      connection.configureElicitationHandlers(
+        this.scopedElicitationHandlers(id)
+      );
+    }
+  }
+
+  /** Client capabilities advertised from the currently configured handlers. */
+  private advertisedHandlerCapabilities(): ClientCapabilities | undefined {
+    const elicitation = elicitationCapabilitiesFromHandlers(
+      this._elicitationHandlers
+    );
+    return elicitation ? { elicitation } : undefined;
+  }
+
+  /**
+   * Record the handler-derived capabilities on every stored server row so a
+   * restore after hibernation re-advertises them before the handlers
+   * themselves are reconfigured.
+   */
+  private persistAdvertisedCapabilities(): void {
+    const capabilities = this.advertisedHandlerCapabilities();
+    for (const server of this.getServersFromStorage()) {
+      const options = decodeMcpServerOptions(server.server_options);
+      if (
+        JSON.stringify(options.capabilities) === JSON.stringify(capabilities)
+      ) {
+        continue;
+      }
+      options.capabilities = capabilities;
+      this.saveServerToStorage({
+        ...server,
+        server_options: encodeMcpServerOptions(options)
+      });
+    }
+  }
+
+  /**
    * Get the current OAuth callback configuration
    * @returns The current OAuth callback configuration
    */
@@ -1314,70 +1950,130 @@ export class MCPClientManager {
   }
 
   /**
+   * Convert connected MCP tools for the AI SDK. Converted schemas are reused
+   * while a live connection retains the same catalog array and schema-source
+   * identities; tool records and execute closures are rebuilt on every call.
+   *
    * @param filter - Optional filter to scope results to specific servers
    * @returns a set of tools that you can use with the AI SDK
    */
-  getAITools(filter?: MCPServerFilter): ToolSet {
+  getAITools(filter?: MCPServerFilter): MCPAIToolSet {
     const connections = this.filterConnections(filter);
+    const entries: [string, MCPAITool][] = [];
 
-    for (const [id, conn] of Object.entries(connections)) {
+    for (const [serverId, conn] of Object.entries(connections)) {
       if (
         conn.connectionState !== MCPConnectionState.READY &&
         conn.connectionState !== MCPConnectionState.AUTHENTICATING
       ) {
         console.warn(
-          `[getAITools] WARNING: Reading tools from connection ${id} in state "${conn.connectionState}". Tools may not be loaded yet.`
+          `[getAITools] WARNING: Reading tools from connection ${serverId} in state "${conn.connectionState}". Tools may not be loaded yet.`
         );
       }
+
+      const catalog = conn.tools;
+      let cache = this._aiToolSchemas.get(conn);
+      if (!cache || cache.catalog !== catalog) {
+        cache = { catalog, converted: [] };
+        this._aiToolSchemas.set(conn, cache);
+      }
+
+      for (const [index, tool] of catalog.entries()) {
+        const toolName = tool.name;
+        try {
+          const sourceInputSchema = tool.inputSchema;
+          const sourceOutputSchema = tool.outputSchema;
+          let slot = cache.converted[index];
+          if (
+            !slot ||
+            slot.tool !== tool ||
+            slot.inputSchema !== sourceInputSchema ||
+            slot.outputSchema !== sourceOutputSchema
+          ) {
+            try {
+              slot = {
+                status: "converted",
+                tool,
+                inputSchema: sourceInputSchema,
+                outputSchema: sourceOutputSchema,
+                converted: {
+                  inputSchema: sourceInputSchema
+                    ? z.fromJSONSchema(
+                        sourceInputSchema as Parameters<
+                          typeof z.fromJSONSchema
+                        >[0]
+                      )
+                    : z.fromJSONSchema({ type: "object" }),
+                  outputSchema: sourceOutputSchema
+                    ? z.fromJSONSchema(
+                        sourceOutputSchema as Parameters<
+                          typeof z.fromJSONSchema
+                        >[0]
+                      )
+                    : undefined
+                }
+              };
+            } catch (error) {
+              const errorText = String(error);
+              cache.converted[index] = {
+                status: "failed",
+                tool,
+                inputSchema: sourceInputSchema,
+                outputSchema: sourceOutputSchema,
+                error: errorText
+              };
+              console.warn(
+                `[getAITools] Skipping tool "${toolName}" from "${serverId}": ${errorText}`
+              );
+              continue;
+            }
+            cache.converted[index] = slot;
+          }
+
+          if (slot.status === "failed") continue;
+
+          const toolKey = `tool_${serverId.replace(/-/g, "")}_${toolName}`;
+          const title = tool.title ?? tool.annotations?.title;
+          const description = tool.description;
+          entries.push([
+            toolKey,
+            {
+              description,
+              title,
+              execute: async (args) => {
+                const result = await this.callTool({
+                  arguments: args,
+                  name: toolName,
+                  serverId
+                });
+                if (result.isError) {
+                  const content = result.content as
+                    | Array<{ type: string; text?: string }>
+                    | undefined;
+                  const textContent = content?.[0];
+                  const message =
+                    textContent?.type === "text" && textContent.text
+                      ? textContent.text
+                      : "Tool call failed";
+                  throw new Error(message);
+                }
+                return result;
+              },
+              inputSchema: slot.converted.inputSchema,
+              outputSchema: slot.converted.outputSchema
+            }
+          ]);
+        } catch (error) {
+          console.warn(
+            `[getAITools] Skipping tool "${toolName}" from "${serverId}": ${error}`
+          );
+        }
+      }
+
+      // Release removed slots when a public catalog array is spliced in place.
+      cache.converted.length = catalog.length;
     }
 
-    const entries: [string, ToolSet[string]][] = [];
-    for (const tool of getNamespacedData(connections, "tools")) {
-      try {
-        const toolKey = `tool_${tool.serverId.replace(/-/g, "")}_${tool.name}`;
-        const title = tool.title ?? tool.annotations?.title;
-        entries.push([
-          toolKey,
-          {
-            description: tool.description,
-            title,
-            execute: async (args) => {
-              const result = await this.callTool({
-                arguments: args,
-                name: tool.name,
-                serverId: tool.serverId
-              });
-              if (result.isError) {
-                const content = result.content as
-                  | Array<{ type: string; text?: string }>
-                  | undefined;
-                const textContent = content?.[0];
-                const message =
-                  textContent?.type === "text" && textContent.text
-                    ? textContent.text
-                    : "Tool call failed";
-                throw new Error(message);
-              }
-              return result;
-            },
-            inputSchema: tool.inputSchema
-              ? z.fromJSONSchema(
-                  tool.inputSchema as Parameters<typeof z.fromJSONSchema>[0]
-                )
-              : z.fromJSONSchema({ type: "object" }),
-            outputSchema: tool.outputSchema
-              ? z.fromJSONSchema(
-                  tool.outputSchema as Parameters<typeof z.fromJSONSchema>[0]
-                )
-              : undefined
-          }
-        ]);
-      } catch (e) {
-        console.warn(
-          `[getAITools] Skipping tool "${tool.name}" from "${tool.serverId}": ${e}`
-        );
-      }
-    }
     return Object.fromEntries(entries);
   }
 
@@ -1452,7 +2148,7 @@ export class MCPClientManager {
    * @param filter - Optional filter to scope results to specific servers
    * @returns a set of tools that you can use with the AI SDK
    */
-  unstable_getAITools(filter?: MCPServerFilter): ToolSet {
+  unstable_getAITools(filter?: MCPServerFilter): MCPAIToolSet {
     if (!this._didWarnAboutUnstableGetAITools) {
       this._didWarnAboutUnstableGetAITools = true;
       console.warn(
@@ -1473,7 +2169,7 @@ export class MCPClientManager {
    * (closes connection AND removes from storage).
    */
   private cleanupClosedConnection(id: string): void {
-    this.updateStoredSessionId(id, undefined);
+    this.updateStoredSession(id, undefined);
 
     const store = this._connectionDisposables.get(id);
     if (store) store.dispose();
@@ -1611,19 +2307,28 @@ export class MCPClientManager {
    */
   async callTool(
     params: CallToolRequest["params"] & { serverId: string },
-    resultSchema?:
-      | typeof CallToolResultSchema
-      | typeof CompatibilityCallToolResultSchema,
-    options?: RequestOptions
-  ) {
+    options?: CallToolRequestOptions
+  ): ReturnType<Client["callTool"]>;
+  /**
+   * @deprecated Prefer the v2 request-options overload. Explicit legacy result
+   * schemas remain honored through the v2 SDK request funnel.
+   */
+  async callTool(
+    params: CallToolRequest["params"] & { serverId: string },
+    resultSchema: LegacyCallToolResultSchema,
+    options?: CallToolRequestOptions
+  ): ReturnType<Client["callTool"]>;
+  async callTool(
+    params: CallToolRequest["params"] & { serverId: string },
+    schemaOrOptions?: CallToolSchemaOrOptions,
+    options?: CallToolRequestOptions
+  ): ReturnType<Client["callTool"]> {
     const { serverId, ...mcpParams } = params;
     const unqualifiedName = mcpParams.name.replace(`${serverId}.`, "");
-    return this.mcpConnections[serverId].client.callTool(
-      {
-        ...mcpParams,
-        name: unqualifiedName
-      },
-      resultSchema,
+    return callV2Tool(
+      this.mcpConnections[serverId].client,
+      { ...mcpParams, name: unqualifiedName },
+      schemaOrOptions,
       options
     );
   }
@@ -1633,10 +2338,11 @@ export class MCPClientManager {
    */
   readResource(
     params: ReadResourceRequest["params"] & { serverId: string },
-    options: RequestOptions
+    options?: CacheableRequestOptions
   ) {
-    return this.mcpConnections[params.serverId].client.readResource(
-      params,
+    const { serverId, ...mcpParams } = params;
+    return this.mcpConnections[serverId].client.readResource(
+      mcpParams,
       options
     );
   }
@@ -1646,12 +2352,10 @@ export class MCPClientManager {
    */
   getPrompt(
     params: GetPromptRequest["params"] & { serverId: string },
-    options: RequestOptions
+    options?: RequestOptions
   ) {
-    return this.mcpConnections[params.serverId].client.getPrompt(
-      params,
-      options
-    );
+    const { serverId, ...mcpParams } = params;
+    return this.mcpConnections[serverId].client.getPrompt(mcpParams, options);
   }
 }
 

@@ -47,7 +47,7 @@ import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
   generateText,
-  stepCountIs,
+  isStepCount,
   streamText,
   tool
 } from "ai";
@@ -322,14 +322,14 @@ export class Chat extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
     const result = streamText({
       abortSignal: options?.abortSignal,
-      model: workersai("@cf/moonshotai/kimi-k2.5", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: systemPrompt,
+      instructions: systemPrompt,
       messages: await convertToModelMessages([...this.messages]),
       // Allow multi-step agentic loops — the model can call a tool,
       // observe its output, and respond in the same turn.
-      stopWhen: stepCountIs(5),
+      stopWhen: isStepCount(5),
       tools: {
         // ── Shared-memory tools (demonstrate cross-DO RPC from a
         // facet tool-execute into the parent Inbox). A write here
@@ -439,8 +439,8 @@ export class Researcher extends Agent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const { text } = await generateText({
-      model: workersai("@cf/moonshotai/kimi-k2.5"),
-      system:
+      model: workersai("@cf/moonshotai/kimi-k2.7-code"),
+      instructions:
         "You are a concise research helper. Use only the provided chat context. " +
         "Return a short, practical answer with any uncertainty called out.",
       prompt: [

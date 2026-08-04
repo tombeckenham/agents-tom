@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  isDurableObjectCodeUpdateReset,
+  isDurableObjectMemoryLimitReset,
+  isDurableObjectStorageReset,
   isErrorRetryable,
+  isPlatformTransientError,
   jitterBackoff,
   tryN,
   validateRetryOptions
@@ -368,6 +372,281 @@ describe("retries", () => {
       expect(isErrorRetryable(undefined)).toBe(false);
       expect(isErrorRetryable("string error")).toBe(false);
       expect(isErrorRetryable(42)).toBe(false);
+    });
+  });
+
+  describe("isDurableObjectCodeUpdateReset", () => {
+    it("matches the verbatim supersede messages", () => {
+      expect(
+        isDurableObjectCodeUpdateReset(
+          new Error("Durable Object reset because its code was updated.")
+        )
+      ).toBe(true);
+      expect(
+        isDurableObjectCodeUpdateReset(
+          new Error(
+            "This script has been upgraded. Please send a new request to connect to the new version."
+          )
+        )
+      ).toBe(true);
+    });
+
+    it("looks through wrapper errors via the cause chain (SqlError shape)", () => {
+      // `SqlError` includes the cause message in its own message, but other
+      // wrappers may not — the cause chain is the robust signal.
+      const wrapped = new Error("query aborted", {
+        cause: new Error("Durable Object reset because its code was updated.")
+      });
+      expect(isDurableObjectCodeUpdateReset(wrapped)).toBe(true);
+    });
+
+    it("does not match lookalike application errors", () => {
+      expect(
+        isDurableObjectCodeUpdateReset(
+          new Error("Your subscription script has been upgraded to a new plan.")
+        )
+      ).toBe(false);
+      expect(
+        isDurableObjectCodeUpdateReset(new Error("Network connection lost."))
+      ).toBe(false);
+      expect(isDurableObjectCodeUpdateReset(null)).toBe(false);
+      expect(isDurableObjectCodeUpdateReset(undefined)).toBe(false);
+    });
+
+    it("terminates on a cyclic cause chain", () => {
+      const e = new Error("app error");
+      (e as unknown as { cause: unknown }).cause = e;
+      expect(isDurableObjectCodeUpdateReset(e)).toBe(false);
+    });
+  });
+
+  describe("isDurableObjectStorageReset", () => {
+    const storageReset =
+      "Internal error in Durable Object storage caused object to be reset";
+
+    it("matches the exact platform fragment case-insensitively", () => {
+      expect(isDurableObjectStorageReset(new Error(storageReset))).toBe(true);
+      expect(
+        isDurableObjectStorageReset(
+          new Error(`storage: ${storageReset.toUpperCase()}. retrying`)
+        )
+      ).toBe(true);
+    });
+
+    it("looks through wrapper errors via the cause chain", () => {
+      const wrapped = new Error("SQL query failed", {
+        cause: new Error(storageReset)
+      });
+      expect(isDurableObjectStorageReset(wrapped)).toBe(true);
+    });
+
+    it("rejects neighboring internal, SQL, and reset messages", () => {
+      expect(
+        isDurableObjectStorageReset(
+          new Error("Internal error in Durable Object storage")
+        )
+      ).toBe(false);
+      expect(
+        isDurableObjectStorageReset(
+          new Error("Internal error caused object to be reset")
+        )
+      ).toBe(false);
+      expect(
+        isDurableObjectStorageReset(
+          new Error("SQL query failed: internal database error")
+        )
+      ).toBe(false);
+      expect(
+        isDurableObjectStorageReset(
+          new Error("Durable Object storage caused object to be restarted")
+        )
+      ).toBe(false);
+    });
+
+    it("is transient but remains distinct from memory-limit poison handling", () => {
+      const error = new Error(storageReset);
+      expect(isDurableObjectStorageReset(error)).toBe(true);
+      expect(isPlatformTransientError(error)).toBe(true);
+      expect(isDurableObjectMemoryLimitReset(error)).toBe(false);
+    });
+  });
+
+  describe("isDurableObjectMemoryLimitReset", () => {
+    it("matches the DO and D1 memory-limit reset messages", () => {
+      expect(
+        isDurableObjectMemoryLimitReset(
+          new Error(
+            "Durable Object's isolate exceeded its memory limit and was reset."
+          )
+        )
+      ).toBe(true);
+      expect(
+        isDurableObjectMemoryLimitReset(
+          new Error("D1 DB's isolate exceeded its memory limit and was reset.")
+        )
+      ).toBe(true);
+    });
+
+    it("matches a truncated/reworded surfacing missing the '...and was reset' tail", () => {
+      // Real-world logs (#1825) clipped the message to just the core fragment;
+      // the broadened predicate must still classify it so the circuit breaker
+      // can engage.
+      expect(
+        isDurableObjectMemoryLimitReset(
+          new Error("Durable Object's isolate exceeded its memory limit")
+        )
+      ).toBe(true);
+      expect(
+        isDurableObjectMemoryLimitReset(
+          "Error: the isolate exceeded its memory limit (128 MB)"
+        )
+      ).toBe(true);
+    });
+
+    it("looks through wrapper errors via the cause chain (SqlError shape)", () => {
+      const wrapped = new Error("SQL query failed", {
+        cause: new Error(
+          "Durable Object's isolate exceeded its memory limit and was reset."
+        )
+      });
+      expect(isDurableObjectMemoryLimitReset(wrapped)).toBe(true);
+    });
+
+    it("matches a raw error-message string (returned-result path)", () => {
+      expect(
+        isDurableObjectMemoryLimitReset(
+          "Durable Object's isolate exceeded its memory limit and was reset."
+        )
+      ).toBe(true);
+    });
+
+    it("is NOT classified as a platform transient (must not be deferred)", () => {
+      // The whole point of #1825: a memory reset re-OOMs on re-run, so it must
+      // NOT join the defer-and-retry-forever transient class.
+      const oom = new Error(
+        "Durable Object's isolate exceeded its memory limit and was reset."
+      );
+      expect(isDurableObjectMemoryLimitReset(oom)).toBe(true);
+      expect(isPlatformTransientError(oom)).toBe(false);
+      expect(isDurableObjectCodeUpdateReset(oom)).toBe(false);
+    });
+
+    it("does not match lookalike application errors or empty inputs", () => {
+      expect(
+        isDurableObjectMemoryLimitReset(
+          new Error("Your plan exceeded its memory quota.")
+        )
+      ).toBe(false);
+      expect(isDurableObjectMemoryLimitReset(new Error("boom"))).toBe(false);
+      expect(isDurableObjectMemoryLimitReset(null)).toBe(false);
+      expect(isDurableObjectMemoryLimitReset(undefined)).toBe(false);
+    });
+
+    it("terminates on a cyclic cause chain", () => {
+      const e = new Error("app error");
+      (e as unknown as { cause: unknown }).cause = e;
+      expect(isDurableObjectMemoryLimitReset(e)).toBe(false);
+    });
+  });
+
+  describe("isPlatformTransientError", () => {
+    function retryableError(msg: string) {
+      const e = new Error(msg);
+      (e as unknown as { retryable: boolean }).retryable = true;
+      return e;
+    }
+
+    it("classifies supersede messages as transient", () => {
+      expect(
+        isPlatformTransientError(
+          new Error("Durable Object reset because its code was updated.")
+        )
+      ).toBe(true);
+      expect(
+        isPlatformTransientError(
+          new Error(
+            "This script has been upgraded. Please send a new request to connect to the new version."
+          )
+        )
+      ).toBe(true);
+    });
+
+    it('classifies "Network connection lost." as transient (bare and SqlError-wrapped)', () => {
+      // The deploy-reset window surfaces SQL failures as
+      // `SqlError: SQL query failed: Network connection lost.` — the wrapper
+      // drops the CF `retryable` flag, so the message itself must classify
+      // (#1730).
+      expect(
+        isPlatformTransientError(new Error("Network connection lost."))
+      ).toBe(true);
+      expect(
+        isPlatformTransientError(
+          new Error("SQL query failed: Network connection lost.")
+        )
+      ).toBe(true);
+    });
+
+    it("classifies a retryable-flagged platform error as transient", () => {
+      expect(isPlatformTransientError(retryableError("internal error"))).toBe(
+        true
+      );
+    });
+
+    it("excludes overloaded errors (retrying the same object won't help)", () => {
+      expect(
+        isPlatformTransientError(
+          retryableError(
+            "Durable Object is overloaded. Too many requests queued."
+          )
+        )
+      ).toBe(false);
+      const e = retryableError("some error");
+      (e as unknown as { overloaded: boolean }).overloaded = true;
+      expect(isPlatformTransientError(e)).toBe(false);
+    });
+
+    it("looks through wrapper errors via the cause chain", () => {
+      // A wrapper whose own message carries no signal but whose cause is a
+      // retryable platform error (the flag does not survive the wrapper).
+      const wrapped = new Error("operation failed", {
+        cause: retryableError("internal error")
+      });
+      expect(isPlatformTransientError(wrapped)).toBe(true);
+
+      const deeplyWrapped = new Error("outer", {
+        cause: new Error("middle", {
+          cause: new Error("Network connection lost.")
+        })
+      });
+      expect(isPlatformTransientError(deeplyWrapped)).toBe(true);
+    });
+
+    it("does NOT classify application errors as transient", () => {
+      expect(isPlatformTransientError(new Error("boom"))).toBe(false);
+      expect(
+        isPlatformTransientError(
+          new Error("Your subscription script has been upgraded to a new plan.")
+        )
+      ).toBe(false);
+      expect(
+        isPlatformTransientError(
+          new Error("app failure", { cause: new Error("inner app failure") })
+        )
+      ).toBe(false);
+      expect(isPlatformTransientError(null)).toBe(false);
+      expect(isPlatformTransientError(undefined)).toBe(false);
+      expect(isPlatformTransientError(42)).toBe(false);
+    });
+
+    it("accepts bare string errors", () => {
+      expect(isPlatformTransientError("Network connection lost.")).toBe(true);
+      expect(isPlatformTransientError("some app error")).toBe(false);
+    });
+
+    it("terminates on a cyclic cause chain", () => {
+      const e = new Error("app error");
+      (e as unknown as { cause: unknown }).cause = e;
+      expect(isPlatformTransientError(e)).toBe(false);
     });
   });
 });

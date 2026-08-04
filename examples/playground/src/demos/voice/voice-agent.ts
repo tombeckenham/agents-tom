@@ -18,10 +18,10 @@ export class PlaygroundVoiceAgent extends VoiceAgent<Env> {
     const ai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: ai("@cf/moonshotai/kimi-k2.6" as Parameters<typeof ai>[0], {
+      model: ai("@cf/moonshotai/kimi-k2.7-code" as Parameters<typeof ai>[0], {
         sessionAffinity: this.sessionAffinity
       }),
-      system:
+      instructions:
         "You are a friendly voice assistant in a demo playground. Keep responses concise — 1-2 sentences. Be warm and helpful.",
       messages: [
         ...context.messages.map((m) => ({
@@ -33,7 +33,7 @@ export class PlaygroundVoiceAgent extends VoiceAgent<Env> {
       abortSignal: context.signal
     });
 
-    return result.textStream;
+    return result.stream;
   }
 
   async onCallStart(connection: Connection) {

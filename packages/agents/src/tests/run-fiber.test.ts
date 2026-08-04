@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { getAgentByName } from "..";
+import { subscribe, type ObservabilityEvent } from "../observability";
 import type { FiberInspection, FiberRecoveryContext } from "..";
 import type { TestRunFiberAgent } from "./agents/run-fiber";
 
@@ -138,6 +139,65 @@ describe("runFiber", () => {
       expect(count).toBe(0);
     });
 
+    it("should apply internal stash wrappers to initial and user checkpoints", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "stash-internal-wrapper"
+      );
+
+      const result = (await agent.runWithInternalStashWrapper()) as unknown as {
+        initialSnapshot: unknown;
+        stashedSnapshot: unknown;
+      };
+
+      expect(result.initialSnapshot).toEqual({
+        __testFiberSnapshot: { requestId: "initial" },
+        user: null
+      });
+      expect(result.stashedSnapshot).toEqual({
+        __testFiberSnapshot: { requestId: "wrapped" },
+        user: { user: "checkpoint" }
+      });
+    });
+
+    it("should not leak an internal stash wrapper into concurrent plain fibers", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "stash-wrapper-concurrent"
+      );
+
+      const result =
+        (await agent.runWrappedAndPlainConcurrentStash()) as unknown as {
+          wrappedSnapshot: unknown;
+          plainSnapshot: unknown;
+        };
+
+      expect(result.wrappedSnapshot).toEqual({
+        __testFiberSnapshot: { requestId: "wrapped" },
+        user: { task: "wrapped" }
+      });
+      expect(result.plainSnapshot).toEqual({ task: "plain" });
+    });
+
+    it("should clean up fiber rows when a fiber fails after writing an internal initial snapshot", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "stash-wrapper-initial-then-throw"
+      );
+
+      const result =
+        (await agent.runWithInitialSnapshotThenThrow()) as unknown as {
+          threw: boolean;
+          runningFiberCount: number;
+        };
+
+      expect(result.threw).toBe(true);
+      expect(result.runningFiberCount).toBe(0);
+
+      const log = (await agent.getExecutionLog()) as unknown as string[];
+      expect(log).toContain("initial-then-throw");
+    });
+
     it("should throw when this.stash() is called outside a fiber", async () => {
       const agent = await getAgentByName(
         env.TestRunFiberAgent,
@@ -152,6 +212,30 @@ describe("runFiber", () => {
   // ── Recovery ──────────────────────────────────────────────────
 
   describe("recovery", () => {
+    it("restores MCP connections before fiber recovery runs", async () => {
+      // Unique name: DO storage persists across test runs, and a leftover
+      // server row would make the ordering assertion vacuous.
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        `recovery-mcp-ordering-${crypto.randomUUID()}`
+      );
+
+      // Simulate pre-eviction state: a stored MCP server and an interrupted
+      // fiber, then re-run the wake sequence the wrapped onStart performs.
+      await agent.seedMcpServerRow("mcp-seeded");
+      await agent.insertInterruptedFiber("fiber-mcp", "mcp-ordering");
+      await agent.rerunWakeSequence();
+
+      const recovered =
+        (await agent.getRecoveredFibers()) as unknown as FiberRecoveryContext[];
+      expect(recovered.some((fiber) => fiber.id === "fiber-mcp")).toBe(true);
+
+      // The recovered fiber ran with the restored connection already
+      // registered — a recovered chat turn can wait on it and see MCP tools.
+      const seen = await agent.getRecoveryMcpConnections();
+      expect(seen["fiber-mcp"]).toContain("mcp-seeded");
+    });
+
     it("should detect an interrupted fiber and call onFiberRecovered", async () => {
       const agent = await getAgentByName(
         env.TestRunFiberAgent,
@@ -169,6 +253,7 @@ describe("runFiber", () => {
       expect(recovered[0].id).toBe("fiber-1");
       expect(recovered[0].name).toBe("research");
       expect(recovered[0].snapshot).toBeNull();
+      expect(recovered[0].recoveryReason).toBe("interrupted");
       expect(typeof recovered[0].createdAt).toBe("number");
       expect(recovered[0].createdAt).toBeGreaterThanOrEqual(before);
       expect(recovered[0].createdAt).toBeLessThanOrEqual(Date.now());
@@ -258,6 +343,175 @@ describe("runFiber", () => {
       const recovered =
         (await agent.getRecoveredFibers()) as unknown as FiberRecoveryContext[];
       expect(recovered.length).toBe(1);
+    });
+
+    it("retains a fresh unmanaged row when onFiberRecovered throws (retryable)", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-retain-throw"
+      );
+
+      await agent.insertInterruptedFiber(
+        "fiber-throw-fresh",
+        "unmanaged-recovery-throws"
+      );
+      await agent.triggerRecoveryCheck();
+
+      // Failed recovery on a fresh unmanaged row is retained so a later scan
+      // can retry it.
+      const count = (await agent.getRunningFiberCount()) as unknown as number;
+      expect(count).toBe(1);
+    });
+
+    it("evicts an aged unmanaged row whose recovery keeps throwing", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-evict-aged"
+      );
+
+      const skipped: Array<{ fiberId: string; reason: string }> = [];
+      const unsubscribe = subscribe("fiber", (event) => {
+        if (event.type === "fiber:recovery:skipped") {
+          skipped.push({
+            fiberId: event.payload.fiberId,
+            reason: event.payload.reason
+          });
+        }
+      });
+
+      try {
+        // Older than the 24h default max age.
+        await agent.insertAgedInterruptedFiber(
+          "fiber-throw-aged",
+          "unmanaged-recovery-throws",
+          25 * 60 * 60 * 1000
+        );
+        await agent.triggerRecoveryCheck();
+      } finally {
+        unsubscribe();
+      }
+
+      const count = (await agent.getRunningFiberCount()) as unknown as number;
+      expect(count).toBe(0);
+      expect(
+        skipped.some(
+          (s) =>
+            s.fiberId === "fiber-throw-aged" && s.reason === "max_age_exceeded"
+        )
+      ).toBe(true);
+    });
+  });
+
+  // ── Recovery follow-up alarm (re-arm + backoff) ───────────────
+  //
+  // Fast, deterministic coverage of the alarm-scheduling behavior that backs
+  // multi-pass fiber recovery. These drive `_checkRunFibers` + `_scheduleNextAlarm`
+  // directly (no process kill / timers) and inspect the physical alarm, so the
+  // starvation re-arm and the exponential backoff are guarded on every PR rather
+  // than only by the nightly e2e suite.
+
+  describe("recovery follow-up alarm", () => {
+    it("arms a follow-up alarm while a retained recovery row is pending", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-alarm-rearm"
+      );
+
+      // No keepAlive lease, no schedules, no facet runs: the ONLY reason to arm
+      // an alarm here is the pending (retained) recovery row. Before the
+      // starvation fix `_scheduleNextAlarm` left this null and the orphan
+      // starved.
+      await agent.insertInterruptedFiber(
+        "poison-1",
+        "unmanaged-recovery-throws"
+      );
+      const alarm = await agent.simulateAlarmCycle();
+
+      // Hook threw → row retained, and a follow-up alarm is armed for the retry.
+      expect((await agent.getRunningFiberCount()) as unknown as number).toBe(1);
+      expect(alarm).not.toBeNull();
+      expect((alarm as number) - Date.now()).toBeGreaterThan(0);
+    });
+
+    it("backs off exponentially across consecutive no-progress scans", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-alarm-backoff"
+      );
+
+      await agent.insertInterruptedFiber(
+        "poison-2",
+        "unmanaged-recovery-throws"
+      );
+
+      const deltas: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const alarm = await agent.simulateAlarmCycle();
+        expect(alarm).not.toBeNull();
+        deltas.push((alarm as number) - Date.now());
+      }
+
+      // Each no-progress cycle roughly doubles the wait (2s base → ~4s, 8s, 16s,
+      // 32s), proving the alarm is NOT a flat keepAliveIntervalMs heartbeat.
+      expect(deltas[1]).toBeGreaterThan(deltas[0]);
+      expect(deltas[2]).toBeGreaterThan(deltas[1]);
+      expect(deltas[3]).toBeGreaterThan(deltas[2]);
+
+      // Still retained (never recovered, never aged out within the test) and the
+      // streak reflects the four no-progress scans.
+      expect((await agent.getRunningFiberCount()) as unknown as number).toBe(1);
+      expect(
+        (await agent.getRecoveryNoProgressScans()) as unknown as number
+      ).toBe(4);
+    });
+
+    it("resets the backoff when a scan makes forward progress", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-alarm-reset"
+      );
+
+      // Accrue backoff with a poison row.
+      await agent.insertInterruptedFiber(
+        "poison-3",
+        "unmanaged-recovery-throws"
+      );
+      await agent.simulateAlarmCycle();
+      const beforeAlarm = await agent.simulateAlarmCycle();
+      const beforeDelta = (beforeAlarm as number) - Date.now();
+      expect(
+        (await agent.getRecoveryNoProgressScans()) as unknown as number
+      ).toBeGreaterThan(0);
+
+      // A recoverable row that succeeds is forward progress → streak resets, so
+      // the next armed wait drops back toward the base interval (the poison row
+      // remains pending, so an alarm is still armed — just not backed off).
+      await agent.insertInterruptedFiber("good-1", "research");
+      const afterAlarm = await agent.simulateAlarmCycle();
+      const afterDelta = (afterAlarm as number) - Date.now();
+
+      expect(
+        (await agent.getRecoveryNoProgressScans()) as unknown as number
+      ).toBe(0);
+      expect(afterDelta).toBeLessThan(beforeDelta);
+    });
+
+    it("arms no follow-up alarm once recovery has fully drained", async () => {
+      const agent = await getAgentByName(
+        env.TestRunFiberAgent,
+        "recovery-alarm-drained"
+      );
+
+      // A single recoverable orphan: the scan recovers and deletes it, leaving
+      // nothing pending — so no recovery alarm is armed and the DO can idle.
+      await agent.insertInterruptedFiber("good-2", "research");
+      const alarm = await agent.simulateAlarmCycle();
+
+      expect((await agent.getRunningFiberCount()) as unknown as number).toBe(0);
+      expect(alarm).toBeNull();
+      expect(
+        (await agent.getRecoveryNoProgressScans()) as unknown as number
+      ).toBe(0);
     });
   });
 
@@ -775,7 +1029,7 @@ describe("runFiber", () => {
       });
     });
 
-    it("should keep managed fibers interrupted when recovery throws", async () => {
+    it("should mark managed fibers as errors when recovery throws", async () => {
       const agent = await freshManagedAgent("managed-recovery-throws");
 
       await agent.insertInterruptedManagedFiber(
@@ -788,9 +1042,42 @@ describe("runFiber", () => {
       await expect(
         agent.inspectManagedFiber("managed-throws")
       ).resolves.toMatchObject({
-        status: "interrupted",
+        status: "error",
         error: "Recovery failed",
         snapshot: { step: 1 }
+      });
+    });
+
+    it("should emit fiber recovery events when recovery fails", async () => {
+      const events: ObservabilityEvent[] = [];
+      const unsubscribe = subscribe("fiber", (event) => events.push(event));
+      const agent = await freshManagedAgent("managed-recovery-events");
+
+      await agent.insertInterruptedManagedFiber(
+        "managed-events",
+        "managed-recovery-throws",
+        { step: 1 }
+      );
+      await agent.triggerRecoveryCheck();
+      unsubscribe();
+
+      expect(events.map((event) => event.type)).toEqual(
+        expect.arrayContaining([
+          "fiber:recovery:detected",
+          "fiber:recovery:attempt",
+          "fiber:recovery:failed"
+        ])
+      );
+      const failed = events.find(
+        (event) => event.type === "fiber:recovery:failed"
+      );
+      expect(failed).toMatchObject({
+        payload: {
+          fiberId: "managed-events",
+          fiberName: "managed-recovery-throws",
+          error: "Recovery failed",
+          reason: "handler_error"
+        }
       });
     });
   });

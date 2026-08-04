@@ -1,4 +1,5 @@
 export {
+  TestCodemodeMcpAgent,
   TestMcpAgent,
   TestMcpJurisdiction,
   TestAddMcpServerAgent,
@@ -28,12 +29,21 @@ export {
   TestOnStartScheduleExplicitFalseAgent,
   TestScheduleAgent
 } from "./schedule";
-export { TestWorkflowAgent } from "./workflow";
+export {
+  TestWorkflowAgent,
+  TestWorkflowOnStartSubAgent,
+  TestWorkflowSubAgent
+} from "./workflow";
+export {
+  TestAgentToolReplayAgent,
+  TestAgentToolStubChild
+} from "./agent-tool-replay";
 export { TestOAuthAgent, TestCustomOAuthAgent } from "./oauth";
 export { TestReadonlyAgent } from "./readonly";
 export { TestProtocolMessagesAgent } from "./protocol-messages";
 export { TestCallableAgent, TestParentAgent, TestChildAgent } from "./callable";
 export { TestQueueAgent } from "./queue";
+export { TestChatSdkStateHostAgent, ChatSdkStateAgent } from "./chat-sdk";
 export { TestRaceAgent } from "./race";
 export { TestRetryAgent, TestRetryDefaultsAgent } from "./retry";
 export { TestKeepAliveAgent } from "./keep-alive";

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   applyChunkToParts,
   isReplayChunk,
+  normalizeToolInput,
   type MessageParts,
   type StreamChunkData
 } from "agents/chat";
@@ -266,6 +267,109 @@ describe("applyChunkToParts", () => {
         output: "result"
       });
       expect(parts.length).toBe(0); // Nothing added
+    });
+  });
+
+  describe("tool-input normalization (provider 400 guard)", () => {
+    // A streamed tool call that finishes with no `input_json_delta` events
+    // (model called the tool with no args) can otherwise persist a non-object
+    // `input`, which 400s every later turn with
+    // `tool_use.input: Input should be an object` and wedges the session.
+    const malformed: Array<[string, unknown]> = [
+      ["null", null],
+      ["undefined", undefined],
+      ["empty string", ""],
+      ["array", [{ id: 1 }, { id: 2 }]],
+      ["empty array", []],
+      ["number", 42],
+      ["boolean", true],
+      ["non-object JSON string", "hello"]
+    ];
+
+    for (const [label, value] of malformed) {
+      it(`coerces ${label} input to {} on tool-input-available (new part)`, () => {
+        const parts = makeParts();
+        applyChunkToParts(parts, {
+          type: "tool-input-available",
+          toolCallId: "call_1",
+          toolName: "doThing",
+          input: value
+        });
+        expect((parts[0] as Record<string, unknown>).input).toEqual({});
+      });
+
+      it(`coerces ${label} input to {} on tool-input-available (finalize streaming part)`, () => {
+        const parts = makeParts();
+        applyChunkToParts(parts, {
+          type: "tool-input-start",
+          toolCallId: "call_1",
+          toolName: "doThing"
+        });
+        applyChunkToParts(parts, {
+          type: "tool-input-available",
+          toolCallId: "call_1",
+          toolName: "doThing",
+          input: value
+        });
+        expect((parts[0] as Record<string, unknown>).input).toEqual({});
+      });
+
+      it(`coerces ${label} input to {} on tool-input-error (new part)`, () => {
+        const parts = makeParts();
+        applyChunkToParts(parts, {
+          type: "tool-input-error",
+          toolCallId: "call_1",
+          toolName: "doThing",
+          input: value,
+          errorText: "boom"
+        });
+        const part = parts[0] as Record<string, unknown>;
+        expect(part.input).toEqual({});
+        expect(part.state).toBe("output-error");
+      });
+
+      it(`coerces ${label} input to {} on tool-input-error (finalize streaming part)`, () => {
+        const parts = makeParts();
+        applyChunkToParts(parts, {
+          type: "tool-input-start",
+          toolCallId: "call_1",
+          toolName: "doThing"
+        });
+        applyChunkToParts(parts, {
+          type: "tool-input-error",
+          toolCallId: "call_1",
+          toolName: "doThing",
+          input: value,
+          errorText: "boom"
+        });
+        const part = parts[0] as Record<string, unknown>;
+        expect(part.input).toEqual({});
+        expect(part.state).toBe("output-error");
+      });
+    }
+
+    it("leaves a valid object input untouched", () => {
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "doThing",
+        input: { a: 1 }
+      });
+      expect((parts[0] as Record<string, unknown>).input).toEqual({ a: 1 });
+    });
+
+    it("parses a stringified-JSON object input", () => {
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "doThing",
+        input: '{"prompt":"a cat"}'
+      });
+      expect((parts[0] as Record<string, unknown>).input).toEqual({
+        prompt: "a cat"
+      });
     });
   });
 
@@ -1383,5 +1487,191 @@ describe("applyChunkToParts", () => {
         })
       ).toBe(false);
     });
+
+    it("returns true for tool-output-denied on an approval-responded part", () => {
+      // A continuation that re-validates the transcript can re-emit a denial
+      // for an approval the user already granted. The chunk must not reach the
+      // client, where the in-place updateToolPart would flip the rendered part
+      // from approval-responded back to output-denied.
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      applyChunkToParts(parts, {
+        type: "tool-approval-request",
+        toolCallId: "call_1",
+        approvalId: "appr-1"
+      });
+      (parts[0] as Record<string, unknown>).state = "approval-responded";
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-output-denied",
+          toolCallId: "call_1"
+        })
+      ).toBe(true);
+    });
+
+    it("returns true for tool-output-denied on a terminal part", () => {
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      applyChunkToParts(parts, {
+        type: "tool-output-available",
+        toolCallId: "call_1",
+        output: "Sunny"
+      });
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-output-denied",
+          toolCallId: "call_1"
+        })
+      ).toBe(true);
+    });
+
+    it("returns false for a genuine first tool-output-denied (input-available)", () => {
+      // The first denial of a still-pending tool must pass through so the
+      // client sees the denial.
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-output-denied",
+          toolCallId: "call_1"
+        })
+      ).toBe(false);
+    });
+
+    it("returns false for tool-output-denied when no existing part matches", () => {
+      const parts = makeParts();
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-output-denied",
+          toolCallId: "call_unknown"
+        })
+      ).toBe(false);
+    });
+
+    it("returns true for tool-approval-request on an approval-responded part", () => {
+      // A continuation replaying a prior tool round-trip can re-emit the
+      // approval request. The chunk must not reach the client, where the
+      // in-place updateToolPart would revert an approved tool back to
+      // approval-requested (re-showing Approve/Reject).
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      applyChunkToParts(parts, {
+        type: "tool-approval-request",
+        toolCallId: "call_1",
+        approvalId: "appr-1"
+      });
+      (parts[0] as Record<string, unknown>).state = "approval-responded";
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-approval-request",
+          toolCallId: "call_1",
+          approvalId: "appr-1"
+        })
+      ).toBe(true);
+    });
+
+    it("returns true for tool-approval-request on a terminal part", () => {
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      applyChunkToParts(parts, {
+        type: "tool-output-available",
+        toolCallId: "call_1",
+        output: "Sunny"
+      });
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-approval-request",
+          toolCallId: "call_1",
+          approvalId: "appr-late"
+        })
+      ).toBe(true);
+    });
+
+    it("returns false for a genuine first tool-approval-request (input-available)", () => {
+      // The first approval request of a still-pending tool must pass through so
+      // the client renders the Approve/Reject decision.
+      const parts = makeParts();
+      applyChunkToParts(parts, {
+        type: "tool-input-available",
+        toolCallId: "call_1",
+        toolName: "getWeather",
+        input: { city: "London" }
+      });
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-approval-request",
+          toolCallId: "call_1",
+          approvalId: "appr-1"
+        })
+      ).toBe(false);
+    });
+
+    it("returns false for tool-approval-request when no existing part matches", () => {
+      const parts = makeParts();
+      expect(
+        isReplayChunk(parts, {
+          type: "tool-approval-request",
+          toolCallId: "call_unknown",
+          approvalId: "appr-1"
+        })
+      ).toBe(false);
+    });
+  });
+});
+
+describe("normalizeToolInput", () => {
+  it("returns a plain object untouched and unchanged", () => {
+    const input = { city: "London" };
+    const result = normalizeToolInput(input);
+    expect(result.input).toBe(input);
+    expect(result.changed).toBe(false);
+  });
+
+  it("parses a stringified-JSON object", () => {
+    const result = normalizeToolInput('{"prompt":"a cat"}');
+    expect(result.input).toEqual({ prompt: "a cat" });
+    expect(result.changed).toBe(true);
+  });
+
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["empty string", ""],
+    ["array", [{ id: 1 }]],
+    ["empty array", []],
+    ["stringified array", "[1,2]"],
+    ["number", 42],
+    ["boolean", true],
+    ["non-JSON string", "hello"],
+    ["unparseable JSON", '{"a":']
+  ])("coerces %s to {} (changed)", (_label, value) => {
+    const result = normalizeToolInput(value);
+    expect(result.input).toEqual({});
+    expect(result.changed).toBe(true);
   });
 });

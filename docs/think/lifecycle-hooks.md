@@ -4,17 +4,18 @@ Think owns the `streamText` call and provides hooks at each stage of the chat tu
 
 ## Hook Summary
 
-| Hook                        | When it fires                                 | Return                     | Async |
-| --------------------------- | --------------------------------------------- | -------------------------- | ----- |
-| `configureSession(session)` | Once during `onStart`                         | `Session`                  | yes   |
-| `beforeTurn(ctx)`           | Before `streamText`                           | `TurnConfig` or void       | yes   |
-| `beforeStep(ctx)`           | Before each model step                        | `StepConfig` or void       | yes   |
-| `beforeToolCall(ctx)`       | When model calls a tool                       | `ToolCallDecision` or void | yes   |
-| `afterToolCall(ctx)`        | After tool execution                          | void                       | yes   |
-| `onStepFinish(ctx)`         | After each step completes                     | void                       | yes   |
-| `onChunk(ctx)`              | Per streaming chunk                           | void                       | yes   |
-| `onChatResponse(result)`    | After turn completes and message is persisted | void                       | yes   |
-| `onChatError(error)`        | On error during a turn                        | error to propagate         | no    |
+| Hook                             | When it fires                                               | Return                            | Async |
+| -------------------------------- | ----------------------------------------------------------- | --------------------------------- | ----- |
+| `configureSession(session)`      | Once during `onStart`                                       | `Session`                         | yes   |
+| `beforeTurn(ctx)`                | Before `streamText`                                         | `TurnConfig` or void              | yes   |
+| `beforeStep(ctx)`                | Before each model step                                      | `StepConfig` or void              | yes   |
+| `beforeToolCall(ctx)`            | When model calls a tool                                     | `ToolCallDecision` or void        | yes   |
+| `afterToolCall(ctx)`             | After tool execution                                        | void                              | yes   |
+| `onStepFinish(ctx)`              | After each step completes                                   | void                              | yes   |
+| `onChunk(ctx)`                   | Per streaming chunk                                         | void                              | yes   |
+| `onChatResponse(result)`         | After turn completes and message is persisted               | void                              | yes   |
+| `onChatError(error, ctx?)`       | On error during a turn                                      | error to propagate                | no    |
+| `classifyChatError(error, ctx?)` | On a turn error, when `contextOverflow.reactive` is enabled | `ChatErrorClassification` or void | no    |
 
 ## Execution Order
 
@@ -80,7 +81,9 @@ export class MyAgent extends Think<Env> {
       .onCompaction(
         createCompactFunction({
           summarize: (prompt) =>
-            generateText({ model: this.getModel(), prompt }).then((r) => r.text)
+            generateText({ model: this.resolveModel(), prompt }).then(
+              (r) => r.text
+            )
         })
       )
       .compactAfter(100_000)
@@ -89,7 +92,7 @@ export class MyAgent extends Think<Env> {
 }
 ```
 
-When `configureSession` adds context blocks, Think builds the system prompt from those blocks instead of using `getSystemPrompt()`. See the [Sessions documentation](../sessions.md) for the full API.
+When `configureSession` adds context blocks, Think builds the system prompt from those blocks instead of using `getSystemPrompt()`. See the [Sessions documentation](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md) for the full API.
 
 ---
 
@@ -108,7 +111,7 @@ beforeTurn(ctx: TurnContext): TurnConfig | void | Promise<TurnConfig | void>
 | `system`       | `string`                  | Assembled system prompt (from context blocks or `getSystemPrompt()`)     |
 | `messages`     | `ModelMessage[]`          | Assembled model messages (truncated)                                     |
 | `tools`        | `ToolSet`                 | Merged tool set (workspace + getTools + session + MCP + client + caller) |
-| `model`        | `LanguageModel`           | The model from `getModel()`                                              |
+| `model`        | `LanguageModel`           | The resolved model (a string from `getModel()` is already resolved here) |
 | `continuation` | `boolean`                 | Whether this is a continuation turn (auto-continue after tool result)    |
 | `body`         | `Record<string, unknown>` | Custom body fields from the client request                               |
 
@@ -116,29 +119,31 @@ beforeTurn(ctx: TurnContext): TurnConfig | void | Promise<TurnConfig | void>
 
 All fields are optional. Return only what you want to change.
 
-| Field              | Type                               | Description                          |
-| ------------------ | ---------------------------------- | ------------------------------------ |
-| `model`            | `LanguageModel`                    | Override the model for this turn     |
-| `system`           | `string`                           | Override the system prompt           |
-| `messages`         | `ModelMessage[]`                   | Override the assembled messages      |
-| `tools`            | `ToolSet`                          | Extra tools to merge (additive)      |
-| `activeTools`      | `string[]`                         | Limit which tools the model can call |
-| `toolChoice`       | `ToolChoice`                       | Force a specific tool call           |
-| `maxSteps`         | `number`                           | Override `maxSteps` for this turn    |
-| `stopWhen`         | `StopCondition \| StopCondition[]` | Additional early-exit conditions     |
-| `sendReasoning`    | `boolean`                          | Send reasoning chunks for this turn  |
-| `maxOutputTokens`  | `number`                           | Maximum tokens to generate           |
-| `temperature`      | `number`                           | Sampling temperature                 |
-| `topP`             | `number`                           | Nucleus sampling value               |
-| `topK`             | `number`                           | Top-K sampling value                 |
-| `presencePenalty`  | `number`                           | Presence penalty                     |
-| `frequencyPenalty` | `number`                           | Frequency penalty                    |
-| `stopSequences`    | `string[]`                         | Stop generation sequences            |
-| `seed`             | `number`                           | Sampling seed when supported         |
-| `maxRetries`       | `number`                           | Maximum retries for this turn        |
-| `timeout`          | `TimeoutConfiguration`             | Timeout for this turn                |
-| `headers`          | `Record<string, string>`           | Additional provider request headers  |
-| `providerOptions`  | `Record<string, unknown>`          | Provider-specific options            |
+| Field                      | Type                                           | Description                                                                                                                                                                       |
+| -------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                    | `ThinkModel`                                   | Override the model for this turn — a model id string or a `LanguageModel`                                                                                                         |
+| `system`                   | `string`                                       | Override the system prompt                                                                                                                                                        |
+| `messages`                 | `ModelMessage[]`                               | Override the assembled messages                                                                                                                                                   |
+| `tools`                    | `ToolSet`                                      | Extra tools to merge (additive)                                                                                                                                                   |
+| `activeTools`              | `string[]`                                     | Limit which tools the model can call                                                                                                                                              |
+| `toolChoice`               | `ToolChoice`                                   | Force a specific tool call                                                                                                                                                        |
+| `maxSteps`                 | `number`                                       | Override `maxSteps` for this turn                                                                                                                                                 |
+| `stopWhen`                 | `StopCondition \| StopCondition[]`             | Additional early-exit conditions                                                                                                                                                  |
+| `sendReasoning`            | `boolean`                                      | Send reasoning chunks for this turn                                                                                                                                               |
+| `maxOutputTokens`          | `number`                                       | Maximum tokens to generate                                                                                                                                                        |
+| `temperature`              | `number`                                       | Sampling temperature                                                                                                                                                              |
+| `topP`                     | `number`                                       | Nucleus sampling value                                                                                                                                                            |
+| `topK`                     | `number`                                       | Top-K sampling value                                                                                                                                                              |
+| `presencePenalty`          | `number`                                       | Presence penalty                                                                                                                                                                  |
+| `frequencyPenalty`         | `number`                                       | Frequency penalty                                                                                                                                                                 |
+| `stopSequences`            | `string[]`                                     | Stop generation sequences                                                                                                                                                         |
+| `seed`                     | `number`                                       | Sampling seed when supported                                                                                                                                                      |
+| `maxRetries`               | `number`                                       | Maximum retries for this turn                                                                                                                                                     |
+| `timeout`                  | `TimeoutConfiguration`                         | Timeout for this turn                                                                                                                                                             |
+| `chatStreamStallTimeoutMs` | `number`                                       | Override the stream-stall watchdog for this turn (`0` disables it); auto-resets after the turn. Useful for a turn with a known-slow tool — see [Think configuration](./index.md). |
+| `headers`                  | `Record<string, string>`                       | Additional provider request headers                                                                                                                                               |
+| `providerOptions`          | `Record<string, unknown>`                      | Provider-specific options                                                                                                                                                         |
+| `experimental_transform`   | `StreamTextTransform \| StreamTextTransform[]` | AI SDK stream transform(s) for this turn — inspect or rewrite stream parts (for example, emit `source` parts derived from tool results). Applied in order.                        |
 
 ### Examples
 
@@ -311,15 +316,15 @@ onStepFinish(step 1)
 
 `StepConfig<TOOLS>` is the AI SDK's `PrepareStepResult<TOOLS>`. Return only the fields to override for the current step.
 
-| Field                  | Type                                                   | Description                                                 |
-| ---------------------- | ------------------------------------------------------ | ----------------------------------------------------------- |
-| `model`                | `LanguageModel`                                        | Override the model for this step                            |
-| `toolChoice`           | `ToolChoice<TOOLS>`                                    | Force or disable tool calling for this step                 |
-| `activeTools`          | `Array<keyof TOOLS>`                                   | Limit which tools are available for this step               |
-| `system`               | `string \| SystemModelMessage \| SystemModelMessage[]` | Override the system message for this step                   |
-| `messages`             | `ModelMessage[]`                                       | Override the full message list for this step                |
-| `experimental_context` | `unknown`                                              | Override context passed to tool execution from this step on |
-| `providerOptions`      | `ProviderOptions`                                      | Provider-specific options for this step                     |
+| Field                  | Type                                                   | Description                                                               |
+| ---------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| `model`                | `ThinkModel`                                           | Override the model for this step — a model id string or a `LanguageModel` |
+| `toolChoice`           | `ToolChoice<TOOLS>`                                    | Force or disable tool calling for this step                               |
+| `activeTools`          | `Array<keyof TOOLS>`                                   | Limit which tools are available for this step                             |
+| `system`               | `string \| SystemModelMessage \| SystemModelMessage[]` | Override the system message for this step                                 |
+| `messages`             | `ModelMessage[]`                                       | Override the full message list for this step                              |
+| `experimental_context` | `unknown`                                              | Override context passed to tool execution from this step on               |
+| `providerOptions`      | `ProviderOptions`                                      | Provider-specific options for this step                                   |
 
 ### Examples
 
@@ -474,7 +479,8 @@ beforeToolCall(ctx: ToolCallContext): ToolCallDecision | void {
 - **Substituted input is not re-validated.** The AI SDK validates the model's emitted input against the tool's `inputSchema` _before_ `execute` runs. When `beforeToolCall` returns `{ action: "allow", input: ... }`, that substituted input is passed straight through to `execute` without going through the schema again. If you substitute, ensure the shape stays valid for the tool you're calling.
 - **`stepNumber` is `undefined` in `ToolCallContext`.** The AI SDK's `ToolExecutionOptions` doesn't expose the current step index. The same field _is_ populated on `ToolCallResultContext` (sourced from `experimental_onToolCallFinish`).
 - **Throwing from `beforeToolCall`** propagates as a tool error — the AI SDK records it in the same way it would record an `execute` failure, and `afterToolCall` fires with `success: false, error: ...`.
-- **Streaming tools (AsyncIterable returns).** The AI SDK supports tools whose `execute` returns `AsyncIterable<output>` to emit preliminary results before a final value. This works regardless of whether the iterator is returned directly (`function execute(...) { return makeIter(); }`, `async function* execute(...) { … }`) or wrapped in a Promise (`async function execute(...) { return makeIter(); }`). Because Think's wrapper must `await beforeToolCall` first, preliminary chunks are collapsed — only the final yielded value reaches the model. If you need true preliminary streaming, override `getTools()` to provide such tools and avoid using `beforeToolCall` for them.
+- **Streaming tools (AsyncIterable returns).** The AI SDK supports tools whose `execute` returns `AsyncIterable<output>` to emit preliminary results before a final value. The canonical form is an async generator (`async function* execute(...) { … }`). Think preserves preliminary streaming for that form even through `beforeToolCall`: each yielded value reaches the model as a `preliminary` tool-result, and the last as the final value. The non-canonical `async function execute(...) { return makeIter(); }` form returns a `Promise<AsyncIterable>`, which does not stream even in the raw AI SDK — Think collapses it to the last yielded value. Use an `async function*` `execute` if you need preliminary streaming.
+- **Blocking/substituting an `async function*` tool emits one `preliminary` chunk.** To keep an `async function*` tool streaming through `beforeToolCall`, its wrapper must commit to an `AsyncIterable` shape synchronously — before the (async) decision is known. The AI SDK turns every value sent through that iterable into a `preliminary` tool-result plus a `final`, so a `block`/`substitute` outcome surfaces one extra `preliminary: true` chunk to observers like `onChunk` (a scalar-`execute` tool never does). The model-visible final output is identical and correct; this only affects observation hooks for the narrow case of blocking/substituting a streaming tool, and it matches how any streaming tool that emits a single value already behaves.
 - **Hook order:** `beforeToolCall` (subclass) → extension `beforeToolCall` dispatch → original `execute` (or `block`/`substitute` short-circuit) → AI SDK records the outcome → `afterToolCall` (subclass) → extension `afterToolCall` dispatch.
 
 ---
@@ -491,19 +497,29 @@ afterToolCall(ctx: ToolCallResultContext): void | Promise<void>
 
 `ToolCallResultContext<TOOLS>` is backed by the AI SDK's `OnToolCallFinishEvent<TOOLS>` (the parameter of `experimental_onToolCallFinish`). It spreads the originating `TypedToolCall<TOOLS>` at the top level, plus the per-call event extras and a discriminated outcome:
 
-| Field        | Type                                  | Description                                          |
-| ------------ | ------------------------------------- | ---------------------------------------------------- |
-| `type`       | `"tool-call"`                         | Discriminator (carried over from the call)           |
-| `toolCallId` | `string`                              | Unique id matching the originating `ToolCallContext` |
-| `toolName`   | `string`                              | Name of the tool that was called                     |
-| `input`      | typed when `TOOLS` is passed          | Arguments the tool was called with                   |
-| `dynamic?`   | `boolean`                             | `true` for runtime-registered tools                  |
-| `stepNumber` | `number \| undefined`                 | Index of the current step                            |
-| `messages`   | `ReadonlyArray<ModelMessage>`         | Conversation messages visible at tool execution time |
-| `durationMs` | `number`                              | Wall-clock execution time of `execute`               |
-| `success`    | `boolean`                             | Discriminator: `true` on success, `false` on failure |
-| `output`     | `unknown` (when `success` is `true`)  | Whatever the tool's `execute` returned               |
-| `error`      | `unknown` (when `success` is `false`) | Whatever was thrown from `execute`                   |
+| Field        | Type                                      | Description                                          |
+| ------------ | ----------------------------------------- | ---------------------------------------------------- |
+| `type`       | `"tool-call"`                             | Discriminator (carried over from the call)           |
+| `toolCallId` | `string`                                  | Unique id matching the originating `ToolCallContext` |
+| `toolName`   | `string`                                  | Name of the tool that was called                     |
+| `input`      | typed when `TOOLS` is passed              | Arguments the tool was called with                   |
+| `dynamic?`   | `boolean`                                 | `true` for runtime-registered tools                  |
+| `stepNumber` | `number \| undefined`                     | Index of the current step                            |
+| `messages`   | `ReadonlyArray<ModelMessage>`             | Conversation messages visible at tool execution time |
+| `durationMs` | `number`                                  | Wall-clock execution time of `execute`               |
+| `success`    | `boolean`                                 | Discriminator: `true` on success, `false` on failure |
+| `output`     | typed per tool (when `success` is `true`) | Whatever the tool's `execute` returned               |
+| `error`      | `unknown` (when `success` is `false`)     | Whatever was thrown from `execute`                   |
+
+When you pass an explicit `TOOLS` generic, narrowing on `ctx.toolName` (together with `ctx.success`) narrows `ctx.output` to that tool's inferred output type. Dynamic tools (runtime-registered, MCP) stay `unknown`:
+
+```typescript
+afterToolCall(ctx: ToolCallResultContext<typeof tools>) {
+  if (ctx.toolName === "search" && ctx.success) {
+    ctx.output.results; // typed as the `search` tool's output
+  }
+}
+```
 
 ### Example
 
@@ -706,22 +722,78 @@ async onChatResponse(result: ChatResponseResult) {
 
 ## onChatError
 
-Called when an error occurs during a chat turn. Return the error to propagate it, or return a different error.
+Called when an error occurs during a chat turn. Return the error to propagate it, or return a different error. The optional context describes where the failure happened and whether user messages were already persisted.
 
 ```typescript
-onChatError(error: unknown): unknown
+onChatError(error: unknown, ctx?: ChatErrorContext): unknown
 ```
 
 The partial assistant message (if any) is persisted before this hook fires.
+
+`ChatErrorContext` includes:
+
+| Field               | Type                                                                       | Description                                                                                                                                                                     |
+| ------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requestId`         | `string \| undefined`                                                      | Chat request ID, when available                                                                                                                                                 |
+| `stage`             | `"parse" \| "persist" \| "turn" \| "stream" \| "recovery" \| "transcript"` | Failure stage                                                                                                                                                                   |
+| `messagesPersisted` | `boolean`                                                                  | Whether incoming user messages were already stored                                                                                                                              |
+| `classification`    | `ChatErrorClassification \| undefined`                                     | Set to `"context_overflow"` on the terminal `onChatError` when a context overflow could not be recovered (see [`classifyChatError`](#classifychaterror)); `undefined` otherwise |
+
+Think also emits `chat:request:failed` on the `agents:chat` observability channel with the same stage and persistence information.
 
 ### Example
 
 Log and transform errors:
 
 ```typescript
-onChatError(error: unknown) {
-  console.error("Chat turn failed:", error);
+onChatError(error: unknown, ctx?: ChatErrorContext) {
+  console.error("Chat turn failed:", ctx?.stage, error);
+  if (ctx?.classification === "context_overflow") {
+    return new Error("This conversation is too long to continue. Please start a new one.");
+  }
   return new Error("Something went wrong. Please try again.");
+}
+```
+
+---
+
+## classifyChatError
+
+Called when an error occurs during a turn, **before** `onChatError`. Maps a raw provider error into a provider-agnostic category so Think can react without baking provider-specific strings into the framework — the same split as the `tokenCounter` you pass to `compactAfter()`. The app owns the mapping because it knows which provider and model it talks to.
+
+```typescript
+classifyChatError(error: unknown, ctx?: ChatErrorContext): ChatErrorClassification | void
+```
+
+`ChatErrorClassification` is `"context_overflow" | "rate_limit" | "transient" | "fatal" | "unknown"`. Today this hook drives **only** context-overflow recovery: Think calls it when a turn errors **and** `contextOverflow.reactive` is enabled (if reactive is off, it is not called). Returning `"context_overflow"` runs the compact-and-retry backstop (see [Context-window overflow recovery](./index.md#context-window-overflow-recovery)); if recovery cannot save the turn, that classification is surfaced on the terminal `onChatError` call via `ChatErrorContext.classification`. The other categories are reserved for future use — returning one today is a no-op (the turn terminalizes as usual) and is not forwarded to `onChatError`. Returning `void` (the default) keeps the existing terminal behavior.
+
+The argument may be an `Error`, an AI SDK `APICallError` (with `statusCode`/`responseBody`), or — for in-stream provider errors that surface as a stream error part rather than a throw — the error message string. Narrow accordingly. (Think confirms provider context-overflow errors always surface as in-stream error parts, never thrown exceptions out of `streamText`, so this hook sees them whether you read the `Error` or the string form.)
+
+The second argument is a [`ChatErrorContext`](#onchaterror): when consulted for overflow recovery it is `{ stage: "stream", requestId }`, so a classifier can correlate the error with the in-flight turn — for example to call [`cancelChat(requestId)`](./index.md) and bail out of recovery.
+
+### Example
+
+For the common case, assign the bundled `defaultContextOverflowClassifier`, which matches the context-overflow errors of Anthropic, OpenAI, Google, Bedrock, and others:
+
+```typescript
+import { Think, defaultContextOverflowClassifier } from "@cloudflare/think";
+
+export class MyAgent extends Think<Env> {
+  override classifyChatError = defaultContextOverflowClassifier;
+}
+```
+
+Or write your own, optionally delegating to the bundled classifier:
+
+```typescript
+import type { ChatErrorClassification } from "@cloudflare/think";
+import { defaultContextOverflowClassifier } from "@cloudflare/think";
+
+classifyChatError(error: unknown): ChatErrorClassification | void {
+  if (error instanceof Error && /rate.?limit/i.test(error.message)) {
+    return "rate_limit";
+  }
+  return defaultContextOverflowClassifier(error);
 }
 ```
 

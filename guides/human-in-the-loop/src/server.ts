@@ -1,7 +1,7 @@
 import { createWorkersAI } from "workers-ai-provider";
 import { routeAgentRequest } from "agents";
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import { convertToModelMessages, streamText, stepCountIs } from "ai";
+import { convertToModelMessages, streamText, isStepCount } from "ai";
 import { tools } from "./tools";
 
 export class HumanInTheLoop extends AIChatAgent {
@@ -16,11 +16,11 @@ export class HumanInTheLoop extends AIChatAgent {
 
     const result = streamText({
       messages: await convertToModelMessages(this.messages),
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
       tools,
-      stopWhen: stepCountIs(5)
+      stopWhen: isStepCount(5)
     });
 
     return result.toUIMessageStreamResponse({

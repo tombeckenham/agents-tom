@@ -3,7 +3,7 @@ import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { createWorkersAI } from "workers-ai-provider";
-import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import { streamText, convertToModelMessages, isStepCount } from "ai";
 import { routeAgentRequest } from "agents";
 
 type State = { counter: number };
@@ -59,13 +59,13 @@ export class Chat extends AIChatAgent<Env> {
     const allTools = this.mcp.getAITools();
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: `You are a helpful assistant. The current date and time is ${new Date().toISOString()}.\n`,
+      instructions: `You are a helpful assistant. The current date and time is ${new Date().toISOString()}.\n`,
       messages: await convertToModelMessages(this.messages),
       tools: allTools,
-      stopWhen: stepCountIs(10)
+      stopWhen: isStepCount(10)
     });
 
     return result.toUIMessageStreamResponse();

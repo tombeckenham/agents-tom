@@ -6,6 +6,7 @@ An Agent that acts as an MCP **client** — dynamically connects to remote MCP s
 
 - **`addMcpServer` / `removeMcpServer`** — managing MCP server connections from an Agent
 - **`onMcpUpdate`** — real-time state updates pushed to the React frontend via WebSocket
+- **`this.mcp.configureElicitationHandlers`** — handles both Stateless Elicitation (`input_required` through MRTR) and Legacy Elicitation (pushed `elicitation/create`); the Agent broadcasts requests to the browser and the human's answer resolves the pending operation via a `@callable` method
 - **OAuth popup flow** — `configureOAuthCallback` with a custom handler that closes the popup after auth
 - **`agentFetch`** — making HTTP requests to the Agent's custom endpoints from the client
 
@@ -13,12 +14,12 @@ An Agent that acts as an MCP **client** — dynamically connects to remote MCP s
 
 ```sh
 npm install
-npm run dev
+npm run start
 ```
 
-The UI lets you add MCP server URLs, see their connection state, and browse their tools, prompts, and resources.
+The UI lets you add MCP server URLs, see their connection state, browse their tools, prompts, and resources, and run tools. If a tool call triggers an elicitation, a card appears asking for your input.
 
-To test with an authenticated server, run the [`mcp-worker-authenticated`](../mcp-worker-authenticated/) example alongside this one and add its URL.
+To test with an authenticated server, run [`mcp-worker-authenticated`](../mcp-worker-authenticated/) alongside this example and add its URL. For **Stateless Elicitation**, run [`mcp-elicitation-mrtr`](../mcp-elicitation-mrtr/) and call `increase-counter`. To test pushed form- and URL-mode **Legacy Elicitation**, run [`mcp-elicitation`](../mcp-elicitation/). Each endpoint is `/mcp` (for example, `http://localhost:8787/mcp`).
 
 ## Environment variables
 

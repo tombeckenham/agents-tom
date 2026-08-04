@@ -3,6 +3,7 @@ import type { UIMessage } from "ai";
 import {
   reconcileMessages,
   resolveToolMergeId,
+  reconcileOrphanPartial,
   assistantContentKey
 } from "../message-reconciler";
 
@@ -96,6 +97,86 @@ describe("reconcileMessages — tool output merge", () => {
       "output-available"
     );
     expect((result[0].parts[0] as Record<string, unknown>).output).toBe("done");
+  });
+
+  it("merges a server output-error over a stale client input-available", () => {
+    const server: ChatMessage[] = [
+      {
+        id: "srv-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-calc",
+            toolCallId: "tc1",
+            toolName: "calc",
+            state: "output-error",
+            errorText: "Tool blew up"
+          } as unknown as ChatMessage["parts"][number]
+        ]
+      } as ChatMessage
+    ];
+    const client = [
+      toolAssistantMsg("srv-1", "tc1", "input-available", { input: { x: 1 } })
+    ];
+    const result = reconcileMessages(client, server);
+    const part = result[0].parts[0] as Record<string, unknown>;
+    // The server's terminal error must not be clobbered back to input-available.
+    expect(part.state).toBe("output-error");
+    expect(part.errorText).toBe("Tool blew up");
+  });
+
+  it("merges a server output-denied over a stale client input-available", () => {
+    const server: ChatMessage[] = [
+      {
+        id: "srv-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-calc",
+            toolCallId: "tc1",
+            toolName: "calc",
+            state: "output-denied",
+            approval: { id: "a1", approved: false, reason: "nope" }
+          } as unknown as ChatMessage["parts"][number]
+        ]
+      } as ChatMessage
+    ];
+    const client = [
+      toolAssistantMsg("srv-1", "tc1", "approval-requested", { input: {} })
+    ];
+    const result = reconcileMessages(client, server);
+    const part = result[0].parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("output-denied");
+    expect((part.approval as Record<string, unknown>).approved).toBe(false);
+  });
+
+  it("does not carry a stray server output onto an output-error part", () => {
+    const server: ChatMessage[] = [
+      {
+        id: "srv-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-calc",
+            toolCallId: "tc1",
+            toolName: "calc",
+            state: "output-error",
+            errorText: "boom",
+            // A stray leftover output alongside the error state.
+            output: "partial"
+          } as unknown as ChatMessage["parts"][number]
+        ]
+      } as ChatMessage
+    ];
+    const client = [
+      toolAssistantMsg("srv-1", "tc1", "input-available", { input: {} })
+    ];
+    const result = reconcileMessages(client, server);
+    const part = result[0].parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("output-error");
+    expect(part.errorText).toBe("boom");
+    // Only the field matching the terminal state is carried over.
+    expect("output" in part).toBe(false);
   });
 
   it("passes through when no server tool outputs exist", () => {
@@ -415,5 +496,98 @@ describe("assistantContentKey", () => {
     const a = assistantMsg("a1", "Yes");
     const b = assistantMsg("a2", "No");
     expect(assistantContentKey(a)).not.toBe(assistantContentKey(b));
+  });
+});
+
+// ── reconcileOrphanPartial ────────────────────────────────────────
+
+describe("reconcileOrphanPartial — orphan-persist (c) merge", () => {
+  it("appends new parts to the existing message", () => {
+    const existing = assistantMsg("a1", "Hello");
+    const incoming = assistantMsg("a1", "Hello", {
+      parts: [
+        { type: "text", text: "Hello" } as ChatMessage["parts"][number],
+        { type: "text", text: " world" } as ChatMessage["parts"][number]
+      ]
+    });
+    const result = reconcileOrphanPartial(existing, incoming);
+    expect(result.parts).toEqual([
+      { type: "text", text: "Hello" },
+      { type: "text", text: "Hello" },
+      { type: "text", text: " world" }
+    ]);
+  });
+
+  it("keeps the existing (result-bearing) tool part over a replayed duplicate", () => {
+    // Early persist applied a client tool result IN PLACE; the replayed chunk
+    // reconstructs the same toolCallId WITHOUT that result. The existing part
+    // must survive and the duplicate must not be re-appended.
+    const existing = toolAssistantMsg("a1", "tc1", "output-available", {
+      output: "settled"
+    });
+    const incoming = toolAssistantMsg("a1", "tc1", "input-available", {
+      input: { x: 1 }
+    });
+    const result = reconcileOrphanPartial(existing, incoming);
+    expect(result.parts).toHaveLength(1);
+    const part = result.parts[0] as Record<string, unknown>;
+    expect(part.state).toBe("output-available");
+    expect(part.output).toBe("settled");
+  });
+
+  it("appends a reconstructed tool part with a new toolCallId", () => {
+    const existing = toolAssistantMsg("a1", "tc1", "output-available", {
+      output: "done"
+    });
+    const incoming: ChatMessage = {
+      id: "a1",
+      role: "assistant",
+      parts: [
+        ...toolAssistantMsg("a1", "tc1", "input-available").parts,
+        ...toolAssistantMsg("a1", "tc2", "input-available").parts
+      ]
+    } as ChatMessage;
+    const result = reconcileOrphanPartial(existing, incoming);
+    const callIds = result.parts.map(
+      (p) => (p as Record<string, unknown>).toolCallId
+    );
+    expect(callIds).toEqual(["tc1", "tc2"]);
+  });
+
+  it("carries the incoming id and role", () => {
+    const existing = assistantMsg("server-id", "hi");
+    const incoming = assistantMsg("server-id", "hi there");
+    const result = reconcileOrphanPartial(existing, incoming);
+    expect(result.id).toBe("server-id");
+    expect(result.role).toBe("assistant");
+  });
+
+  it("overlays incoming metadata onto existing (incoming wins)", () => {
+    const existing = assistantMsg("a1", "hi", {
+      metadata: { a: 1, b: 1 } as ChatMessage["metadata"]
+    });
+    const incoming = assistantMsg("a1", "hi", {
+      metadata: { b: 2, c: 3 } as ChatMessage["metadata"]
+    });
+    const result = reconcileOrphanPartial(existing, incoming);
+    expect(result.metadata).toEqual({ a: 1, b: 2, c: 3 });
+  });
+
+  it("falls back to existing metadata when incoming has none", () => {
+    const existing = assistantMsg("a1", "hi", {
+      metadata: { a: 1 } as ChatMessage["metadata"]
+    });
+    const incoming = assistantMsg("a1", "hi");
+    const result = reconcileOrphanPartial(existing, incoming);
+    expect(result.metadata).toEqual({ a: 1 });
+  });
+
+  it("does not mutate the incoming message", () => {
+    const existing = assistantMsg("a1", "a");
+    const incoming = assistantMsg("a1", "b");
+    const incomingPartsRef = incoming.parts;
+    reconcileOrphanPartial(existing, incoming);
+    expect(incoming.parts).toBe(incomingPartsRef);
+    expect(incoming.parts).toHaveLength(1);
   });
 });

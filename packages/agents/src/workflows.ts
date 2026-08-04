@@ -34,7 +34,11 @@
  */
 
 import { WorkflowEntrypoint } from "cloudflare:workers";
-import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
+import type {
+  WorkflowEvent,
+  WorkflowStep,
+  WorkflowStepEvent
+} from "cloudflare:workers";
 import { getAgentByName, type Agent } from "./index";
 import type {
   AgentWorkflowParams,
@@ -44,6 +48,19 @@ import type {
   WaitForApprovalOptions
 } from "./workflow-types";
 import { WorkflowRejectedError } from "./workflow-types";
+import type {
+  AgentWorkflowOrigin,
+  AgentWorkflowPathStep
+} from "./workflow-types";
+import { isInternalJsStubProp } from "./utils";
+
+type AgentPathInvoker = {
+  _cf_invokeAgentPath(
+    path: ReadonlyArray<AgentWorkflowPathStep>,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown>;
+};
 
 /**
  * WeakSet to track which prototypes have been wrapped.
@@ -69,7 +86,7 @@ export class AgentWorkflow<
    * The Agent stub - initialized before run() is called.
    * Use this.agent to access the Agent's RPC methods.
    */
-  private _agent!: DurableObjectStub<AgentType>;
+  private _agent?: DurableObjectStub<AgentType>;
 
   /**
    * Workflow instance ID
@@ -120,46 +137,53 @@ export class AgentWorkflow<
         // Instance-level guard: only init once per instance
         // (prevents double init if super.run() is called from a subclass)
         if (!this.__agentInitCalled) {
-          const { __agentName, __agentBinding, __workflowName, ...userParams } =
-            event.payload;
+          const {
+            __agentName,
+            __agentBinding,
+            __workflowName,
+            __agentOrigin,
+            ...userParams
+          } = event.payload;
 
           // Initialize agent connection
           await this._initAgent(
             __agentName,
             __agentBinding,
             __workflowName,
+            __agentOrigin,
             event.instanceId
           );
           this.__agentInitCalled = true;
 
-          // Pass cleaned event and wrapped step to user's implementation
-          const cleanedEvent = {
-            ...event,
-            payload: userParams as Params
-          } as WorkflowEvent<Params>;
-
-          const wrappedStep = this._wrapStep(step);
-
           try {
-            return await originalRun.call(this, cleanedEvent, wrappedStep);
-          } catch (err) {
-            await this._autoReportError(err);
-            throw err;
+            // Pass cleaned event and wrapped step to user's implementation
+            const cleanedEvent = {
+              ...event,
+              payload: userParams as Params
+            } as WorkflowEvent<Params>;
+
+            const wrappedStep = this.extendStep(
+              this._wrapStep(step),
+              cleanedEvent
+            );
+
+            return await this._runWithErrorReporting(
+              originalRun,
+              cleanedEvent,
+              wrappedStep
+            );
+          } finally {
+            this._disposeAgent();
           }
         }
 
         // If already initialized (e.g., called via super.run()),
-        // just call the original with the event as-is
-        try {
-          return await originalRun.call(
-            this,
-            event as WorkflowEvent<Params>,
-            step as AgentWorkflowStep
-          );
-        } catch (err) {
-          await this._autoReportError(err);
-          throw err;
-        }
+        // just call the original with the event as-is.
+        return await this._runWithErrorReporting(
+          originalRun,
+          event as WorkflowEvent<Params>,
+          step as AgentWorkflowStep
+        );
       };
 
       wrappedPrototypes.add(proto);
@@ -174,9 +198,10 @@ export class AgentWorkflow<
     agentName: string | undefined,
     agentBinding: string | undefined,
     workflowName: string | undefined,
+    agentOrigin: AgentWorkflowOrigin | undefined,
     instanceId: string
   ): Promise<void> {
-    if (!agentName || !agentBinding || !workflowName) {
+    if (!workflowName || (!agentOrigin && (!agentName || !agentBinding))) {
       throw new Error(
         "AgentWorkflow requires __agentName, __agentBinding, and __workflowName in params. " +
           "Use agent.runWorkflow() to start workflows with proper agent context."
@@ -185,23 +210,124 @@ export class AgentWorkflow<
 
     this._workflowId = instanceId;
     this._workflowName = workflowName;
+    this._errorReported = false;
+
+    // The origin payload is durably persisted in workflow params, so a workflow
+    // started by an older SDK can resume against newer code (and vice versa).
+    // Reject origin versions this build does not understand rather than
+    // silently misreading a future shape.
+    if (agentOrigin && agentOrigin.version !== 1) {
+      throw new Error(
+        `AgentWorkflow received an unsupported origin version (${
+          (agentOrigin as { version?: unknown }).version
+        }). Upgrade the "agents" package running this Workflow to match the Agent that started it.`
+      );
+    }
+
+    if (agentOrigin?.kind === "facet") {
+      this._agent = await this._initFacetAgent(agentOrigin);
+      return;
+    }
+
+    const resolvedAgentName =
+      agentOrigin?.kind === "agent" ? agentOrigin.name : agentName;
+    const resolvedAgentBinding =
+      agentOrigin?.kind === "agent" ? agentOrigin.binding : agentBinding;
+
+    if (!resolvedAgentName || !resolvedAgentBinding) {
+      throw new Error(
+        "AgentWorkflow requires a valid Agent origin. Use agent.runWorkflow() to start workflows with proper agent context."
+      );
+    }
 
     // Get the Agent namespace from env
     const namespace = (this.env as Record<string, unknown>)[
-      agentBinding
+      resolvedAgentBinding
     ] as DurableObjectNamespace<AgentType>;
 
     if (!namespace) {
       throw new Error(
-        `Agent binding '${agentBinding}' not found in environment`
+        `Agent binding '${resolvedAgentBinding}' not found in environment`
       );
     }
 
     // Get the Agent stub by name
     this._agent = await getAgentByName<Cloudflare.Env, AgentType>(
       namespace,
-      agentName
+      resolvedAgentName
     );
+  }
+
+  private async _initFacetAgent(
+    origin: Extract<AgentWorkflowOrigin, { kind: "facet" }>
+  ): Promise<DurableObjectStub<AgentType>> {
+    const root = origin.path[0];
+    if (!root) {
+      throw new Error("AgentWorkflow facet origin requires a non-empty path");
+    }
+
+    const namespace = (this.env as Record<string, unknown>)[
+      origin.rootBinding
+    ] as DurableObjectNamespace<Agent> | undefined;
+
+    if (!namespace) {
+      throw new Error(
+        `Agent binding '${origin.rootBinding}' not found in environment`
+      );
+    }
+
+    const rootAgent = (await getAgentByName<Cloudflare.Env, Agent>(
+      namespace,
+      root.name
+    )) as unknown as AgentPathInvoker;
+
+    return new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (isInternalJsStubProp(prop)) return undefined;
+          if (typeof prop !== "string") return undefined;
+          if (prop === "fetch") {
+            return () => {
+              throw new Error(
+                "AgentWorkflow.agent for sub-agent origins is an RPC-only stub — .fetch() is not supported. Use routeSubAgentRequest() or the /agents/{parent}/{name}/sub/{child}/{name} URL for external HTTP/WS routing."
+              );
+            };
+          }
+          return async (...args: unknown[]) =>
+            rootAgent._cf_invokeAgentPath(origin.path, prop, args);
+        }
+      }
+    ) as DurableObjectStub<AgentType>;
+  }
+
+  /**
+   * Call user workflow code and report unhandled errors to the Agent.
+   */
+  private async _runWithErrorReporting(
+    originalRun: (
+      event: WorkflowEvent<Params>,
+      step: AgentWorkflowStep
+    ) => Promise<unknown>,
+    event: WorkflowEvent<Params>,
+    step: AgentWorkflowStep
+  ): Promise<unknown> {
+    try {
+      return await originalRun.call(this, event, step);
+    } catch (err) {
+      await this._autoReportError(err);
+      throw err;
+    }
+  }
+
+  /**
+   * Dispose the Agent stub owned by this workflow run.
+   */
+  private _disposeAgent(): void {
+    const agent = this._agent;
+    this._agent = undefined;
+    this.__agentInitCalled = false;
+    disposeIfPresent(agent);
   }
 
   /**
@@ -278,6 +404,19 @@ export class AgentWorkflow<
     };
 
     return wrappedStep;
+  }
+
+  /**
+   * Extend the Agent-aware workflow step before user code receives it.
+   *
+   * Subclasses can override this to add framework-specific step helpers while
+   * preserving the underlying WorkflowStep object identity.
+   */
+  protected extendStep(
+    step: AgentWorkflowStep,
+    _event: WorkflowEvent<Params>
+  ): AgentWorkflowStep {
+    return step;
   }
 
   /**
@@ -409,27 +548,49 @@ export class AgentWorkflow<
 
     // Wait for the approval event
     // Note: Call reportProgress() before this method if you want to update progress
-    const event = await step.waitForEvent(stepName, {
+    const event = (await step.waitForEvent(stepName, {
       type: eventType,
       timeout
-    });
-
-    // Cast the payload to our expected type
-    const payload = event.payload as {
+    })) as WorkflowStepEvent<{
       approved: boolean;
       reason?: string;
       metadata?: T;
-    };
+    }>;
 
-    // Check if rejected
-    if (!payload.approved) {
-      const reason = payload.reason;
-      await step.reportError(reason ?? "Workflow rejected");
-      throw new WorkflowRejectedError(reason, this._workflowId);
+    try {
+      const payload = event.payload;
+
+      // Check if rejected
+      if (!payload.approved) {
+        const reason = payload.reason;
+        await step.reportError(reason ?? "Workflow rejected");
+        throw new WorkflowRejectedError(reason, this._workflowId);
+      }
+
+      // Return the approval metadata as the result
+      return payload.metadata as T;
+    } finally {
+      disposeIfPresent(event);
     }
+  }
+}
 
-    // Return the approval metadata as the result
-    return payload.metadata as T;
+type DisposableResource = {
+  [Symbol.dispose](): void;
+};
+
+function isDisposableResource(value: unknown): value is DisposableResource {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    Symbol.dispose in value &&
+    typeof value[Symbol.dispose] === "function"
+  );
+}
+
+function disposeIfPresent(value: unknown): void {
+  if (isDisposableResource(value)) {
+    value[Symbol.dispose]();
   }
 }
 

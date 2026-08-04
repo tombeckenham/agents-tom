@@ -7,7 +7,7 @@
  */
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import worker from "./worker";
 
 // --- Helpers ---
@@ -56,6 +56,14 @@ function uniquePath() {
   return `/agents/test-voice-agent/voice-test-${++instanceCounter}`;
 }
 
+function uniqueAISDKStreamPath() {
+  return `/agents/test-ai-sdk-full-stream-voice-agent/voice-test-${++instanceCounter}`;
+}
+
+function uniqueAISDKTextStreamPath() {
+  return `/agents/test-ai-sdk-text-stream-voice-agent/voice-test-${++instanceCounter}`;
+}
+
 function waitForStatus(ws: WebSocket, status: string) {
   return waitForMessageMatching(
     ws,
@@ -75,6 +83,125 @@ function waitForType(ws: WebSocket, type: string) {
       m !== null &&
       (m as Record<string, unknown>).type === type
   );
+}
+
+async function waitForAck(ws: WebSocket, command: string): Promise<void> {
+  await waitForMessageMatching(
+    ws,
+    (m) =>
+      typeof m === "object" &&
+      m !== null &&
+      (m as Record<string, unknown>).type === "_ack" &&
+      (m as Record<string, unknown>).command === command
+  );
+}
+
+async function setTranscriberMode(
+  ws: WebSocket,
+  value:
+    | "default"
+    | "missing"
+    | "pending_ready"
+    | "pending_ready_no_close_settle"
+    | "reject_ready"
+    | "create_throw"
+): Promise<void> {
+  sendJSON(ws, { type: "_set_transcriber_mode", value });
+  await waitForAck(ws, "_set_transcriber_mode");
+}
+
+async function setBeforeCallStart(
+  ws: WebSocket,
+  value: boolean | "throw"
+): Promise<void> {
+  sendJSON(ws, { type: "_set_before_call_start", value });
+  await waitForAck(ws, "_set_before_call_start");
+}
+
+async function setKeepAliveThrow(ws: WebSocket, value: boolean): Promise<void> {
+  sendJSON(ws, { type: "_set_keep_alive_throw", value });
+  await waitForAck(ws, "_set_keep_alive_throw");
+}
+
+async function waitForMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function waitForBinary(ws: WebSocket, timeout = 5000): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      settled = true;
+      clearTimeout(timer);
+      ws.removeEventListener("message", handler);
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timeout waiting for binary message"));
+    }, timeout);
+    const handler = (e: MessageEvent) => {
+      void toArrayBuffer(e.data).then(
+        (buffer) => {
+          if (settled || !buffer) return;
+          cleanup();
+          resolve(buffer);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          cleanup();
+          reject(error);
+        }
+      );
+    };
+    ws.addEventListener("message", handler);
+  });
+}
+
+async function toArrayBuffer(data: unknown): Promise<ArrayBuffer | null> {
+  if (data instanceof ArrayBuffer) return data;
+
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView;
+    return new Uint8Array(view.buffer, view.byteOffset, view.byteLength).slice()
+      .buffer as ArrayBuffer;
+  }
+
+  if (data instanceof Blob) return data.arrayBuffer();
+
+  return null;
+}
+
+function decodeAudio(buffer: ArrayBuffer): string {
+  return String.fromCharCode(...new Uint8Array(buffer));
+}
+
+function collectMessagesUntil(
+  ws: WebSocket,
+  predicate: (msg: Record<string, unknown>) => boolean,
+  timeout = 5000
+): Promise<Record<string, unknown>[]> {
+  return new Promise((resolve, reject) => {
+    const messages: Record<string, unknown>[] = [];
+    const timer = setTimeout(
+      () => reject(new Error("Timeout collecting messages")),
+      timeout
+    );
+    const handler = (e: MessageEvent) => {
+      if (typeof e.data !== "string") return;
+
+      const msg = JSON.parse(e.data) as Record<string, unknown>;
+      messages.push(msg);
+      if (predicate(msg)) {
+        clearTimeout(timer);
+        ws.removeEventListener("message", handler);
+        resolve(messages);
+      }
+    };
+    ws.addEventListener("message", handler);
+  });
 }
 
 // --- Tests ---
@@ -120,6 +247,515 @@ describe("VoiceAgent — protocol", () => {
       unknown
     >;
     expect(config.format).toBe("mp3");
+    expect(config.sampleRate).toBe(16000);
+    ws.close();
+  });
+
+  it("sends configured sampleRate in audio_config", async () => {
+    const { ws } = await connectWS(
+      `/agents/test-pcm24k-voice-agent/voice-test-${++instanceCounter}`
+    );
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, { type: "start_call" });
+    const config = (await waitForType(ws, "audio_config")) as Record<
+      string,
+      unknown
+    >;
+    expect(config.format).toBe("pcm16");
+    expect(config.sampleRate).toBe(24000);
+    ws.close();
+  });
+});
+
+describe("VoiceAgent — transcriber readiness", () => {
+  it("does not send listening or run onCallStart before readiness resolves", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+    await setTranscriberMode(ws, "pending_ready");
+
+    const audioConfig = waitForType(ws, "audio_config");
+    sendJSON(ws, { type: "start_call" });
+    await audioConfig;
+
+    const beforeReady = collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "_counts"
+    );
+    sendJSON(ws, { type: "_get_counts" });
+
+    const beforeReadyMessages = await beforeReady;
+    expect(beforeReadyMessages).not.toContainEqual({
+      type: "status",
+      status: "listening"
+    });
+    expect(beforeReadyMessages.at(-1)).toMatchObject({
+      type: "_counts",
+      callStart: 0
+    });
+
+    sendJSON(ws, { type: "_resolve_transcriber_ready" });
+    await waitForStatus(ws, "listening");
+
+    sendJSON(ws, { type: "_get_counts" });
+    const counts = (await waitForType(ws, "_counts")) as Record<
+      string,
+      unknown
+    >;
+    expect(counts.callStart).toBe(1);
+    ws.close();
+  });
+
+  it("sends a visible error, returns idle, and cleans up when readiness rejects", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setTranscriberMode(ws, "reject_ready");
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message: "Speech recognition failed to start"
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const failedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(failedCounts.callStart).toBe(0);
+      expect(failedCounts.callEnd).toBe(1);
+      expect(failedCounts.keepAliveAcquired).toBe(1);
+      expect(failedCounts.keepAliveReleased).toBe(1);
+
+      await setTranscriberMode(ws, "default");
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      sendJSON(ws, { type: "_get_counts" });
+      const restartedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(restartedCounts.callStart).toBe(1);
+      expect(restartedCounts.callEnd).toBe(1);
+      expect(restartedCounts.keepAliveAcquired).toBe(2);
+      expect(restartedCounts.keepAliveReleased).toBe(1);
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("sends a visible error, returns idle, and cleans up when session creation throws", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setTranscriberMode(ws, "create_throw");
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message: "Speech recognition failed to start"
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const counts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(counts.callStart).toBe(0);
+      expect(counts.callEnd).toBe(1);
+      expect(counts.keepAliveAcquired).toBe(1);
+      expect(counts.keepAliveReleased).toBe(1);
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("sends a visible error, returns idle, and cleans up when beforeCallStart throws", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setBeforeCallStart(ws, "throw");
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message: "Voice call failed to start"
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const failedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(failedCounts.callStart).toBe(0);
+      expect(failedCounts.callEnd).toBe(1);
+      expect(failedCounts.keepAliveAcquired).toBe(0);
+      expect(failedCounts.keepAliveReleased).toBe(0);
+
+      await setBeforeCallStart(ws, true);
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      sendJSON(ws, { type: "_get_counts" });
+      const restartedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(restartedCounts.callStart).toBe(1);
+      expect(restartedCounts.callEnd).toBe(1);
+      expect(restartedCounts.keepAliveAcquired).toBe(1);
+      expect(restartedCounts.keepAliveReleased).toBe(0);
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("sends a visible error, returns idle, and cleans up when beforeCallStart rejects", async () => {
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setBeforeCallStart(ws, false);
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message: "Voice call was rejected"
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const failedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(failedCounts.callStart).toBe(0);
+      expect(failedCounts.callEnd).toBe(1);
+      expect(failedCounts.keepAliveAcquired).toBe(0);
+      expect(failedCounts.keepAliveReleased).toBe(0);
+
+      await setBeforeCallStart(ws, true);
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      sendJSON(ws, { type: "_get_counts" });
+      const restartedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(restartedCounts.callStart).toBe(1);
+      expect(restartedCounts.callEnd).toBe(1);
+      expect(restartedCounts.keepAliveAcquired).toBe(1);
+      expect(restartedCounts.keepAliveReleased).toBe(0);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it("sends a visible error, returns idle, and cleans up when no transcriber is configured", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setTranscriberMode(ws, "missing");
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message:
+          "No transcriber configured. Set 'transcriber' on your VoiceAgent subclass or override createTranscriber()."
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const failedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(failedCounts.callStart).toBe(0);
+      expect(failedCounts.callEnd).toBe(1);
+      expect(failedCounts.keepAliveAcquired).toBe(0);
+      expect(failedCounts.keepAliveReleased).toBe(0);
+
+      await setTranscriberMode(ws, "default");
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      sendJSON(ws, { type: "_get_counts" });
+      const restartedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(restartedCounts.callStart).toBe(1);
+      expect(restartedCounts.callEnd).toBe(1);
+      expect(restartedCounts.keepAliveAcquired).toBe(1);
+      expect(restartedCounts.keepAliveReleased).toBe(0);
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("sends a visible error, returns idle, and cleans up when keepAlive rejects", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniquePath());
+    try {
+      await waitForStatus(ws, "idle");
+      await setKeepAliveThrow(ws, true);
+
+      const startupMessagesPromise = collectMessagesUntil(
+        ws,
+        (msg) => msg.type === "status" && msg.status === "idle"
+      );
+      sendJSON(ws, { type: "start_call" });
+      const startupMessages = await startupMessagesPromise;
+
+      expect(startupMessages).toContainEqual({
+        type: "error",
+        message: "Voice call failed to start"
+      });
+      expect(startupMessages.at(-1)).toEqual({
+        type: "status",
+        status: "idle"
+      });
+
+      sendJSON(ws, { type: "_get_counts" });
+      const failedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(failedCounts.callStart).toBe(0);
+      expect(failedCounts.callEnd).toBe(1);
+      expect(failedCounts.keepAliveAcquired).toBe(0);
+      expect(failedCounts.keepAliveReleased).toBe(0);
+
+      await setKeepAliveThrow(ws, false);
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      sendJSON(ws, { type: "_get_counts" });
+      const restartedCounts = (await waitForType(ws, "_counts")) as Record<
+        string,
+        unknown
+      >;
+      expect(restartedCounts.callStart).toBe(1);
+      expect(restartedCounts.callEnd).toBe(1);
+      expect(restartedCounts.keepAliveAcquired).toBe(1);
+      expect(restartedCounts.keepAliveReleased).toBe(0);
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("ignores stale readiness after end_call", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+    await setTranscriberMode(ws, "pending_ready");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForType(ws, "audio_config");
+
+    sendJSON(ws, { type: "end_call" });
+    await waitForStatus(ws, "idle");
+
+    const afterEnd = collectMessagesUntil(ws, (msg) => msg.type === "_counts");
+    sendJSON(ws, { type: "_resolve_transcriber_ready" });
+    sendJSON(ws, { type: "_get_counts" });
+    const afterEndMessages = await afterEnd;
+
+    expect(afterEndMessages).not.toContainEqual({
+      type: "status",
+      status: "listening"
+    });
+    expect(afterEndMessages.some((msg) => msg.type === "error")).toBe(false);
+    expect(afterEndMessages.at(-1)).toMatchObject({
+      type: "_counts",
+      callStart: 0,
+      callEnd: 1,
+      keepAliveAcquired: 1,
+      keepAliveReleased: 1
+    });
+    ws.close();
+  });
+
+  it("ignores stale readiness rejection after end_call", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+    await setTranscriberMode(ws, "pending_ready_no_close_settle");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForType(ws, "audio_config");
+
+    sendJSON(ws, { type: "end_call" });
+    await waitForStatus(ws, "idle");
+
+    const afterEnd = collectMessagesUntil(ws, (msg) => msg.type === "_counts");
+    sendJSON(ws, { type: "_reject_transcriber_ready" });
+    await waitForMicrotasks();
+    sendJSON(ws, { type: "_get_counts" });
+    const afterEndMessages = await afterEnd;
+
+    expect(afterEndMessages).not.toContainEqual({
+      type: "status",
+      status: "listening"
+    });
+    expect(afterEndMessages.some((msg) => msg.type === "error")).toBe(false);
+    expect(afterEndMessages.at(-1)).toMatchObject({
+      type: "_counts",
+      callStart: 0,
+      callEnd: 1,
+      keepAliveAcquired: 1,
+      keepAliveReleased: 1
+    });
+    ws.close();
+  });
+
+  it("ignores stale readiness rejection after a later startup succeeds", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+    await setTranscriberMode(ws, "pending_ready_no_close_settle");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForType(ws, "audio_config");
+
+    sendJSON(ws, { type: "end_call" });
+    await waitForStatus(ws, "idle");
+
+    await setTranscriberMode(ws, "default");
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    const afterRestart = collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "_counts"
+    );
+    sendJSON(ws, { type: "_reject_transcriber_ready_at", index: 0 });
+    await waitForMicrotasks();
+    sendJSON(ws, { type: "_get_counts" });
+    const afterRestartMessages = await afterRestart;
+
+    expect(afterRestartMessages.some((msg) => msg.type === "error")).toBe(
+      false
+    );
+    expect(afterRestartMessages.at(-1)).toMatchObject({
+      type: "_counts",
+      callStart: 1,
+      callEnd: 1,
+      keepAliveAcquired: 2,
+      keepAliveReleased: 1
+    });
+    ws.close();
+  });
+
+  it("ignores stale readiness rejection after disconnect", async () => {
+    const path = uniquePath();
+    const { ws } = await connectWS(path);
+    await waitForStatus(ws, "idle");
+    await setTranscriberMode(ws, "pending_ready_no_close_settle");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForType(ws, "audio_config");
+
+    ws.close();
+    await waitForMicrotasks();
+
+    const { ws: nextWs } = await connectWS(path);
+    await waitForStatus(nextWs, "idle");
+
+    const afterDisconnect = collectMessagesUntil(
+      nextWs,
+      (msg) => msg.type === "_counts"
+    );
+    sendJSON(nextWs, { type: "_reject_transcriber_ready" });
+    await waitForMicrotasks();
+    sendJSON(nextWs, { type: "_get_counts" });
+    const afterDisconnectMessages = await afterDisconnect;
+
+    expect(afterDisconnectMessages).not.toContainEqual({
+      type: "status",
+      status: "listening"
+    });
+    expect(afterDisconnectMessages.some((msg) => msg.type === "error")).toBe(
+      false
+    );
+    expect(afterDisconnectMessages.at(-1)).toMatchObject({
+      type: "_counts",
+      callStart: 0,
+      keepAliveAcquired: 1,
+      keepAliveReleased: 1
+    });
+    nextWs.close();
+  });
+
+  it("starts immediately for custom transcribers without waitUntilReady", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    sendJSON(ws, { type: "_get_counts" });
+    const counts = (await waitForType(ws, "_counts")) as Record<
+      string,
+      unknown
+    >;
+    expect(counts.callStart).toBe(1);
     ws.close();
   });
 });
@@ -245,6 +881,226 @@ describe("VoiceAgent — continuous STT pipeline", () => {
 
     // Should eventually get back to listening
     await waitForStatus(ws, "listening");
+
+    ws.close();
+  });
+
+  it("handles AI SDK stream responses that include tool calls", async () => {
+    const { ws } = await connectWS(uniqueAISDKStreamPath());
+    await waitForStatus(ws, "idle");
+
+    const mockResponse = [
+      [
+        { type: "text", text: "I can get the weather for you." },
+        {
+          type: "tool-call",
+          toolName: "getWeather",
+          input: { location: "San Francisco" },
+          output: "warm"
+        }
+      ],
+      [{ type: "text", text: "The weather is warm" }]
+    ];
+    sendJSON(ws, { type: "_set_mock_response", response: mockResponse });
+    await waitForMessageMatching(
+      ws,
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as Record<string, unknown>).type === "_ack" &&
+        (m as Record<string, unknown>).command === "_set_mock_response"
+    );
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const transcriptEnd = (await waitForType(ws, "transcript_end")) as Record<
+      string,
+      unknown
+    >;
+    expect(transcriptEnd.text).toBe(
+      "I can get the weather for you. The weather is warm"
+    );
+
+    await waitForStatus(ws, "listening");
+    ws.close();
+  });
+
+  it("speaks stream text before delayed tool results complete", async () => {
+    const { ws } = await connectWS(uniqueAISDKStreamPath());
+    await waitForStatus(ws, "idle");
+
+    const mockResponse = [
+      [
+        { type: "text", text: "I can get the weather for you." },
+        {
+          type: "tool-call",
+          toolName: "getWeather",
+          input: { location: "San Francisco" },
+          output: "warm",
+          outputDelayMs: 3000
+        }
+      ],
+      [{ type: "text", text: "The weather is warm" }]
+    ];
+    sendJSON(ws, { type: "_set_mock_response", response: mockResponse });
+    await waitForMessageMatching(
+      ws,
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as Record<string, unknown>).type === "_ack" &&
+        (m as Record<string, unknown>).command === "_set_mock_response"
+    );
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    const audioPromise = waitForBinary(ws, 1000);
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const audio = await audioPromise;
+    expect(decodeAudio(audio)).toBe("I can get the weather for you.");
+
+    const transcriptEnd = (await waitForType(ws, "transcript_end")) as Record<
+      string,
+      unknown
+    >;
+    expect(transcriptEnd.text).toBe(
+      "I can get the weather for you. The weather is warm"
+    );
+
+    await waitForStatus(ws, "listening");
+    ws.close();
+  });
+
+  it("flushes partial stream speech before reporting stream errors", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ws } = await connectWS(uniqueAISDKStreamPath());
+    try {
+      await waitForStatus(ws, "idle");
+
+      const mockResponse = [
+        [
+          { type: "text", text: "Partial response." },
+          { type: "error", message: "provider failed" }
+        ]
+      ];
+      sendJSON(ws, { type: "_set_mock_response", response: mockResponse });
+      await waitForMessageMatching(
+        ws,
+        (m) =>
+          typeof m === "object" &&
+          m !== null &&
+          (m as Record<string, unknown>).type === "_ack" &&
+          (m as Record<string, unknown>).command === "_set_mock_response"
+      );
+
+      sendJSON(ws, { type: "start_call" });
+      await waitForStatus(ws, "listening");
+
+      const audioPromise = waitForBinary(ws, 1000);
+      for (let i = 0; i < 4; i++) {
+        ws.send(new ArrayBuffer(5000));
+      }
+
+      const audio = await audioPromise;
+      expect(decodeAudio(audio)).toBe("Partial response.");
+
+      const transcriptEnd = (await waitForType(ws, "transcript_end")) as Record<
+        string,
+        unknown
+      >;
+      expect(transcriptEnd.text).toBe("Partial response.");
+
+      const error = (await waitForType(ws, "error")) as Record<string, unknown>;
+      expect(error.message).toBe("provider failed");
+
+      await waitForStatus(ws, "listening");
+    } finally {
+      ws.close();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("keeps deprecated AI SDK textStream support for tool-call streams", async () => {
+    const { ws } = await connectWS(uniqueAISDKTextStreamPath());
+    await waitForStatus(ws, "idle");
+
+    const mockResponse = [
+      [
+        { type: "text", text: "I can get the weather for you." },
+        {
+          type: "tool-call",
+          toolName: "getWeather",
+          input: { location: "San Francisco" },
+          output: "warm"
+        }
+      ],
+      [{ type: "text", text: "The weather is warm" }]
+    ];
+    sendJSON(ws, { type: "_set_mock_response", response: mockResponse });
+    await waitForMessageMatching(
+      ws,
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as Record<string, unknown>).type === "_ack" &&
+        (m as Record<string, unknown>).command === "_set_mock_response"
+    );
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const transcriptEnd = (await waitForType(ws, "transcript_end")) as Record<
+      string,
+      unknown
+    >;
+    // Known textStream bug: AI SDK textStream omits the boundary between
+    // non-adjacent text parts separated by tool calls. Keep coverage so we
+    // notice if deprecated textStream support stops working entirely.
+    expect(transcriptEnd.text).toBe(
+      "I can get the weather for you.The weather is warm"
+    );
+
+    await waitForStatus(ws, "listening");
+    ws.close();
+  });
+});
+
+describe("VoiceAgent — agent context carryover", () => {
+  it("feeds the assistant's spoken reply back to the transcriber session", async () => {
+    const { ws } = await connectWS(uniquePath());
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    // Wait for the assistant reply to finish and the pipeline to settle.
+    await waitForType(ws, "transcript_end");
+    await waitForStatus(ws, "listening");
+
+    sendJSON(ws, { type: "_get_agent_context" });
+    const ctx = (await waitForType(ws, "_agent_context")) as Record<
+      string,
+      unknown
+    >;
+    const contexts = ctx.contexts as string[];
+    expect(contexts).toContain("Echo: utterance 1 (20000 bytes)");
 
     ws.close();
   });
@@ -634,6 +1490,134 @@ async function connectEmptyWS(path: string) {
 }
 
 describe("VoiceAgent — empty response handling", () => {
+  it("does not emit assistant transcript events for an empty stream", async () => {
+    const { ws } = await connectEmptyWS(uniqueEmptyPath());
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, {
+      type: "_set_response_mode",
+      value: "empty_stream"
+    });
+    await waitForType(ws, "_ack");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const messages = await collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "status" && msg.status === "listening"
+    );
+
+    expect(messages).toContainEqual({
+      type: "error",
+      message: "No response generated"
+    });
+    const types = messages.map((m) => m.type);
+    expect(types).not.toContain("transcript_start");
+    expect(types).not.toContain("transcript_end");
+    expect(types).not.toContain("metrics");
+
+    sendJSON(ws, { type: "_get_message_count" });
+    const count = (await waitForType(ws, "_message_count")) as Record<
+      string,
+      unknown
+    >;
+    expect(count.count).toBe(1);
+
+    ws.close();
+  });
+
+  it("does not emit assistant transcript events for whitespace-only stream", async () => {
+    const { ws } = await connectEmptyWS(uniqueEmptyPath());
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, {
+      type: "_set_response_mode",
+      value: "whitespace_stream"
+    });
+    await waitForType(ws, "_ack");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const messages = await collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "status" && msg.status === "listening"
+    );
+
+    expect(messages).toContainEqual({
+      type: "error",
+      message: "No response generated"
+    });
+    const types = messages.map((m) => m.type);
+    expect(types).not.toContain("transcript_start");
+    expect(types).not.toContain("transcript_end");
+    expect(types).not.toContain("metrics");
+
+    sendJSON(ws, { type: "_get_message_count" });
+    const count = (await waitForType(ws, "_message_count")) as Record<
+      string,
+      unknown
+    >;
+    expect(count.count).toBe(1);
+
+    ws.close();
+  });
+
+  it("defers assistant transcript start until streamed text is non-empty", async () => {
+    const { ws } = await connectEmptyWS(uniqueEmptyPath());
+    await waitForStatus(ws, "idle");
+
+    sendJSON(ws, {
+      type: "_set_response_mode",
+      value: "leading_whitespace_stream"
+    });
+    await waitForType(ws, "_ack");
+
+    sendJSON(ws, { type: "start_call" });
+    await waitForStatus(ws, "listening");
+
+    for (let i = 0; i < 4; i++) {
+      ws.send(new ArrayBuffer(5000));
+    }
+
+    const messages = await collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "transcript_end"
+    );
+    const assistantMessages = messages.filter((msg) =>
+      ["transcript_start", "transcript_delta", "transcript_end"].includes(
+        msg.type as string
+      )
+    );
+
+    expect(assistantMessages).toEqual([
+      { type: "transcript_start", role: "assistant" },
+      { type: "transcript_delta", text: "   Hello" },
+      { type: "transcript_delta", text: " world." },
+      { type: "transcript_end", text: "   Hello world." }
+    ]);
+
+    await waitForStatus(ws, "listening");
+
+    sendJSON(ws, { type: "_get_message_count" });
+    const count = (await waitForType(ws, "_message_count")) as Record<
+      string,
+      unknown
+    >;
+    expect(count.count).toBe(2);
+
+    ws.close();
+  });
+
   it("sends error and does not save message when onTurn returns empty string", async () => {
     const { ws } = await connectEmptyWS(uniqueEmptyPath());
     await waitForStatus(ws, "idle");
@@ -646,9 +1630,18 @@ describe("VoiceAgent — empty response handling", () => {
       ws.send(new ArrayBuffer(5000));
     }
 
-    // Should get an error message about empty response
-    const error = (await waitForType(ws, "error")) as Record<string, unknown>;
-    expect(error.message).toBe("No response generated");
+    // Should get an error message about empty response without creating an
+    // assistant transcript entry.
+    const messages = await collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "error"
+    );
+    expect(messages).toContainEqual({
+      type: "error",
+      message: "No response generated"
+    });
+    expect(messages.map((m) => m.type)).not.toContain("transcript_start");
+    expect(messages.map((m) => m.type)).not.toContain("transcript_end");
 
     // Should go back to listening
     await waitForStatus(ws, "listening");
@@ -677,25 +1670,10 @@ describe("VoiceAgent — empty response handling", () => {
     }
 
     // Collect all messages until we get back to listening
-    const messages: Record<string, unknown>[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("Timeout collecting messages")),
-        5000
-      );
-      const handler = (e: MessageEvent) => {
-        if (typeof e.data === "string") {
-          const msg = JSON.parse(e.data);
-          messages.push(msg);
-          if (msg.type === "status" && msg.status === "listening") {
-            clearTimeout(timer);
-            ws.removeEventListener("message", handler);
-            resolve();
-          }
-        }
-      };
-      ws.addEventListener("message", handler);
-    });
+    const messages = await collectMessagesUntil(
+      ws,
+      (msg) => msg.type === "status" && msg.status === "listening"
+    );
 
     // Should NOT have received metrics
     const types = messages.map((m) => m.type);

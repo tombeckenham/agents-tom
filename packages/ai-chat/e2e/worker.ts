@@ -5,7 +5,7 @@ import {
   createToolsFromClientSchemas
 } from "../src/index";
 import type { UIMessage } from "ai";
-import { streamText, tool, convertToModelMessages, stepCountIs } from "ai";
+import { streamText, tool, convertToModelMessages, isStepCount } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
@@ -15,6 +15,7 @@ export type Env = {
   ChatAgent: DurableObjectNamespace<ChatAgent>;
   LlmChatAgent: DurableObjectNamespace<LlmChatAgent>;
   ClientToolAgent: DurableObjectNamespace<ClientToolAgent>;
+  ClientToolApprovalAgent: DurableObjectNamespace<ClientToolApprovalAgent>;
   SlowAgent: DurableObjectNamespace<SlowAgent>;
   BadKeyAgent: DurableObjectNamespace<BadKeyAgent>;
   SanitizeAgent: DurableObjectNamespace<SanitizeAgent>;
@@ -71,16 +72,16 @@ export class LlmChatAgent extends AIChatAgent<Env> {
     };
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system:
+      instructions:
         "You are a helpful test assistant. Keep responses very short (1-2 sentences max). " +
         "When asked about the weather, use the getWeather tool. " +
         "When asked to add numbers, use the addNumbers tool.",
       messages: await convertToModelMessages(this.messages),
       tools,
-      stopWhen: stepCountIs(3)
+      stopWhen: isStepCount(3)
     });
 
     return result.toUIMessageStreamResponse();
@@ -97,10 +98,10 @@ export class ClientToolAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system:
+      instructions:
         "You are a test assistant. Always use the getUserLocation tool when asked about location.",
       messages: await convertToModelMessages(this.messages),
       tools: {
@@ -110,7 +111,43 @@ export class ClientToolAgent extends AIChatAgent<Env> {
           // No execute — client must handle via CF_AGENT_TOOL_RESULT
         })
       },
-      stopWhen: stepCountIs(3)
+      stopWhen: isStepCount(3)
+    });
+
+    return result.toUIMessageStreamResponse();
+  }
+}
+
+/**
+ * Agent with a client-side tool that REQUIRES approval (no execute function).
+ * The LLM calls the tool, the stream pauses at approval-requested, and the
+ * test sends CF_AGENT_TOOL_APPROVAL. Kept separate from `ClientToolAgent` so
+ * the approval flow doesn't perturb the tool-result/continuation tests that
+ * agent's plain (no-approval) tool drives.
+ */
+export class ClientToolApprovalAgent extends AIChatAgent<Env> {
+  async onChatMessage() {
+    const workersai = createWorkersAI({ binding: this.env.AI });
+
+    const result = streamText({
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
+        sessionAffinity: this.sessionAffinity
+      }),
+      instructions:
+        "You are a test assistant. Always use the getUserLocation tool when asked about location.",
+      messages: await convertToModelMessages(this.messages),
+      tools: {
+        getUserLocation: tool({
+          description: "Get the user's current location from the browser",
+          inputSchema: z.object({}),
+          // Requires approval: an approved continuation keeps the part in
+          // `approval-responded` (awaiting the client result) rather than the
+          // SDK re-validating it as an unneeded approval and denying it.
+          needsApproval: true
+          // No execute — client resolves via CF_AGENT_TOOL_RESULT after approval
+        })
+      },
+      stopWhen: isStepCount(3)
     });
 
     return result.toUIMessageStreamResponse();
@@ -157,7 +194,7 @@ export class BadKeyAgent extends AIChatAgent<Env> {
 
     const result = streamText({
       model: openai.chat("gpt-4o-mini"),
-      system: "You are a test assistant.",
+      instructions: "You are a test assistant.",
       messages: await convertToModelMessages(this.messages)
     });
 
@@ -250,13 +287,14 @@ export class ResponseLlmAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: "You are a test assistant. Keep responses to 1 sentence max.",
+      instructions:
+        "You are a test assistant. Keep responses to 1 sentence max.",
       messages: await convertToModelMessages(this.messages),
       abortSignal: options?.abortSignal,
-      stopWhen: stepCountIs(2)
+      stopWhen: isStepCount(2)
     });
 
     return result.toUIMessageStreamResponse();
@@ -304,13 +342,14 @@ export class ResponseChainAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: "You are a test assistant. Keep responses to 1 sentence max.",
+      instructions:
+        "You are a test assistant. Keep responses to 1 sentence max.",
       messages: await convertToModelMessages(this.messages),
       abortSignal: options?.abortSignal,
-      stopWhen: stepCountIs(2)
+      stopWhen: isStepCount(2)
     });
 
     return result.toUIMessageStreamResponse();
@@ -352,6 +391,15 @@ export class ResponseChainAgent extends AIChatAgent<Env> {
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext) {
+    // Real readiness probe. Playwright's `webServer.url` polls this so it only
+    // starts tests once `wrangler dev` is actually serving — not merely once the
+    // proxy port is open. This matters because a `remote` binding keeps the
+    // worker unable to serve while it is "Establishing remote connection...",
+    // during which the port is already open and a port-only readiness check
+    // would race ahead and every request would fail.
+    if (new URL(request.url).pathname === "/__health") {
+      return new Response("ok");
+    }
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })

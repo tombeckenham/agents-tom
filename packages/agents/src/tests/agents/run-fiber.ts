@@ -20,9 +20,13 @@ export class TestRunFiberAgent extends Agent {
   private _releaseIgnoredCancelManagedFiber?: () => void;
   private _releaseBlockedRecovery?: () => void;
 
+  /** MCP connection ids visible at the moment each fiber was recovered. */
+  recoveryMcpConnections: Record<string, string[]> = {};
+
   override async onFiberRecovered(
     ctx: FiberRecoveryContext
   ): Promise<void | FiberRecoveryResult> {
+    this.recoveryMcpConnections[ctx.id] = Object.keys(this.mcp.mcpConnections);
     this.recoveredFibers.push(ctx);
     if (ctx.name === "managed-recovery-block") {
       await new Promise<void>((resolve) => {
@@ -38,6 +42,9 @@ export class TestRunFiberAgent extends Agent {
     }
     if (ctx.name === "managed-recovery-throws") {
       throw new Error("Recovery failed");
+    }
+    if (ctx.name === "unmanaged-recovery-throws") {
+      throw new Error("Unmanaged recovery failed");
     }
   }
 
@@ -406,6 +413,100 @@ export class TestRunFiberAgent extends Agent {
     }).catch(console.error);
   }
 
+  async runWithInternalStashWrapper(): Promise<{
+    initialSnapshot: unknown;
+    stashedSnapshot: unknown;
+  }> {
+    let initialSnapshot: unknown = null;
+    let stashedSnapshot: unknown = null;
+
+    await this._runFiberWithStashWrapper(
+      "internal-wrapped",
+      async (ctx) => {
+        initialSnapshot = this._readRunSnapshot(ctx.id);
+        this.stash({ user: "checkpoint" });
+        stashedSnapshot = this._readRunSnapshot(ctx.id);
+      },
+      {
+        initialSnapshot: {
+          __testFiberSnapshot: { requestId: "initial" },
+          user: null
+        },
+        wrapStash: (data) => ({
+          __testFiberSnapshot: { requestId: "wrapped" },
+          user: data
+        })
+      }
+    );
+
+    return { initialSnapshot, stashedSnapshot };
+  }
+
+  async runWrappedAndPlainConcurrentStash(): Promise<{
+    wrappedSnapshot: unknown;
+    plainSnapshot: unknown;
+  }> {
+    let wrappedSnapshot: unknown = null;
+    let plainSnapshot: unknown = null;
+
+    await Promise.all([
+      this._runFiberWithStashWrapper(
+        "internal-wrapped-concurrent",
+        async (ctx) => {
+          await new Promise((r) => setTimeout(r, 10));
+          this.stash({ task: "wrapped" });
+          wrappedSnapshot = this._readRunSnapshot(ctx.id);
+          await new Promise((r) => setTimeout(r, 50));
+        },
+        {
+          initialSnapshot: {
+            __testFiberSnapshot: { requestId: "initial" },
+            user: null
+          },
+          wrapStash: (data) => ({
+            __testFiberSnapshot: { requestId: "wrapped" },
+            user: data
+          })
+        }
+      ),
+      this.runFiber("plain-concurrent", async (ctx) => {
+        await new Promise((r) => setTimeout(r, 20));
+        this.stash({ task: "plain" });
+        plainSnapshot = this._readRunSnapshot(ctx.id);
+      })
+    ]);
+
+    return { wrappedSnapshot, plainSnapshot };
+  }
+
+  async runWithInitialSnapshotThenThrow(): Promise<{
+    threw: boolean;
+    runningFiberCount: number;
+  }> {
+    let threw = false;
+
+    await this._runFiberWithStashWrapper(
+      "internal-wrapper-initial-then-throw",
+      async () => {
+        this.executionLog.push("initial-then-throw");
+        throw new Error("simulated fiber failure");
+      },
+      {
+        initialSnapshot: {
+          __testFiberSnapshot: { requestId: "initial" },
+          user: null
+        }
+      }
+    ).catch(() => {
+      threw = true;
+    });
+
+    return {
+      threw,
+      runningFiberCount: await this.getRunningFiberCount()
+    };
+  }
+
   async stashOutsideFiber(): Promise<string> {
     try {
       this.stash({ bad: true });
@@ -436,11 +537,49 @@ export class TestRunFiberAgent extends Agent {
     return rows[0].count;
   }
 
+  private _readRunSnapshot(id: string): unknown {
+    const rows = this.sql<{ snapshot: string | null }>`
+      SELECT snapshot FROM cf_agents_runs WHERE id = ${id} LIMIT 1
+    `;
+    const snapshot = rows[0]?.snapshot;
+    return snapshot ? JSON.parse(snapshot) : null;
+  }
+
   async waitFor(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // ── Eviction simulation ───────────────────────────────────────
+
+  /**
+   * Insert a stored MCP server pending OAuth (never dials out on restore)
+   * and reset the manager so the next wake restores it again. Clears the
+   * in-memory connections so any connection seen later provably came from
+   * that wake's restore.
+   */
+  async seedMcpServerRow(id: string): Promise<void> {
+    this.sql`
+      INSERT OR REPLACE INTO cf_agents_mcp_servers
+        (id, name, server_url, client_id, auth_url, callback_url, server_options)
+      VALUES (${id}, ${"seeded"}, ${"http://mcp.invalid/mcp"}, NULL,
+              ${"http://mcp.invalid/authorize"}, ${"http://mcp.invalid/callback"},
+              ${JSON.stringify({ capabilities: { elicitation: { form: {}, url: {} } } })})
+    `;
+    for (const connectionId of Object.keys(this.mcp.mcpConnections)) {
+      delete this.mcp.mcpConnections[connectionId];
+    }
+    // @ts-expect-error - accessing private field for testing
+    this.mcp._isRestored = false;
+  }
+
+  /** Re-run the wrapped wake sequence: MCP restore → fiber recovery → onStart. */
+  async rerunWakeSequence(): Promise<void> {
+    await this.onStart();
+  }
+
+  async getRecoveryMcpConnections(): Promise<Record<string, string[]>> {
+    return this.recoveryMcpConnections;
+  }
 
   async insertInterruptedFiber(
     id: string,
@@ -450,6 +589,18 @@ export class TestRunFiberAgent extends Agent {
     this.sql`
       INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
       VALUES (${id}, ${name}, ${snapshot ? JSON.stringify(snapshot) : null}, ${Date.now()})
+    `;
+  }
+
+  /** Insert an unmanaged interrupted fiber row with a backdated created_at. */
+  async insertAgedInterruptedFiber(
+    id: string,
+    name: string,
+    ageMs: number
+  ): Promise<void> {
+    this.sql`
+      INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
+      VALUES (${id}, ${name}, NULL, ${Date.now() - ageMs})
     `;
   }
 
@@ -512,5 +663,32 @@ export class TestRunFiberAgent extends Agent {
     await (
       this as unknown as { _checkRunFibers(): Promise<void> }
     )._checkRunFibers();
+  }
+
+  /** Read the physical DO alarm (epoch ms) or null when none is armed. */
+  async getCurrentAlarm(): Promise<number | null> {
+    return this.ctx.storage.getAlarm();
+  }
+
+  /** Inspect the in-memory recovery backoff streak (white-box for tests). */
+  async getRecoveryNoProgressScans(): Promise<number> {
+    return (this as unknown as { _recoveryNoProgressScans: number })
+      ._recoveryNoProgressScans;
+  }
+
+  /**
+   * Run one housekeeping+reschedule cycle in the same order as `alarm()`
+   * (`_checkRunFibers` then `_scheduleNextAlarm`) and return the resulting
+   * armed alarm time (epoch ms) or null. Lets tests drive multi-pass recovery
+   * deterministically without spawning a real process / waiting on timers.
+   */
+  async simulateAlarmCycle(): Promise<number | null> {
+    const self = this as unknown as {
+      _checkRunFibers(): Promise<void>;
+      _scheduleNextAlarm(): Promise<void>;
+    };
+    await self._checkRunFibers();
+    await self._scheduleNextAlarm();
+    return this.ctx.storage.getAlarm();
   }
 }

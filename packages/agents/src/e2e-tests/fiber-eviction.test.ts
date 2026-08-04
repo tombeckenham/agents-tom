@@ -14,9 +14,38 @@
  */
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { setDefaultAutoSelectFamily, Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+
+// Disable happy-eyeballs dual-stack racing. When a probe `fetch`/WebSocket
+// connects to a server that is mid-SIGKILL/restart, the abandoned racing socket
+// can throw a connect-time `setTypeOfService` EINVAL that surfaces as an
+// unhandled error and fails an otherwise-green chaos run.
+setDefaultAutoSelectFamily(false);
+
+// Write-time variant: undici's `writeH1` calls `socket.setTypeOfService(...)` on
+// every request when the socket exposes it. Against a server being torn down the
+// `setsockopt(IP_TOS)` syscall returns EINVAL, thrown *synchronously* inside
+// undici — no `fetch`/WebSocket call site can catch it, so it surfaces as an
+// unhandled exception and fails an otherwise-green run. We never use IP
+// type-of-service, so make the optional setter best-effort.
+{
+  const proto = Socket.prototype as unknown as {
+    setTypeOfService?: (tos: number) => unknown;
+  };
+  const original = proto.setTypeOfService;
+  if (typeof original === "function") {
+    proto.setTypeOfService = function (this: unknown, tos: number) {
+      try {
+        return original.call(this, tos);
+      } catch {
+        return this;
+      }
+    };
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 18799;
@@ -52,6 +81,28 @@ function killProcessOnPort(port: number): void {
   }
 }
 
+function killProcessTree(pid: number): void {
+  let children: number[] = [];
+  try {
+    children = execSync(`pgrep -P ${pid} 2>/dev/null || true`)
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(Number);
+  } catch {
+    // pgrep may be unavailable; killing the parent is still useful.
+  }
+  for (const childPid of children) {
+    killProcessTree(childPid);
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already dead
+  }
+}
+
 function startWrangler(): ChildProcess {
   const configPath = path.join(__dirname, "wrangler.jsonc");
   const child = spawn(
@@ -64,12 +115,13 @@ function startWrangler(): ChildProcess {
       "--port",
       String(PORT),
       "--persist-to",
-      PERSIST_DIR
+      PERSIST_DIR,
+      "--inspector-port",
+      "0"
     ],
     {
       cwd: __dirname,
       stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
       env: { ...process.env, NODE_ENV: "test" }
     }
   );
@@ -90,6 +142,7 @@ async function waitForReady(maxAttempts = 30, delayMs = 1000): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
       const res = await fetch(`${AGENT_URL}/`);
+      await res.body?.cancel();
       if (res.status > 0) return;
     } catch {
       // Not ready yet
@@ -102,7 +155,8 @@ async function waitForReady(maxAttempts = 30, delayMs = 1000): Promise<void> {
 async function waitForPortFree(maxAttempts = 30, delayMs = 500): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      await fetch(`${AGENT_URL}/`);
+      const res = await fetch(`${AGENT_URL}/`);
+      await res.body?.cancel();
     } catch {
       return;
     }
@@ -124,15 +178,7 @@ function killProcess(child: ChildProcess): Promise<void> {
       clearTimeout(fallback);
       resolve();
     });
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(child.pid, "SIGKILL");
-      } catch {
-        // Already dead
-      }
-    }
+    killProcessTree(child.pid);
   });
 }
 

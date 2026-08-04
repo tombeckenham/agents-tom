@@ -4,6 +4,8 @@ Instead of asking LLMs to call tools directly, Code Mode lets them write executa
 
 Code Mode generates TypeScript type definitions from your tools for LLM context, and executes the generated JavaScript in secure, isolated sandboxes with millisecond startup times.
 
+The published package includes the Codemode guides at `docs/index.md`.
+
 > **Experimental** — may have breaking changes. Use with caution in production.
 
 ## Installation
@@ -58,7 +60,7 @@ const codemode = createCodeTool({ tools, executor });
 // 4. Use it with streamText — the LLM writes code that calls your tools
 const result = streamText({
   model,
-  system: "You are a helpful assistant.",
+  instructions: "You are a helpful assistant.",
   messages,
   tools: { codemode }
 });
@@ -191,6 +193,261 @@ import { resolveProvider } from "@cloudflare/codemode";
 await executor.execute(code, [resolveProvider(dbProvider)]);
 ```
 
+## Connectors
+
+Connectors are class-based integrations that bridge external services into the codemode sandbox.
+
+Create a runtime with an executor and connectors, then expose `runtime.tool()` to the model:
+
+```ts
+import {
+  createCodemodeRuntime,
+  DynamicWorkerExecutor
+} from "@cloudflare/codemode";
+
+const runtime = createCodemodeRuntime({
+  ctx: this.ctx,
+  executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
+  connectors: [github, repoApi]
+});
+
+const result = streamText({
+  model,
+  messages,
+  tools: {
+    codemode: runtime.tool()
+  }
+});
+```
+
+For non-AI-SDK hosts such as MCP servers, use the same runtime directly:
+
+```ts
+const matches = await runtime.search("create issue");
+const docs = await runtime.describe(matches.results[0].path);
+const outcome = await runtime.execute({
+  code: `async () => github.create_issue({ title: "Bug" })`
+});
+```
+
+Search and describe results include `requiresApproval: true` for protected connector methods. A paused `execute()` outcome can be resolved with the same `approve()` and `reject()` methods used by an approval UI.
+
+Inside the sandbox, each connector is available as a global named after the connector. The `codemode` platform SDK provides discovery:
+
+```ts
+// discover
+const matches = await codemode.search("pull request");
+const docs = await codemode.describe("github.list_pull_requests");
+
+// call
+const prs = await github.list_pull_requests({
+  owner: "cloudflare",
+  repo: "agents"
+});
+```
+
+### `McpConnector`
+
+Wraps an MCP server. Each MCP tool becomes a method on the connector namespace.
+
+Under the hood: fetches tools from the MCP connection via `listTools()`, creates a descriptor per tool for search/describe, and dispatches calls through `connection.client.callTool()`. Tool names are sanitized into valid JS identifiers.
+
+```ts
+// github.codemode.ts
+import {
+  McpConnector,
+  type McpConnectionLike,
+  type ConnectorTool
+} from "@cloudflare/codemode";
+
+export class GithubConnector extends McpConnector<Env> {
+  constructor(
+    ctx: ExecutionContext,
+    env: Env,
+    private conn: McpConnectionLike
+  ) {
+    super(ctx, env);
+  }
+
+  name() {
+    return "github";
+  }
+  protected instructions() {
+    return "Use for GitHub operations.";
+  }
+  protected createConnection() {
+    return this.conn;
+  }
+
+  // Override to customize tool naming
+  // protected toolName(tool: McpTool) { return sanitizeToolName(tool.name); }
+
+  // Decorate derived tools: mark approvals, attach reverts
+  protected tool(name: string, t: ConnectorTool): ConnectorTool {
+    return name === "create_issue" ? { ...t, requiresApproval: true } : t;
+  }
+}
+```
+
+Sandbox sees:
+
+```ts
+github.list_pull_requests({ owner, repo, state });
+github.search_issues({ query });
+// ... one method per MCP tool
+```
+
+### `OpenApiConnector`
+
+Wraps an OpenAPI spec. The base reads the spec **once, host-side** and derives one typed tool **per operation**, so the model calls operations directly — `stripe.CreatePaymentIntent({ amount, currency })` — discoverable through `codemode.search`/`describe` with real input types (deriving on the host costs zero prompt tokens). Override two methods: `spec()` returns the OpenAPI document (operations are derived from it), and `request()` performs an authenticated request. A low-level `request` tool stays available as an escape hatch.
+
+```ts
+// stripe.codemode.ts
+import {
+  OpenApiConnector,
+  type OpenApiRequestOptions
+} from "@cloudflare/codemode";
+
+export class StripeConnector extends OpenApiConnector<Env> {
+  name() {
+    return "stripe";
+  }
+  protected instructions() {
+    return "Use for Stripe payments. Call the per-operation tools directly.";
+  }
+  protected spec() {
+    return stripeOpenApiSpec;
+  }
+
+  protected request(options: OpenApiRequestOptions) {
+    return fetch(`https://api.stripe.com${options.path}`, {
+      method: options.method ?? "GET",
+      headers: { Authorization: `Bearer ${this.env.STRIPE_KEY}` },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }).then((r) => r.json());
+  }
+}
+```
+
+Sandbox sees:
+
+```ts
+// Per-operation tool, derived from the spec (path params substituted for you).
+const intent = await stripe.CreatePaymentIntent({
+  amount: 2000,
+  currency: "usd"
+});
+
+// Escape hatch, if an operation isn't reachable via a derived tool:
+const raw = await stripe.request({ path: "/v1/charges", method: "GET" });
+```
+
+### `CodemodeConnector` (base class)
+
+A connector is three things — `name()`, optional `instructions()`, and `tools()`. Each tool carries its own docs, schema, approval requirement, execution, and optional revert, so everything about a tool lives in one place:
+
+```ts
+import { CodemodeConnector } from "@cloudflare/codemode";
+
+export class MyConnector extends CodemodeConnector<Env> {
+  name() {
+    return "myService";
+  }
+
+  protected tools() {
+    return {
+      listThings: {
+        description: "List things.",
+        inputSchema: { type: "object" },
+        execute: (args) => this.env.MY_SERVICE.list(args)
+      },
+      createThing: {
+        description: "Create a thing.",
+        inputSchema: {
+          type: "object",
+          properties: { title: { type: "string" } },
+          required: ["title"]
+        },
+        requiresApproval: true, // pauses the run for user approval
+        execute: (args) => this.env.MY_SERVICE.create(args),
+        revert: (_args, result) => this.env.MY_SERVICE.delete(result.id) // enables rollback
+      }
+    };
+  }
+}
+```
+
+An existing AI SDK `ToolSet` is shape-compatible and can be returned from `tools()` directly:
+
+```ts
+export class LinearConnector extends CodemodeConnector<Env> {
+  name() {
+    return "linear";
+  }
+  protected tools() {
+    return linearTools; // AI SDK ToolSet
+  }
+}
+```
+
+The `tool(name, t)` decoration hook adjusts tools you didn't author inline (used with MCP/OpenAPI-derived tools). The RPC wire surface (`describe()`, `executeTool()`, `revertAction()`, `getTypeScriptTypes()`) is derived from the tools record — you don't implement it.
+
+The agent drives approvals through the runtime: `runtime.pending()`, `runtime.approve({ executionId })`, `runtime.reject({ seq, executionId })`, `runtime.rollback({ executionId })` (see [docs/codemode/approvals.md](../../docs/codemode/approvals.md)).
+
+### Snippets
+
+Snippets are durable, addressable saved scripts. The model writes and runs scripts; the developer promotes the ones worth keeping (`runtime.saveSnippet`), and the model reuses them (`codemode.run`). No authoring step, no skill-source interface.
+
+```ts
+// host side: review runs, promote one
+const runs = await runtime.executions();
+await runtime.saveSnippet("list-open-prs", {
+  executionId: runs[0].id,
+  description: "List open PRs for a repo."
+});
+
+// sandbox side: the model runs it by name
+const prs = await codemode.run("list-open-prs");
+```
+
+Snippets appear in `codemode.search` results (with `kind: "snippet"`) and are documented via `codemode.describe(name)`. They live on the runtime facet, whose identity is derived from the connector set — so a snippet is always run against exactly the connectors it was written with. See [docs/codemode/snippets.md](../../docs/codemode/snippets.md).
+
+### Vite plugin
+
+The `@cloudflare/codemode/vite` plugin exports the `CodemodeRuntime` facet class from the Worker entry module, making it available as `ctx.exports.CodemodeRuntime` for facet spawning:
+
+```ts
+// vite.config.ts
+import codemode from "@cloudflare/codemode/vite";
+export default { plugins: [codemode()] };
+```
+
+Connector classes are ordinary TypeScript imports:
+
+```ts
+import { GithubConnector } from "./github.codemode";
+import { StripeConnector } from "./stripe.codemode";
+```
+
+### How connector calls work
+
+```
+┌─────────────────────┐        ┌─────────────────────────────────────────────┐
+│                     │        │  Dynamic Worker (isolated sandbox)           │
+│  Host Worker        │  RPC   │                                              │
+│                     │◄──────►│  github.list_pull_requests(args)             │
+│  Connectors are     │        │    → __connectors.github.callTool(...)       │
+│  host-side RPC      │        │    → Workers RPC                             │
+│  targets            │        │                                              │
+│                     │        │  codemode.search("query")                    │
+│  Platform SDK uses  │        │    → __dispatchers.codemode.call(...)        │
+│  ToolDispatcher     │        │    → host-side search                        │
+│                     │        │                                              │
+└─────────────────────┘        └─────────────────────────────────────────────┘
+```
+
+Connector calls go via **Workers RPC** directly to the host-side connector binding — no JSON serialization through ToolDispatcher. The platform SDK (`codemode.search`, `codemode.describe`, etc.) uses the traditional ToolDispatcher path since it's host-created.
+
 ## Architecture
 
 ### How it works
@@ -290,7 +547,7 @@ class NodeVMExecutor implements Executor {
 | Option           | Type                     | Default  | Description                                                  |
 | ---------------- | ------------------------ | -------- | ------------------------------------------------------------ |
 | `loader`         | `WorkerLoader`           | required | Worker Loader binding from `env.LOADER`                      |
-| `timeout`        | `number`                 | `30000`  | Execution timeout in ms                                      |
+| `timeout`        | `number`                 | `60000`  | Execution timeout in ms                                      |
 | `globalOutbound` | `Fetcher \| null`        | `null`   | Network access control. `null` = blocked, `Fetcher` = routed |
 | `modules`        | `Record<string, string>` | `{}`     | Extra modules importable in the sandbox                      |
 
@@ -320,7 +577,7 @@ The user sends a message, the agent passes it to an LLM with the codemode tool, 
 import { Agent } from "agents";
 import { createCodeTool } from "@cloudflare/codemode/ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import { streamText, convertToModelMessages, isStepCount } from "ai";
 
 export class MyAgent extends Agent<Env, State> {
   async onChatMessage() {
@@ -330,10 +587,10 @@ export class MyAgent extends Agent<Env, State> {
 
     const result = streamText({
       model,
-      system: "You are a helpful assistant.",
+      instructions: "You are a helpful assistant.",
       messages: await convertToModelMessages(this.state.messages),
       tools: { codemode },
-      stopWhen: stepCountIs(10)
+      stopWhen: isStepCount(10)
     });
 
     // Stream response back to client...
@@ -439,22 +696,23 @@ const types = generateTypes(myAiSdkTools);
 
 ## Module Structure
 
-| Module                             | Peer deps             | Exports                                                                                                                                                              |
-| ---------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@cloudflare/codemode`             | None                  | `sanitizeToolName`, `normalizeCode`, `generateTypesFromJsonSchema`, `jsonSchemaToType`, `DynamicWorkerExecutor`, `ToolDispatcher`, `ToolProvider`, `resolveProvider` |
-| `@cloudflare/codemode/ai`          | `ai`, `zod`           | `createCodeTool`, `generateTypes`, `aiTools`, `resolveProvider`, `ToolDescriptor`, `ToolDescriptors`                                                                 |
-| `@cloudflare/codemode/tanstack-ai` | `@tanstack/ai`, `zod` | `createCodeTool`, `generateTypes`, `tanstackTools`, `resolveProvider`                                                                                                |
-| `@cloudflare/codemode/browser`     | None                  | `createBrowserCodeTool`, `IframeSandboxExecutor`, `Executor`, `ExecuteResult`, `ResolvedProvider`, JSON Schema tool descriptor types                                 |
+| Module                             | Peer deps             | Exports                                                                                                                              |
+| ---------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `@cloudflare/codemode`             | None                  | `createCodemodeRuntime`, connector base classes, `DynamicWorkerExecutor`, executor utilities, JSON Schema type helpers               |
+| `@cloudflare/codemode/ai`          | `ai`, `zod`           | `createCodeTool`, `generateTypes`, `aiTools`, `resolveProvider`, `ToolDescriptor`, `ToolDescriptors`                                 |
+| `@cloudflare/codemode/tanstack-ai` | `@tanstack/ai`, `zod` | `createCodeTool`, `generateTypes`, `tanstackTools`, `resolveProvider`                                                                |
+| `@cloudflare/codemode/browser`     | None                  | `createBrowserCodeTool`, `IframeSandboxExecutor`, `Executor`, `ExecuteResult`, `ResolvedProvider`, JSON Schema tool descriptor types |
 
 ## Limitations
 
-- **Tool approval (`needsApproval`) is not supported yet.** Tools with `needsApproval: true` or a `needsApproval` function are excluded from codemode instead of pausing execution for approval. Support for approval flows within codemode is planned. For now, use approval-required tools through standard AI SDK tool calling instead.
+- Runtime approval support applies to connector annotations. Legacy `createCodeTool` still excludes tools with `needsApproval: true` instead of pausing execution.
 - Browser iframe execution uses nonce-scoped internal messages, but its timeout cannot preempt tight synchronous loops like `while (true) {}` because those block the browser event loop.
 - Requires Cloudflare Workers environment for `DynamicWorkerExecutor`
 - Limited to JavaScript execution
 
 ## Examples
 
+- [`examples/codemode-connectors/`](../../examples/codemode-connectors/) — Runtime and connector example with MCP and OpenAPI connectors
 - [`examples/codemode/`](../../examples/codemode/) — Full working example with task management tools
 - [`examples/codemode-browser/`](../../examples/codemode-browser/) — Browser iframe executor example with dynamic client tools
 

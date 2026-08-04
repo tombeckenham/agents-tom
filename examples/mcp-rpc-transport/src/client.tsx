@@ -1,5 +1,5 @@
 import { useAgent } from "agents/react";
-import { useAgentChat } from "agents/ai-react";
+import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { createRoot } from "react-dom/client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -105,7 +105,10 @@ function App() {
     }, [])
   });
 
-  const { messages, sendMessage, clearHistory } = useAgentChat({ agent });
+  const { messages, sendMessage, clearHistory } = useAgentChat({
+    agent,
+    experimental_throttle: 100
+  });
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

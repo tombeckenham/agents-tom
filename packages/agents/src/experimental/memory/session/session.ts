@@ -3,8 +3,20 @@
  */
 
 import type { ToolSet } from "ai";
-import type { SessionProvider, StoredCompaction } from "./provider";
-import type { SessionMessage, SessionOptions } from "./types";
+import type {
+  HistoryRowStat,
+  RecentHistoryResult,
+  SessionProvider,
+  StoredCompaction
+} from "./provider";
+import type {
+  CompactAfterOptions,
+  CompactContext,
+  CompactionErrorHandler,
+  SessionMessage,
+  SessionOptions,
+  SessionTokenCounter
+} from "./types";
 import {
   ContextBlocks,
   type ContextBlock,
@@ -14,7 +26,7 @@ import {
 import { AgentSessionProvider, type SqlProvider } from "./providers/agent";
 import { AgentContextProvider } from "./providers/agent-context";
 import type { CompactResult } from "../utils/compaction-helpers";
-import { estimateMessageTokens } from "../utils/tokens";
+import { estimateMessageTokens, estimateStringTokens } from "../utils/tokens";
 import { MessageType } from "../../../types";
 
 export type SessionContextOptions = Omit<ContextConfig, "label">;
@@ -68,9 +80,15 @@ export class Session {
   private _pending?: PendingContext[];
   private _cachedPrompt?: WritableContextProvider | true;
   private _compactionFn?:
-    | ((messages: SessionMessage[]) => Promise<CompactResult | null>)
+    | ((
+        messages: SessionMessage[],
+        context?: CompactContext
+      ) => Promise<CompactResult | null>)
     | null;
+  private _warnedCompactionNoOp = false;
   private _tokenThreshold?: number;
+  private _tokenCounter?: SessionTokenCounter;
+  private _compactionErrorHandler?: CompactionErrorHandler;
   private _ready = false;
   // Promise for the async skill restore kicked off during _ensureReady().
   // Every async public method awaits this before touching storage or
@@ -87,6 +105,8 @@ export class Session {
       options?.context ?? [],
       options?.promptStore
     );
+    this._tokenCounter = options?.tokenCounter;
+    this._compactionErrorHandler = options?.onCompactionError;
     this._ready = true;
   }
 
@@ -157,7 +177,10 @@ export class Session {
    * message history into a summary overlay.
    */
   onCompaction(
-    fn: (messages: SessionMessage[]) => Promise<CompactResult | null>
+    fn: (
+      messages: SessionMessage[],
+      context?: CompactContext
+    ) => Promise<CompactResult | null>
   ): this {
     this._compactionFn = fn;
     return this;
@@ -166,9 +189,27 @@ export class Session {
   /**
    * Auto-compact when estimated token count exceeds the threshold.
    * Checked after each `appendMessage`. Requires `onCompaction()`.
+   *
+   * By default this uses a Workers-safe heuristic over stored messages plus
+   * the Session-managed frozen system prompt. Provide `tokenCounter` when you
+   * have model-reported usage or a tokenizer and need a stricter budget.
    */
-  compactAfter(tokenThreshold: number): this {
+  compactAfter(tokenThreshold: number, options?: CompactAfterOptions): this {
     this._tokenThreshold = tokenThreshold;
+    if (options?.tokenCounter) {
+      this._tokenCounter = options.tokenCounter;
+    }
+    return this;
+  }
+
+  /**
+   * Handle failures from the automatic `compactAfter()` trigger.
+   *
+   * Manual `compact()` still reports errors through the existing session error
+   * broadcast path.
+   */
+  onCompactionError(handler: CompactionErrorHandler): this {
+    this._compactionErrorHandler = handler;
     return this;
   }
 
@@ -265,14 +306,41 @@ export class Session {
    * for load_context tool results that haven't been unloaded.
    * Runs once per init to survive hibernation / eviction, including for
    * async SessionProviders (e.g. Postgres) where we must `await` history.
+   *
+   * Skipped entirely when no skill-capable provider is configured —
+   * `load_context` results can only exist when a skill block was registered,
+   * and the scan would otherwise read the whole transcript on every wake,
+   * bypassing byte-budgeted hydration (#1710). A skill block added later via
+   * `addContext()` triggers the scan at that point instead.
    */
   private async _restoreLoadedSkills(): Promise<void> {
-    const history = await this.storage.getHistory();
+    if (!this.context.hasSkillCapableConfigs()) return;
+    await this._scanHistoryForLoadedSkills();
+  }
 
+  private _skillScanRan = false;
+
+  /**
+   * Scan stored history for load/unload_context tool results and restore
+   * the loaded-skill tracking set.
+   *
+   * Memory-bounded when the provider supports `getHistoryRowStats`: rows
+   * are enumerated without content, then only assistant rows are fetched
+   * and scanned ONE AT A TIME — peak memory is a single message instead of
+   * the whole transcript. Falls back to a full `getHistory()` read for
+   * providers without row stats (e.g. Postgres).
+   *
+   * Note: the bounded path scans raw path rows, so `load_context` results
+   * inside compacted ranges are still seen (the full-read path hides them
+   * behind compaction overlays). That superset is intentional — the stored
+   * tool result still exists and can be reclaimed by `unloadSkill`.
+   */
+  private async _scanHistoryForLoadedSkills(): Promise<void> {
+    this._skillScanRan = true;
     const loaded = new Set<string>();
 
-    for (const msg of history) {
-      if (msg.role !== "assistant") continue;
+    const scanMessage = (msg: SessionMessage) => {
+      if (msg.role !== "assistant") return;
       for (const part of msg.parts) {
         if (
           part.toolName === "load_context" &&
@@ -303,6 +371,19 @@ export class Session {
             loaded.delete(`${input.label}:${input.key}`);
           }
         }
+      }
+    };
+
+    if (this.storage.getHistoryRowStats) {
+      const stats = await this.storage.getHistoryRowStats();
+      for (const row of stats) {
+        if (row.role !== "assistant") continue;
+        const msg = await this.storage.getMessage(row.id);
+        if (msg) scanMessage(msg);
+      }
+    } else {
+      for (const msg of await this.storage.getHistory()) {
+        scanMessage(msg);
       }
     }
 
@@ -366,6 +447,61 @@ export class Session {
     return this.storage.getHistory(leafId);
   }
 
+  private _warnedNoRecentHistorySupport = false;
+
+  /**
+   * Byte-budgeted read of the most recent messages on the active branch
+   * path (always at least the leaf message, and at least
+   * `minRecentMessages` when the path is long enough). Lets hosts hydrate
+   * a bounded window instead of the full transcript so wake-time memory
+   * scales with the budget rather than total session history (#1710).
+   *
+   * Falls back to a full (untruncated) read when the provider doesn't
+   * implement `getRecentHistory`. The fallback reports honest metadata
+   * (`truncated: false` and the real serialized size) and warns once so a
+   * host relying on the budget knows it is not being enforced.
+   */
+  async getRecentHistory(
+    maxContentBytes: number,
+    minRecentMessages = 1
+  ): Promise<RecentHistoryResult> {
+    await this._ensureRestored();
+    if (this.storage.getRecentHistory) {
+      return this.storage.getRecentHistory(
+        null,
+        maxContentBytes,
+        minRecentMessages
+      );
+    }
+    if (!this._warnedNoRecentHistorySupport) {
+      this._warnedNoRecentHistorySupport = true;
+      console.warn(
+        "[Session] The configured SessionProvider does not implement " +
+          "getRecentHistory; the requested byte budget cannot be enforced " +
+          "and the FULL history was loaded. Implement getRecentHistory " +
+          "(and getHistoryRowStats) on the provider to bound hydration."
+      );
+    }
+    const messages = await this.storage.getHistory();
+    let totalContentBytes = 0;
+    for (const message of messages) {
+      totalContentBytes += JSON.stringify(message).length;
+    }
+    return { messages, truncated: false, totalContentBytes };
+  }
+
+  /**
+   * Per-row stored sizes for the active branch path (root → leaf) WITHOUT
+   * loading message content, or `null` when the provider doesn't support it.
+   * Lets hosts find oversized rows (e.g. inline base64 media) and process
+   * them one at a time with bounded memory.
+   */
+  async getHistoryRowStats(): Promise<HistoryRowStat[] | null> {
+    await this._ensureRestored();
+    if (!this.storage.getHistoryRowStats) return null;
+    return this.storage.getHistoryRowStats();
+  }
+
   async getMessage(id: string): Promise<SessionMessage | null> {
     await this._ensureRestored();
     return this.storage.getMessage(id);
@@ -393,11 +529,67 @@ export class Session {
     this._broadcaster.broadcast(JSON.stringify({ type, ...data }));
   }
 
+  private _shouldEstimateTokens(): boolean {
+    return Boolean(
+      this._broadcaster || (this._tokenThreshold != null && this._compactionFn)
+    );
+  }
+
+  private async _estimateTokenCount(): Promise<number> {
+    const messages = await this.getHistory();
+    const systemPrompt = await this.context.getSystemPromptForEstimate();
+
+    if (this._tokenCounter) {
+      if (!this.context.isLoaded()) {
+        await this.context.load();
+      }
+      const contextBlocks = this.context.getBlocks();
+      const estimate = await this._tokenCounter({
+        messages,
+        systemPrompt,
+        contextBlocks
+      });
+      return Number.isFinite(estimate) ? Math.max(0, Math.ceil(estimate)) : 0;
+    }
+
+    return estimateMessageTokens(messages) + estimateStringTokens(systemPrompt);
+  }
+
+  private async _handleAutoCompactionError(error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (this._compactionErrorHandler) {
+      try {
+        await this._compactionErrorHandler(error);
+      } catch (handlerError) {
+        const handlerMessage =
+          handlerError instanceof Error
+            ? handlerError.message
+            : String(handlerError);
+        console.warn(
+          `Session auto-compaction error handler failed: ${handlerMessage}`
+        );
+      }
+    } else {
+      console.warn(`Session auto-compaction failed: ${message}`);
+    }
+
+    this._emitError(message);
+  }
+
   private async _emitStatus(
     phase: "idle" | "compacting",
     extra?: Record<string, unknown>
   ): Promise<number> {
-    const tokenEstimate = estimateMessageTokens(await this.getHistory());
+    let tokenEstimate = 0;
+    if (this._shouldEstimateTokens()) {
+      try {
+        tokenEstimate = await this._estimateTokenCount();
+      } catch (err) {
+        await this._handleAutoCompactionError(err);
+      }
+    }
+
     this._broadcast(MessageType.CF_AGENT_SESSION, {
       phase,
       tokenEstimate,
@@ -450,8 +642,25 @@ export class Session {
     ) {
       try {
         compacted = Boolean(await this.compact());
-      } catch {
+        if (!compacted && !this._warnedCompactionNoOp) {
+          // The trigger fired (over threshold) but the compaction function
+          // returned null — history was not shortened, so this will fire again
+          // next turn. Most often the boundary heuristic under-counts a
+          // tool-heavy history; surface it once instead of looping silently.
+          this._warnedCompactionNoOp = true;
+          console.warn(
+            `[Session] Auto-compaction fired (~${tokenEstimate} tokens > ${this._tokenThreshold}) but the compaction function returned null, so history was not shortened. ` +
+              (this._tokenCounter
+                ? `A tokenCounter is configured and now flows to the boundary logic, but it is invoked per-message there — a whole-prompt/usage counter (e.g. returning a fixed usage.inputTokens regardless of which messages are passed) degrades the tail budget to minTailMessages and can still no-op. Pass a per-message CompactOptions.tokenCounter for precise tail budgeting.`
+                : `If your history is tool-heavy, configure a tokenCounter on compactAfter() — it flows to createCompactFunction's boundary logic automatically.`)
+          );
+        } else if (compacted) {
+          // Re-arm the one-time warning so a later regression is surfaced again.
+          this._warnedCompactionNoOp = false;
+        }
+      } catch (err) {
         // Auto-compact failure is non-fatal — message is already appended
+        await this._handleAutoCompactionError(err);
       }
     }
 
@@ -469,6 +678,23 @@ export class Session {
     await this._ensureRestored();
     await this.storage.updateMessage(message);
     await this._emitStatus("idle");
+    await this._notifyMessagesChanged({ type: "update", message });
+  }
+
+  /**
+   * @internal
+   * Rewrite a stored message WITHOUT the public-write side effects: no
+   * token-estimate status broadcast (which reads the FULL history) and no
+   * auto-compaction check. For framework maintenance passes that rewrite
+   * many rows with bounded memory — e.g. media eviction (#1710) — where the
+   * per-row full-history estimate would reintroduce the memory pressure the
+   * pass exists to remove. The message-change listener still fires so a
+   * cache-owning host stays coherent. Application code should use
+   * `updateMessage`.
+   */
+  async internal_rewriteMessage(message: SessionMessage): Promise<void> {
+    await this._ensureRestored();
+    await this.storage.updateMessage(message);
     await this._notifyMessagesChanged({ type: "update", message });
   }
 
@@ -520,7 +746,13 @@ export class Session {
 
     let result: CompactResult | null;
     try {
-      result = await this._compactionFn(await this.getHistory());
+      // Pass the Session's authoritative token counter so the compaction
+      // function's boundary logic can use the same accounting as the
+      // fire/no-fire decision (see CompactContext). The function still wins if
+      // it was given its own explicit counter.
+      result = await this._compactionFn(await this.getHistory(), {
+        tokenCounter: this._tokenCounter
+      });
     } catch (err) {
       this._emitError(err instanceof Error ? err.message : String(err));
       return null;
@@ -615,12 +847,20 @@ export class Session {
       const key = this._sessionId ? `${label}_${this._sessionId}` : label;
       provider = new AgentContextProvider(this._agent, key);
     }
-    return this.context.addBlock({
+    const block = await this.context.addBlock({
       label,
       description: opts.description,
       maxTokens: opts.maxTokens,
       provider
     });
+    // The init-time skill restore is skipped when no skill provider is
+    // configured (see _restoreLoadedSkills). If a skill block arrives later
+    // (e.g. an extension's onLoad), run the scan now so previously loaded
+    // skills from history are tracked.
+    if (block.isSkill && !this._skillScanRan) {
+      await this._scanHistoryForLoadedSkills();
+    }
+    return block;
   }
 
   /**

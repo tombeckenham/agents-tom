@@ -9,24 +9,24 @@
     "types": "wrangler types env.d.ts --include-runtime false"
   },
   "dependencies": {
-    "@cloudflare/kumo": "^2.2.1",
+    "@cloudflare/kumo": "^2.6.0",
     "@phosphor-icons/react": "^2.1.10",
     "agents": "*",
-    "nanoid": "^5.1.11",
-    "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "nanoid": "^5.1.16",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.37.2",
-    "@cloudflare/workers-types": "^4.20260519.1",
+    "@cloudflare/vite-plugin": "^1.48.0",
+    "@cloudflare/workers-types": "^5.20260729.1",
     "@tailwindcss/vite": "^4",
-    "@types/node": "^25.9.0",
-    "@types/react": "^19.2.14",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.2",
-    "tailwindcss": "^4.3.0",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tailwindcss": "^4.3.2",
     "typescript": "^6.0.3",
-    "vite": "^8.0.13",
-    "wrangler": "^4.93.0"
+    "vite": "^8.1.0",
+    "wrangler": "^4.115.0"
   }
 }

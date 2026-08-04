@@ -26,7 +26,11 @@
 import type { Agent, Connection, WSMessage } from "agents";
 import { VOICE_PROTOCOL_VERSION } from "./types";
 import type { Transcriber } from "./types";
-import { AudioConnectionManager, sendVoiceJSON } from "./audio-pipeline";
+import {
+  AudioConnectionManager,
+  runBackground,
+  sendVoiceJSON
+} from "./audio-pipeline";
 
 // --- Mixin ---
 
@@ -90,6 +94,9 @@ export function withVoiceInput<TBase extends AgentLike>(
     #cm = new AudioConnectionManager("VoiceInput");
     #keepAliveDispose = new Map<string, () => void>();
 
+    // Current async start_call identity per connection, used to ignore stale startup work.
+    #startupTokens = new Map<string, symbol>();
+
     static #VOICE_MESSAGES = new Set([
       "hello",
       "start_call",
@@ -133,6 +140,7 @@ export function withVoiceInput<TBase extends AgentLike>(
 
       // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- overwriting lifecycle
       (this as any).onClose = (connection: Connection, ...rest: unknown[]) => {
+        this.#startupTokens.delete(connection.id);
         this.#releaseKeepAlive(connection.id);
         this.#cm.cleanup(connection.id);
         return _onClose?.(connection, ...rest);
@@ -164,16 +172,20 @@ export function withVoiceInput<TBase extends AgentLike>(
             case "hello":
               break;
             case "start_call":
-              this.#handleStartCall(connection);
+              runBackground("start_call", () =>
+                this.#handleStartCall(connection)
+              );
               break;
             case "end_call":
-              this.#handleEndCall(connection);
+              runBackground("end_call", () => this.#handleEndCall(connection));
               break;
             case "start_of_speech":
             case "end_of_speech":
               break;
             case "interrupt":
-              this.#handleInterrupt(connection);
+              runBackground("interrupt", () =>
+                this.#handleInterrupt(connection)
+              );
               break;
           }
           return;
@@ -218,47 +230,74 @@ export function withVoiceInput<TBase extends AgentLike>(
     async #handleStartCall(connection: Connection) {
       if (this.#cm.isInCall(connection.id)) return;
 
+      const startupToken = Symbol(connection.id);
+      this.#startupTokens.set(connection.id, startupToken);
+
       this.#cm.initConnection(connection.id);
 
-      const allowed = await this.beforeCallStart(connection);
-      if (!allowed) {
-        this.#cm.cleanup(connection.id);
-        return;
-      }
-
-      const provider = this.createTranscriber(connection) ?? this.transcriber;
-      if (!provider) {
-        console.error(
-          "[VoiceInput] No transcriber configured. Set 'transcriber' on your VoiceInput subclass or override createTranscriber()."
-        );
-        sendVoiceJSON(
-          connection,
-          {
-            type: "error",
-            message:
-              "No transcriber configured. Set 'transcriber' on your VoiceInput subclass or override createTranscriber()."
-          },
-          "VoiceInput"
-        );
-        this.#cm.cleanup(connection.id);
-        return;
-      }
-
-      const dispose = await this.keepAlive();
-      this.#keepAliveDispose.set(connection.id, dispose);
-
-      this.#cm.startTranscriberSession(connection.id, provider, {
-        onInterim: (text: string) => {
-          sendVoiceJSON(
+      try {
+        const allowed = await this.beforeCallStart(connection);
+        if (!this.#isCurrentStartup(connection.id, startupToken)) return;
+        if (!allowed) {
+          await this.#handleStartupFailure(
             connection,
-            { type: "transcript_interim", text },
-            "VoiceInput"
+            startupToken,
+            undefined,
+            "Voice call was rejected",
+            null
           );
-        },
-        onUtterance: (transcript: string) => {
-          this.#emitTranscript(connection, transcript);
+          return;
         }
-      });
+
+        const provider = this.createTranscriber(connection) ?? this.transcriber;
+        if (!provider) {
+          const message =
+            "No transcriber configured. Set 'transcriber' on your VoiceInput subclass or override createTranscriber().";
+          console.error(`[VoiceInput] ${message}`);
+          await this.#handleStartupFailure(
+            connection,
+            startupToken,
+            undefined,
+            message,
+            null
+          );
+          return;
+        }
+
+        const dispose = await this.keepAlive();
+        if (!this.#isCurrentStartup(connection.id, startupToken)) {
+          dispose();
+          return;
+        }
+        this.#keepAliveDispose.set(connection.id, dispose);
+
+        this.#cm.startTranscriberSession(connection.id, provider, {
+          onInterim: (text: string) => {
+            sendVoiceJSON(
+              connection,
+              { type: "transcript_interim", text },
+              "VoiceInput"
+            );
+          },
+          onUtterance: (transcript: string) => {
+            runBackground("emitTranscript", () =>
+              this.#emitTranscript(connection, transcript)
+            );
+          }
+        });
+      } catch (error) {
+        await this.#handleStartupFailure(
+          connection,
+          startupToken,
+          error,
+          "Voice input failed to start",
+          "[VoiceInput] Call startup failed:"
+        );
+        return;
+      }
+
+      if (!this.#isCurrentStartup(connection.id, startupToken)) return;
+      this.#startupTokens.delete(connection.id);
 
       sendVoiceJSON(
         connection,
@@ -267,6 +306,41 @@ export function withVoiceInput<TBase extends AgentLike>(
       );
 
       await this.onCallStart(connection);
+    }
+
+    #isCurrentStartup(connectionId: string, startupToken: symbol): boolean {
+      return (
+        this.#startupTokens.get(connectionId) === startupToken &&
+        this.#cm.isInCall(connectionId)
+      );
+    }
+
+    async #handleStartupFailure(
+      connection: Connection,
+      startupToken: symbol,
+      error: unknown,
+      clientMessage: string,
+      logPrefix: string | null = "[VoiceInput] Call startup failed:"
+    ): Promise<void> {
+      if (!this.#isCurrentStartup(connection.id, startupToken)) return;
+
+      // The client starts local audio optimistically on start_call. Every
+      // terminal startup path must send error + idle so it tears that down.
+      if (logPrefix && error !== undefined) console.error(logPrefix, error);
+      this.#startupTokens.delete(connection.id);
+      sendVoiceJSON(
+        connection,
+        { type: "error", message: clientMessage },
+        "VoiceInput"
+      );
+      this.#cm.cleanup(connection.id);
+      this.#releaseKeepAlive(connection.id);
+      sendVoiceJSON(
+        connection,
+        { type: "status", status: "idle" },
+        "VoiceInput"
+      );
+      await this.onCallEnd(connection);
     }
 
     #releaseKeepAlive(connectionId: string) {
@@ -278,6 +352,7 @@ export function withVoiceInput<TBase extends AgentLike>(
     }
 
     #handleEndCall(connection: Connection) {
+      this.#startupTokens.delete(connection.id);
       this.#cm.cleanup(connection.id);
       this.#releaseKeepAlive(connection.id);
       sendVoiceJSON(
@@ -285,7 +360,9 @@ export function withVoiceInput<TBase extends AgentLike>(
         { type: "status", status: "idle" },
         "VoiceInput"
       );
-      this.onCallEnd(connection);
+      // Return the (possibly async) consumer hook so its rejections are
+      // caught by the runBackground wrapper around this handler.
+      return this.onCallEnd(connection);
     }
 
     #handleInterrupt(connection: Connection) {
@@ -296,7 +373,7 @@ export function withVoiceInput<TBase extends AgentLike>(
         { type: "status", status: "listening" },
         "VoiceInput"
       );
-      this.onInterrupt(connection);
+      return this.onInterrupt(connection);
     }
 
     // --- Internal: transcript emission ---

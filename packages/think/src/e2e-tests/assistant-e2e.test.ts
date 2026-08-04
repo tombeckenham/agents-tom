@@ -7,9 +7,17 @@
  */
 import { describe, it, expect, afterAll, beforeAll } from "vitest";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { setDefaultAutoSelectFamily } from "node:net";
+import "./harden-net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+
+// Disable happy-eyeballs dual-stack racing. When a probe `fetch`/WebSocket
+// connects to a server that is mid-SIGKILL/restart, the abandoned racing socket
+// can throw a connect-time `setTypeOfService` EINVAL that surfaces as an
+// unhandled error and fails an otherwise-green chaos run.
+setDefaultAutoSelectFamily(false);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 18798;
@@ -49,6 +57,28 @@ function killProcessOnPort(port: number): void {
   }
 }
 
+function killProcessTree(pid: number): void {
+  let children: number[] = [];
+  try {
+    children = execSync(`pgrep -P ${pid} 2>/dev/null || true`)
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(Number);
+  } catch {
+    // pgrep may be unavailable; killing the parent is still useful.
+  }
+  for (const childPid of children) {
+    killProcessTree(childPid);
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already dead
+  }
+}
+
 function startWrangler(): ChildProcess {
   const configPath = path.join(__dirname, "wrangler.jsonc");
   const child = spawn(
@@ -68,7 +98,6 @@ function startWrangler(): ChildProcess {
     {
       cwd: __dirname,
       stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
       env: { ...process.env, NODE_ENV: "test" }
     }
   );
@@ -85,10 +114,11 @@ function startWrangler(): ChildProcess {
   return child;
 }
 
-async function waitForReady(maxAttempts = 30, delayMs = 1000): Promise<void> {
+async function waitForReady(maxAttempts = 60, delayMs = 1000): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
       const res = await fetch(`${BASE_URL}/`);
+      await res.body?.cancel();
       if (res.status > 0) return;
     } catch {
       // Not ready yet
@@ -104,17 +134,15 @@ function killProcess(child: ChildProcess): Promise<void> {
       resolve();
       return;
     }
-    child.on("exit", () => resolve());
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(child.pid, "SIGKILL");
-      } catch {
-        // Already dead
-      }
-    }
-    setTimeout(resolve, 3000);
+    // Clear the fallback timer once the child exits — an uncleared timer keeps
+    // the vitest worker's event loop alive and can push teardown past the pool's
+    // termination window ("Timeout terminating forks worker").
+    const fallback = setTimeout(resolve, 3000);
+    child.on("exit", () => {
+      clearTimeout(fallback);
+      resolve();
+    });
+    killProcessTree(child.pid);
   });
 }
 
@@ -260,16 +288,22 @@ function sendChatAndWaitForDone(
 }
 
 /**
- * Wait for the next cf_agent_chat_messages broadcast.
+ * Wait for the next cf_agent_chat_messages broadcast. Best-effort sync barrier:
+ * resolves with the broadcast, or `null` on timeout. It deliberately does NOT
+ * reject — callers arm it before sending and await it after, so a reject timer
+ * could fire on a dangling promise (if the intervening send throws or the
+ * broadcast simply never lands) and surface as an unhandled rejection that fails
+ * an otherwise-green run. The authoritative assertion is always the subsequent
+ * `getMessages` RPC, so a missed broadcast does not need to fail the test here.
  */
 function waitForMessagesBroadcast(
   ws: WebSocket,
   timeout = 10000
-): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
+): Promise<Record<string, unknown> | null> {
+  return new Promise((resolve) => {
     const timer = setTimeout(() => {
       ws.removeEventListener("message", handler);
-      reject(new Error("Messages broadcast timed out"));
+      resolve(null);
     }, timeout);
 
     const handler = (e: MessageEvent) => {
@@ -408,10 +442,8 @@ describe("think e2e — real LLM", () => {
       'Use the write tool to create a file at /hello.txt with the content "Hello from e2e test"'
     );
 
-    // Wait for persistence
-    await waitForMessagesBroadcast(ws).catch(() => {
-      // timeout OK — message may have already been received
-    });
+    // Wait for persistence (best-effort barrier; resolves null on timeout).
+    await waitForMessagesBroadcast(ws);
 
     // Now ask the LLM to read it back
     const { chunks: readChunks } = await sendChatAndWaitForDone(
@@ -448,7 +480,7 @@ describe("think e2e — real LLM", () => {
 
     // First turn
     await sendChatAndWaitForDone(ws, "My name is TestBot.");
-    await waitForMessagesBroadcast(ws).catch(() => {});
+    await waitForMessagesBroadcast(ws);
 
     // Second turn — the LLM should remember the name
     const { chunks } = await sendChatAndWaitForDone(

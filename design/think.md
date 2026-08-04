@@ -4,6 +4,11 @@ An opinionated Agent base class for AI assistants. Handles the chat lifecycle �
 
 **Status:** experimental (`@cloudflare/think`, v0.1.2)
 
+> This is a historical design note. For current user-facing API behavior, see
+> [`docs/think/index.md`](../docs/think/index.md),
+> [`docs/think/lifecycle-hooks.md`](../docs/think/lifecycle-hooks.md), and
+> [`docs/agents/chat-agents.md#stream-recovery`](../docs/agents/chat-agents.md#stream-recovery).
+
 ## Problem
 
 Every AI agent built on the Agents SDK needs the same infrastructure:
@@ -72,7 +77,7 @@ Think requires almost no boilerplate. The minimal subclass overrides one method:
 export class ChatSession extends Think<Env> {
   getModel() {
     return createWorkersAI({ binding: this.env.AI })(
-      "@cf/moonshotai/kimi-k2.6"
+      "@cf/moonshotai/kimi-k2.7-code"
     );
   }
 }
@@ -80,15 +85,15 @@ export class ChatSession extends Think<Env> {
 
 The full set of override points:
 
-| Method               | Default                          | Purpose                               |
-| -------------------- | -------------------------------- | ------------------------------------- |
-| `getModel()`         | throws                           | Return the `LanguageModel` to use     |
-| `getSystemPrompt()`  | `"You are a helpful assistant."` | System prompt                         |
-| `getTools()`         | `{}`                             | AI SDK `ToolSet` for the agentic loop |
-| `getMaxSteps()`      | `10`                             | Max tool-call rounds per turn         |
-| `assembleContext()`  | prune older tool calls           | Customize what's sent to the LLM      |
-| `onChatMessage()`    | `streamText(...)`                | Full control over inference           |
-| `onChatError(error)` | passthrough                      | Customize error handling              |
+| Method                    | Default                          | Purpose                               |
+| ------------------------- | -------------------------------- | ------------------------------------- |
+| `getModel()`              | throws                           | Return the `LanguageModel` to use     |
+| `getSystemPrompt()`       | `"You are a helpful assistant."` | System prompt                         |
+| `getTools()`              | `{}`                             | AI SDK `ToolSet` for the agentic loop |
+| `getMaxSteps()`           | `10`                             | Max tool-call rounds per turn         |
+| `assembleContext()`       | prune older tool calls           | Customize what's sent to the LLM      |
+| `onChatMessage()`         | `streamText(...)`                | Full control over inference           |
+| `onChatError(error, ctx)` | passthrough                      | Customize error handling              |
 
 ### Step-by-step: a chat request
 
@@ -190,7 +195,7 @@ A `_turnQueue.generation` check prevents persisting into a cleared conversation 
 If an error occurs during the agentic loop or streaming:
 
 - **Partial message is persisted** — whatever was generated before the error is saved so context isn't lost (both WebSocket and RPC paths)
-- **`onChatError(error)` is called** — override to log, transform, or swallow
+- **`onChatError(error, ctx)` is called** — override to log, transform, or swallow
 - **Error is communicated** — WebSocket broadcasts `{ done: true, error: true }`, RPC calls `callback.onError()`
 
 ### Wire protocol
@@ -296,9 +301,10 @@ When used as a sub-agent, the `chat()` method runs a full turn and streams event
 
 ```typescript
 interface StreamCallback {
+  onStart(event: { requestId: string }): void | Promise<void>;
   onEvent(json: string): void | Promise<void>;
   onDone(): void | Promise<void>;
-  onError?(error: string): void | Promise<void>;
+  onError(error: string): void | Promise<void>;
 }
 ```
 
@@ -364,6 +370,21 @@ const executeTool = createExecuteTool({
 
 The LLM writes JavaScript code. The tool sends it to a dynamic Worker isolate via `DynamicWorkerExecutor`. The sandbox can call workspace tools via `codemode.*` and optionally the full `state.*` filesystem API (`readFile`, `writeFile`, `glob`, `searchFiles`, `planEdits`, etc.). Fully isolated: no network access by default, configurable timeout.
 
+### Fetch tools (`@cloudflare/think/tools/fetch`)
+
+Opt-in, read-only HTTP reads. `createFetchTools()` generates a generic `fetch_url` tool (when a public `allowlist` is set) plus one `fetch_<name>` per binding target. Wired into Think via the `fetchTools` property, which auto-merges the generated tools between workspace tools and `getTools()` and adds a capability-prompt line; it injects `this.workspace` and a `tool:fetch` observability emit automatically.
+
+```typescript
+fetchTools = {
+  allowlist: ["https://developers.cloudflare.com/**"],
+  bindings: {
+    docsApi: { binding: this.env.DOCS_API, allowlist: ["/v1/docs/**"] }
+  }
+};
+```
+
+Key decisions: named tools (not one polymorphic tool) so per-target policy is baked in; `GET`-only (mutations belong in approval-gated actions, and recovery replays a turn so non-idempotent egress would be unsafe); Workers-grounded SSRF defenses (private/loopback/link-local/`*.internal` blocked for the public path, credentials rejected, IPv4 shorthand normalized by the WHATWG URL parser); three size knobs (`maxBytes` download cap, `maxModelChars` text truncation, `response: "workspace"` spill); allowlist-aware redirect policy with cross-origin header stripping; and a markdown-first default `Accept`. Results are returned as structured `{ ok, ... }` values, never thrown.
+
 ### Browser tools (`@cloudflare/think/tools/browser`)
 
 Two AI SDK tools for CDP-based browser automation:
@@ -396,6 +417,32 @@ Two AI SDK tools for managing extensions at runtime:
 3. **Persistence** — stores extension manifest + source in DO storage, `restore()` rebuilds from storage after hibernation
 4. **Permissions** — extensions declare `network` (allowed hosts) and `workspace` (`read` | `read-write` | `none`) permissions. Workspace access is mediated by `HostBridgeLoopback`, a `WorkerEntrypoint` that resolves the parent agent via `ctx.exports` and delegates operations with permission checks.
 5. **Unloading** — removes the extension and its tools, deletes from storage
+
+### Reply attachments (`ctx.attachReply`)
+
+Actions can record advisory delivery metadata for the current reply via
+`ctx.attachReply(attachment)`. The attachment is a side channel: it never changes
+the model-visible tool output, and surfaces that do not understand an attachment
+type ignore it.
+
+Think accumulates attachments for the active admitted turn, JSON-normalizes them
+on record (so circular references, bigint, functions, or symbols cannot break
+downstream persistence/RPC), caps the number recorded per turn, deep-copies
+snapshots on read, and exposes the producing-attempt snapshot in two places:
+
+- `onChatResponse(result)` receives `result.attachments`.
+- `replyAttachments(requestId?)` returns a copy for server-side/programmatic
+  callers. Passing a mismatched request id returns `[]`.
+
+Normal server actions and approval-gated actions after approval can attach reply
+metadata from successful `execute` calls. Policy callbacks (`approval`,
+`permissions`, function-valued `idempotencyKey`) receive a no-op recorder, and
+attachments from an `execute` that later fails are discarded. `durable-pause`
+approved actions are a v1 no-op because their result is delivered by a later
+continuation turn with a new request id; persisting attachments across that
+handoff is future work. Rendering (voice notes, email drafts, cards,
+messenger-specific payloads) is owned by the Channels/Voice surfaces, not by this
+recording API.
 
 ## SQLite tables
 
@@ -500,6 +547,7 @@ Tests in `packages/think/src/tests/`, running inside the Workers runtime via `@c
 | `@cloudflare/think/extensions`       | `src/extensions/index.ts` | ExtensionManager, HostBridgeLoopback                   |
 | `@cloudflare/think/tools/workspace`  | `src/tools/workspace.ts`  | File operation tool factories (for custom backends)    |
 | `@cloudflare/think/tools/execute`    | `src/tools/execute.ts`    | Sandboxed code execution tool                          |
+| `@cloudflare/think/tools/fetch`      | `src/tools/fetch.ts`      | Opt-in allowlisted, read-only HTTP fetch tools         |
 | `@cloudflare/think/tools/browser`    | `src/tools/browser.ts`    | CDP browser automation tools (search + execute)        |
 | `@cloudflare/think/tools/extensions` | `src/tools/extensions.ts` | Extension management AI tools                          |
 
@@ -512,4 +560,4 @@ Think's design — skills, extensions, tree-structured sessions, compaction, and
 - [chat-shared-layer.md](./chat-shared-layer.md) — shared streaming, sanitization, and protocol primitives (Think uses `StreamAccumulator`, `sanitizeMessage`, `enforceRowSizeLimit`, `CHAT_MESSAGE_TYPES`, `TurnQueue`, `ResumableStream`, `ContinuationState` from `agents/chat`)
 - [rfc-sub-agents.md](./rfc-sub-agents.md) — sub-agents via facets (Think's `subAgent()` is built on this)
 - [loopback.md](./loopback.md) — cross-boundary RPC pattern (used by extension host bridge)
-- [workspace.md](./workspace.md) — Workspace design (Think's file tools are backed by this)
+- [workspace.md](./shell/index.md) — Workspace design (Think's file tools are backed by this)

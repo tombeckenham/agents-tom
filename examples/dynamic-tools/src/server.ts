@@ -5,7 +5,7 @@ import {
   streamText,
   convertToModelMessages,
   pruneMessages,
-  stepCountIs
+  isStepCount
 } from "ai";
 
 /**
@@ -27,10 +27,10 @@ export class DynamicToolsAgent extends AIChatAgent {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system:
+      instructions:
         "You are a helpful assistant. You have access to tools provided by " +
         "the embedding application. Use them when asked. If no tools are " +
         "available, let the user know they can enable tools in the sidebar.",
@@ -41,7 +41,7 @@ export class DynamicToolsAgent extends AIChatAgent {
       }),
       // Dynamic tools from client — the server does not know these at deploy time
       tools: createToolsFromClientSchemas(options?.clientTools),
-      stopWhen: stepCountIs(5)
+      stopWhen: isStepCount(5)
     });
 
     return result.toUIMessageStreamResponse();

@@ -18,7 +18,7 @@ async function getHost(): Promise<TestHostAgent> {
   )) as unknown as TestHostAgent;
 }
 
-describe("AgentChatStateAdapter", () => {
+describe("ChatSdkStateAdapter", () => {
   it("persists subscription state", async () => {
     const host = await getHost();
 

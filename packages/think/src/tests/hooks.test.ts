@@ -5,6 +5,7 @@ import type { UIMessage } from "ai";
 
 const MSG_CHAT_REQUEST = "cf_agent_use_chat_request";
 const MSG_CHAT_RESPONSE = "cf_agent_use_chat_response";
+const MSG_TOOL_APPROVAL = "cf_agent_tool_approval";
 
 async function connectWS(agentClass: string, room: string) {
   const slug = agentClass
@@ -217,7 +218,7 @@ describe("Think — beforeStep hook", () => {
 
 // ── onStepFinish ────────────────────────────────────────────────
 
-describe("Think — onStepFinish hook", () => {
+describe("Think — onStepEnd hook", () => {
   it("fires after step completes with correct data", async () => {
     const agent = await freshAgent("hook-sf-1");
     await agent.testChat("Hello");
@@ -283,6 +284,774 @@ describe("Think — tool-call hooks expose typed input/output", () => {
     expect(JSON.parse(log[0].inputJson)).toEqual({ message: "ping" });
     // Mock tool returns "pong: ping"
     expect(JSON.parse(log[0].outputJson)).toBe("pong: ping");
+    expect(JSON.parse(log[0].toolOutputJson)).toEqual({
+      type: "tool-result",
+      output: "pong: ping"
+    });
+    expect(typeof log[0].toolExecutionMs).toBe("number");
+    expect(log[0].durationMs).toBe(log[0].toolExecutionMs);
+  });
+});
+
+// ── Actions ──────────────────────────────────────────────────────
+
+describe("Think — actions compile into guarded tools", () => {
+  it("executes an action through the tool-call hooks", async () => {
+    const agent = await freshToolAgent("action-default");
+    await agent.useEchoActionForTest();
+    await agent.testChat("call echo action");
+
+    const before = await agent.getBeforeToolCallLog();
+    expect(before.length).toBeGreaterThan(0);
+    expect(before[0].toolName).toBe("echo");
+    expect(JSON.parse(before[0].inputJson)).toEqual({ message: "hello" });
+
+    const after = await agent.getAfterToolCallLog();
+    expect(after.length).toBeGreaterThan(0);
+    expect(JSON.parse(after[0].outputJson)).toBe("action echo: hello");
+
+    const probe = await agent.getActionProbe();
+    expect(probe.count).toBe(1);
+    expect(probe.context?.requestId).not.toBe("");
+    expect(probe.context?.toolCallId).toBe("tc1");
+    expect(probe.context?.messageCount).toBeGreaterThan(0);
+  });
+
+  it("allows permissioned actions by default", async () => {
+    const agent = await freshToolAgent("action-permission-default");
+    await agent.useEchoActionForTest("permission");
+    await agent.testChat("call echo action");
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("action echo: hello");
+  });
+
+  it("denies permissioned actions before execute", async () => {
+    const agent = await freshToolAgent("action-permission-denied");
+    await agent.useEchoActionForTest("permission");
+    await agent.setActionGrantedPermissions([]);
+    await agent.testChat("call echo action");
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toEqual({
+      error: {
+        name: "ActionAuthorizationError",
+        message: "Missing required permission: echo:run",
+        permissions: ["echo:run"]
+      }
+    });
+  });
+
+  it("maps thrown action errors to structured tool output", async () => {
+    const agent = await freshToolAgent("action-throw");
+    await agent.useEchoActionForTest("throw");
+    await agent.testChat("call echo action");
+
+    const after = await agent.getAfterToolCallLog();
+    expect(after.length).toBeGreaterThan(0);
+    expect(JSON.parse(after[0].outputJson)).toEqual({
+      error: { name: "Error", message: "action failed" }
+    });
+  });
+
+  it("times out actions with a structured tool output", async () => {
+    const agent = await freshToolAgent("action-timeout");
+    await agent.useEchoActionForTest("timeout");
+    await agent.testChat("call echo action");
+
+    const after = await agent.getAfterToolCallLog();
+    expect(after.length).toBeGreaterThan(0);
+    const output = JSON.parse(after[0].outputJson) as {
+      error?: { message?: string };
+    };
+    expect(output.error?.message).toContain("timed out");
+  });
+
+  it("truncates oversized action outputs before model consumption", async () => {
+    const agent = await freshToolAgent("action-large-output");
+    await agent.useEchoActionForTest("large-output");
+    await agent.testChat("call echo action");
+
+    const after = await agent.getAfterToolCallLog();
+    expect(after.length).toBeGreaterThan(0);
+    const output = JSON.parse(after[0].outputJson) as string;
+    expect(output).toContain("[truncated");
+    expect(output.length).toBeLessThan(22_000);
+  });
+
+  it("normalizes non-JSON-safe action outputs before model consumption", async () => {
+    const agent = await freshToolAgent("action-non-json-output");
+    await agent.useEchoActionForTest("non-json-output");
+    await agent.testChat("call echo action");
+
+    const after = await agent.getAfterToolCallLog();
+    expect(after.length).toBeGreaterThan(0);
+    expect(JSON.parse(after[0].outputJson)).toEqual({
+      count: "12n",
+      self: "[Circular]"
+    });
+  });
+
+  it("records and replays settled action ledger rows", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-replay-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionIdempotencyKey("replay-key");
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toBe(
+      "action echo: hello"
+    );
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toMatchObject([
+      {
+        key: "action:echo:replay-key",
+        action_name: "echo",
+        status: "settled"
+      }
+    ]);
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toBe(
+      "action echo: hello"
+    );
+    expect((await agent.getActionProbe()).count).toBe(1);
+  });
+
+  it("returns a programming error for action ledger key/input conflicts", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-conflict-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionIdempotencyKey("conflict-key");
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toBe(
+      "action echo: hello"
+    );
+    await expect(
+      agent.executeEchoActionToolForTest("different")
+    ).resolves.toEqual({
+      error: {
+        name: "ActionKeyConflict",
+        message:
+          'Idempotency key "action:echo:conflict-key" for action "echo" was reused with different input. This is a programming error; do not retry.'
+      }
+    });
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+  });
+
+  it("does not execute when the action ledger has an unknown pending row", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-pending-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionIdempotencyKey("pending-key");
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:pending-key",
+      status: "pending"
+    });
+
+    await agent.testChat("call echo action");
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[after.length - 1]?.outputJson ?? "null")).toEqual({
+      error: {
+        name: "ActionPendingError",
+        message:
+          "A prior attempt of this action is in an unknown state; not re-executed. Manual reconciliation may be required."
+      }
+    });
+  });
+
+  it("reclaims a stale explicit-key pending row and settles it", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-reclaim-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionIdempotencyKey("pending-key");
+    await agent.setActionLedgerPendingRetryLeaseForTest(50);
+    const stale = Date.now() - 1_000;
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:pending-key",
+      status: "pending",
+      updatedAt: stale
+    });
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toBe(
+      "action echo: hello"
+    );
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    const rows = await agent.listActionLedgerRowsForTest();
+    expect(rows).toMatchObject([
+      { key: "action:echo:pending-key", status: "settled" }
+    ]);
+    // Reclaim refreshes the lease timestamp before settling.
+    expect(rows[0]!.updated_at).toBeGreaterThan(stale);
+  });
+
+  it("does not reclaim a stale fallback-key pending row", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-fallback-${crypto.randomUUID()}`
+    );
+    // "default" mode declares no idempotencyKey, so the ledger key falls back
+    // to `tool:${toolCallId}` — never eligible for stale reclaim.
+    await agent.useEchoActionForTest("default");
+    await agent.setActionLedgerPendingRetryLeaseForTest(50);
+    await agent.insertActionLedgerRowForTest({
+      key: "tool:tc-direct",
+      status: "pending",
+      updatedAt: Date.now() - 1_000
+    });
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: {
+        name: "ActionPendingError",
+        message:
+          "A prior attempt of this action is in an unknown state; not re-executed. Manual reconciliation may be required."
+      }
+    });
+    expect((await agent.getActionProbe()).count).toBe(0);
+  });
+
+  it("does not reclaim a stale explicit pending row when the lease is disabled", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-lease-off-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionIdempotencyKey("pending-key");
+    await agent.setActionLedgerPendingRetryLeaseForTest(false);
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:pending-key",
+      status: "pending",
+      updatedAt: Date.now() - 1_000
+    });
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: {
+        name: "ActionPendingError",
+        message:
+          "A prior attempt of this action is in an unknown state; not re-executed. Manual reconciliation may be required."
+      }
+    });
+    expect((await agent.getActionProbe()).count).toBe(0);
+  });
+
+  it("releases the row when a reclaimed execution throws", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-reclaim-throw-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-throw");
+    await agent.setActionIdempotencyKey("throw-key");
+    await agent.setActionLedgerPendingRetryLeaseForTest(50);
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:throw-key",
+      status: "pending",
+      updatedAt: Date.now() - 1_000
+    });
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: { name: "Error", message: "ledger action failed" }
+    });
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+
+    // The released row lets a later attempt run again.
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: { name: "Error", message: "ledger action failed" }
+    });
+    expect((await agent.getActionProbe()).count).toBe(2);
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+  });
+
+  it("executes once when a stale reclaim races itself in one isolate", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-reclaim-coalesce-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-slow");
+    await agent.setActionIdempotencyKey("coalesce-key");
+    await agent.setActionDelayForTest(50);
+    await agent.setActionLedgerPendingRetryLeaseForTest(50);
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:coalesce-key",
+      status: "pending",
+      updatedAt: Date.now() - 1_000
+    });
+
+    await expect(agent.executeEchoActionToolParallelForTest()).resolves.toEqual(
+      ["action echo: hello", "action echo: hello"]
+    );
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toMatchObject([
+      { key: "action:echo:coalesce-key", status: "settled" }
+    ]);
+  });
+
+  it("releases action ledger keys after execution failure", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-release-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-throw");
+    await agent.setActionIdempotencyKey("throw-key");
+
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: { name: "Error", message: "ledger action failed" }
+    });
+    await expect(agent.executeEchoActionToolForTest()).resolves.toEqual({
+      error: { name: "Error", message: "ledger action failed" }
+    });
+
+    expect((await agent.getActionProbe()).count).toBe(2);
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+  });
+
+  it("coalesces same-isolate duplicate action ledger executions", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-coalesce-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-slow");
+    await agent.setActionIdempotencyKey("coalesce-key");
+    await agent.setActionDelayForTest(50);
+
+    await expect(agent.executeEchoActionToolParallelForTest()).resolves.toEqual(
+      ["action echo: hello", "action echo: hello"]
+    );
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toMatchObject([
+      {
+        key: "action:echo:coalesce-key",
+        status: "settled"
+      }
+    ]);
+  });
+
+  it("releases action ledger rows when result serialization fails", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-serialize-failure-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-symbol-output");
+    await agent.setActionIdempotencyKey("symbol-key");
+
+    const output = await agent.executeEchoActionToolForTest();
+
+    expect(output).toEqual({ type: "symbol" });
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+  });
+
+  it("sweeps expired action ledger rows without deleting fresh rows", async () => {
+    const agent = await freshToolAgent(
+      `action-ledger-sweep-${crypto.randomUUID()}`
+    );
+    await agent.useEchoActionForTest("ledger-key");
+    await agent.setActionLedgerRetentionForTest({
+      settledMs: 10,
+      pendingMs: 10,
+      maxSweepRows: 10
+    });
+    const old = Date.now() - 1_000;
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:old-settled",
+      status: "settled",
+      output: "old",
+      updatedAt: old
+    });
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:old-pending",
+      status: "pending",
+      updatedAt: old
+    });
+    await agent.insertActionLedgerRowForTest({
+      key: "action:echo:fresh-settled",
+      status: "settled",
+      output: "fresh"
+    });
+
+    await expect(agent.sweepActionLedgerForTest()).resolves.toEqual({
+      settled: 1,
+      pending: 1
+    });
+
+    expect(await agent.listActionLedgerRowsForTest()).toMatchObject([
+      {
+        key: "action:echo:fresh-settled",
+        status: "settled"
+      }
+    ]);
+  });
+
+  it("emits an approval request with a stable action descriptor", async () => {
+    const room = `action-approval-request-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval-permission");
+    await agent.setActionGrantedPermissions(["echo:run"]);
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    const initialFrames = await initialDone;
+    const approvalChunk = initialFrames
+      .filter(
+        (frame) =>
+          frame.type === MSG_CHAT_RESPONSE &&
+          typeof frame.body === "string" &&
+          frame.body.length > 0
+      )
+      .map(
+        (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+      )
+      .find((chunk) => chunk.type === "tool-approval-request");
+
+    expect(approvalChunk).toMatchObject({
+      toolCallId: "tc1",
+      approvalDescriptor: {
+        requestId: expect.any(String),
+        toolCallId: "tc1",
+        action: "echo",
+        summary: "Approve echo action",
+        input: { message: "hello" },
+        permissions: ["echo:run"],
+        risk: "low",
+        kind: "approval-gated"
+      }
+    });
+
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    const toolPart = messages
+      .flatMap((message) => message.parts)
+      .find((part) => "toolCallId" in part && part.toolCallId === "tc1") as
+      | Record<string, unknown>
+      | undefined;
+    expect(toolPart).toMatchObject({
+      state: "approval-requested",
+      approval: {
+        descriptor: {
+          action: "echo",
+          summary: "Approve echo action",
+          input: { message: "hello" }
+        }
+      }
+    });
+
+    await closeWS(ws);
+  });
+
+  it("supports function-valued approval and permission policies", async () => {
+    const room = `action-function-policy-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("function-policy");
+    await agent.setActionGrantedPermissions(["echo:hello"]);
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    const initialFrames = await initialDone;
+    const approvalChunk = initialFrames
+      .filter(
+        (frame) =>
+          frame.type === MSG_CHAT_RESPONSE &&
+          typeof frame.body === "string" &&
+          frame.body.length > 0
+      )
+      .map(
+        (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+      )
+      .find((chunk) => chunk.type === "tool-approval-request");
+
+    expect(approvalChunk).toMatchObject({
+      toolCallId: "tc1",
+      approvalDescriptor: {
+        action: "echo",
+        input: { message: "hello" },
+        permissions: ["echo:hello"]
+      }
+    });
+
+    await closeWS(ws);
+  });
+
+  it("denies approval-gated actions before prompting", async () => {
+    const room = `action-approval-denied-before-prompt-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval-permission");
+    await agent.setActionGrantedPermissions([]);
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    const initialFrames = await initialDone;
+    const chunks = initialFrames
+      .filter(
+        (frame) =>
+          frame.type === MSG_CHAT_RESPONSE &&
+          typeof frame.body === "string" &&
+          frame.body.length > 0
+      )
+      .map(
+        (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+      );
+    expect(chunks.some((chunk) => chunk.type === "tool-approval-request")).toBe(
+      false
+    );
+    expect((await agent.getActionProbe()).count).toBe(0);
+
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    const toolPart = messages
+      .flatMap((message) => message.parts)
+      .find((part) => "toolCallId" in part && part.toolCallId === "tc1") as
+      | Record<string, unknown>
+      | undefined;
+    expect(toolPart).toMatchObject({
+      state: "output-available",
+      output: {
+        error: {
+          name: "ActionAuthorizationError",
+          message: "Missing required permission: echo:run",
+          permissions: ["echo:run"]
+        }
+      }
+    });
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+
+    await closeWS(ws);
+  });
+
+  it("rechecks authorization after approval before execute", async () => {
+    const room = `action-approval-grant-changed-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval-permission");
+    await agent.setActionGrantedPermissions(["echo:run"]);
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+
+    await agent.setActionGrantedPermissions([]);
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    const toolPart = messages
+      .flatMap((message) => message.parts)
+      .find((part) => "toolCallId" in part && part.toolCallId === "tc1") as
+      | Record<string, unknown>
+      | undefined;
+    expect(toolPart).toMatchObject({
+      state: "output-available",
+      output: {
+        error: {
+          name: "ActionAuthorizationError",
+          message: "Missing required permission: echo:run",
+          permissions: ["echo:run"]
+        }
+      }
+    });
+
+    await closeWS(ws);
+  });
+
+  it("resumes and executes an approved action", async () => {
+    const room = `action-approval-approved-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval");
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    const toolPart = messages
+      .flatMap((message) => message.parts)
+      .find((part) => "toolCallId" in part && part.toolCallId === "tc1") as
+      | Record<string, unknown>
+      | undefined;
+    expect(toolPart).toMatchObject({
+      state: "output-available",
+      output: "action echo: hello",
+      approval: {
+        approved: true,
+        descriptor: {
+          action: "echo"
+        }
+      }
+    });
+
+    await closeWS(ws);
+  });
+
+  it("records approval-gated actions only after approval", async () => {
+    const room = `action-ledger-approval-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("ledger-approval");
+    await agent.setActionIdempotencyKey("approval-ledger-key");
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(1);
+    expect(await agent.listActionLedgerRowsForTest()).toMatchObject([
+      {
+        key: "action:echo:approval-ledger-key",
+        status: "settled"
+      }
+    ]);
+
+    await closeWS(ws);
+  });
+
+  it("does not execute an approved action with rewritten input", async () => {
+    const room = `action-approval-rewritten-input-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval");
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+
+    await agent.setToolCallDecision({
+      action: "allow",
+      input: { message: "rewritten" }
+    });
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toEqual({
+      error: {
+        name: "ActionApprovalInputError",
+        message: "Approved action input cannot be changed by beforeToolCall"
+      }
+    });
+
+    await closeWS(ws);
+  });
+
+  it("does not execute a rejected action", async () => {
+    const room = `action-approval-rejected-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval");
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: false,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    const toolPart = messages
+      .flatMap((message) => message.parts)
+      .find((part) => "toolCallId" in part && part.toolCallId === "tc1") as
+      | Record<string, unknown>
+      | undefined;
+    expect(toolPart).toMatchObject({
+      state: "output-denied",
+      approval: {
+        approved: false,
+        descriptor: {
+          action: "echo"
+        }
+      }
+    });
+    expect(await agent.listActionLedgerRowsForTest()).toEqual([]);
+
+    await closeWS(ws);
+  });
+
+  it("keeps beforeToolCall as the outer gate after approval", async () => {
+    const room = `action-approval-before-tool-call-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.useEchoActionForTest("approval");
+    await agent.setToolCallDecision({
+      action: "block",
+      reason: "blocked by hook"
+    });
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo action");
+    await initialDone;
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect((await agent.getActionProbe()).count).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("blocked by hook");
+
+    await closeWS(ws);
   });
 });
 
@@ -422,6 +1191,198 @@ describe("Think — ToolCallDecision honored by wrapped execute", () => {
     expect(after.length).toBeGreaterThan(0);
     expect(JSON.parse(after[0].outputJson)).toBe("echo: hello");
   });
+
+  it("addMessages from inside a tool execute runs mid-turn and persists", async () => {
+    // Validates the premise the mid-turn broadcast gate relies on: a real tool
+    // `execute` runs with `_insideInferenceLoop === true`, so `addMessages`
+    // suppresses its broadcast there. Also confirms the write is durable the
+    // moment it returns (not deferred to the next turn).
+    const agent = await freshToolAgent("dec-add-messages");
+    await agent.setEchoExecuteMode("add-messages");
+    await agent.testChat("call echo");
+
+    const probe = await agent.getMidTurnAddProbe();
+    expect(probe.insideLoop).toBe(true);
+    expect(probe.persisted).toBe(true);
+  });
+});
+
+// ── beforeToolCall gates whether execute runs (invocation counter) ──
+
+describe("Think — beforeToolCall gates whether execute runs", () => {
+  it("runs execute exactly once on a void decision", async () => {
+    const agent = await freshToolAgent("gate-void");
+    await agent.setToolCallDecision(null);
+    await agent.testChat("call echo");
+
+    expect(await agent.getEchoExecuteCount()).toBe(1);
+  });
+
+  it("runs execute exactly once when 'allow' substitutes the input", async () => {
+    const agent = await freshToolAgent("gate-allow");
+    await agent.setToolCallDecision({
+      action: "allow",
+      input: { message: "rewritten" }
+    });
+    await agent.testChat("call echo");
+
+    expect(await agent.getEchoExecuteCount()).toBe(1);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("echo: rewritten");
+  });
+
+  it("never runs execute when the call is blocked", async () => {
+    // Counter-based proof (vs. the indirect output assertion): if `execute`
+    // had run, the count would be 1 and the output would be "echo: hello",
+    // not the block reason.
+    const agent = await freshToolAgent("gate-block");
+    await agent.setToolCallDecision({ action: "block", reason: "nope" });
+    await agent.testChat("call echo");
+
+    expect(await agent.getEchoExecuteCount()).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("nope");
+  });
+
+  it("never runs execute when the result is substituted", async () => {
+    const agent = await freshToolAgent("gate-substitute");
+    await agent.setToolCallDecision({
+      action: "substitute",
+      output: "cached value"
+    });
+    await agent.testChat("call echo");
+
+    expect(await agent.getEchoExecuteCount()).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("cached value");
+  });
+});
+
+// ── Streaming tool preservation through beforeToolCall ──────────
+
+describe("Think — streaming tool preservation", () => {
+  it("preserves preliminary chunks for an async-generator execute", async () => {
+    const agent = await freshToolAgent("stream-preserve");
+    await agent.setEchoExecuteMode("async-generator");
+    await agent.testChat("call echo");
+
+    const chunks = await agent.getToolResultChunkLog();
+    const preliminary = chunks
+      .filter((c) => c.preliminary)
+      .map((c) => JSON.parse(c.outputJson));
+    // The tool yields two preliminary values before the final value; the
+    // AI SDK surfaces each yield as a `preliminary` tool-result.
+    expect(preliminary).toContain("echo-prelim-1: hello");
+    expect(preliminary).toContain("echo-prelim-2: hello");
+
+    const final = chunks
+      .filter((c) => !c.preliminary)
+      .map((c) => JSON.parse(c.outputJson));
+    expect(final).toEqual(["echo: hello"]);
+
+    // afterToolCall still sees the final value, and execute ran once.
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("echo: hello");
+    expect(await agent.getEchoExecuteCount()).toBe(1);
+  });
+
+  it("emits no synthetic preliminary chunk for a scalar execute", async () => {
+    // The scalar wrapper must not turn an ordinary tool into a streaming one.
+    const agent = await freshToolAgent("stream-scalar");
+    await agent.setEchoExecuteMode("default");
+    await agent.testChat("call echo");
+
+    const chunks = await agent.getToolResultChunkLog();
+    expect(chunks.some((c) => c.preliminary)).toBe(false);
+    const final = chunks
+      .filter((c) => !c.preliminary)
+      .map((c) => JSON.parse(c.outputJson));
+    expect(final).toEqual(["echo: hello"]);
+  });
+
+  it("collapses a Promise<AsyncIterable> (non-canonical) execute", async () => {
+    // `async () => makeIterator()` returns a Promise<AsyncIterable>, which
+    // does not stream even in the raw AI SDK — Think collapses it to the
+    // last yielded value rather than leaking the iterator object.
+    const agent = await freshToolAgent("stream-collapse");
+    await agent.setEchoExecuteMode("async-iterable");
+    await agent.testChat("call echo");
+
+    const chunks = await agent.getToolResultChunkLog();
+    expect(chunks.some((c) => c.preliminary)).toBe(false);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("echo: hello");
+  });
+});
+
+// ── Raw needsApproval + beforeToolCall ordering ─────────────────
+
+describe("Think — raw needsApproval tool + beforeToolCall ordering", () => {
+  it("keeps beforeToolCall as the outer gate after approval (block)", async () => {
+    // Dual gate: the AI SDK `needsApproval` gate prompts first; after the
+    // user approves, `beforeToolCall` still gets the final say and blocks
+    // `execute` from ever running.
+    const room = `needs-approval-block-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.setEchoExecuteMode("needs-approval");
+    await agent.setToolCallDecision({
+      action: "block",
+      reason: "blocked after approval"
+    });
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo");
+    await initialDone;
+    // Approval gate held execution before the prompt.
+    expect(await agent.getEchoExecuteCount()).toBe(0);
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect(await agent.getEchoExecuteCount()).toBe(0);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("blocked after approval");
+
+    await closeWS(ws);
+  });
+
+  it("runs execute exactly once when both gates allow", async () => {
+    const room = `needs-approval-allow-${crypto.randomUUID()}`;
+    const agent = await freshToolAgent(room);
+    await agent.setEchoExecuteMode("needs-approval");
+    const ws = await connectWS("ThinkToolsTestAgent", room);
+
+    const initialDone = waitForDone(ws);
+    sendChatRequest(ws, "call echo");
+    await initialDone;
+    expect(await agent.getEchoExecuteCount()).toBe(0);
+
+    const continuationDone = waitForDone(ws);
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_APPROVAL,
+        toolCallId: "tc1",
+        approved: true,
+        autoContinue: true
+      })
+    );
+    await continuationDone;
+
+    expect(await agent.getEchoExecuteCount()).toBe(1);
+    const after = await agent.getAfterToolCallLog();
+    expect(JSON.parse(after[0].outputJson)).toBe("echo: hello");
+
+    await closeWS(ws);
+  });
 });
 
 // ── Extension hook dispatch ─────────────────────────────────────
@@ -436,7 +1397,9 @@ describe("Think — extension observation hooks", () => {
     // beforeToolCall/afterToolCall/onStepFinish/onChunk but Think only
     // ever fired beforeTurn. The extension records each hook into a
     // workspace marker file via the host bridge.
-    const agent = await freshExtensionHookAgent("ext-before-tc");
+    const agent = await freshExtensionHookAgent(
+      `ext-before-tc-${crypto.randomUUID()}`
+    );
     await agent.testChat("ping");
 
     const files = await agent.listExtLogFiles();
@@ -824,6 +1787,14 @@ describe("Think — beforeTurn config overrides", () => {
     expect(log[0].system).toContain("You are running inside a Think agent.");
   });
 
+  it("accepts instructions as the preferred TurnConfig system prompt name", async () => {
+    const agent = await freshAgent("bt-instructions");
+    await agent.setTurnConfigOverride({ instructions: "You are a pirate." });
+    const result = await agent.testChat("With instructions override");
+
+    expect(result.done).toBe(true);
+  });
+
   it("activeTools override limits tool availability", async () => {
     const agent = await freshAgent("bt-active");
     await agent.setTurnConfigOverride({ activeTools: ["read"] });
@@ -876,6 +1847,27 @@ describe("Think — beforeTurn config overrides", () => {
     await agent.setTurnConfigOutputText();
     const result = await agent.testChat("Structured-output turn");
     expect(result.done).toBe(true);
+  });
+
+  it("experimental_transform override is forwarded to streamText and applied", async () => {
+    // #1714 — TurnConfig.experimental_transform should reach streamText so
+    // callers can inspect/rewrite the stream. The transform here upper-cases
+    // every text-delta; we assert the persisted assistant text is upper-cased.
+    const agent = await freshAgent("bt-transform");
+    await agent.setResponse("hello from the assistant");
+    await agent.setTurnConfigTransform();
+
+    const result = await agent.testChat("Transform turn");
+    expect(result.done).toBe(true);
+
+    const messages = (await agent.getMessages()) as UIMessage[];
+    const assistant = messages.filter((m) => m.role === "assistant");
+    const last = assistant[assistant.length - 1];
+    const text = last.parts
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+    expect(text).toBe("HELLO FROM THE ASSISTANT");
   });
 
   it("sends reasoning chunks by default on the chat() path", async () => {

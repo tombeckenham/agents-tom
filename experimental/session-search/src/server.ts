@@ -25,7 +25,7 @@ import type { UIMessage } from "ai";
 import {
   convertToModelMessages,
   generateText,
-  stepCountIs,
+  isStepCount,
   streamText
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
@@ -69,7 +69,7 @@ export class SearchAgent extends Agent<Env> {
 
   private getAI() {
     return createWorkersAI({ binding: this.env.AI })(
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/moonshotai/kimi-k2.7-code",
       { sessionAffinity: this.sessionAffinity }
     );
   }
@@ -91,10 +91,10 @@ export class SearchAgent extends Agent<Env> {
 
     const result = streamText({
       model: this.getAI(),
-      system: await this.session.freezeSystemPrompt(),
+      instructions: await this.session.freezeSystemPrompt(),
       messages: await convertToModelMessages(truncated as UIMessage[]),
       tools: await this.session.tools(),
-      stopWhen: stepCountIs(5)
+      stopWhen: isStepCount(5)
     });
 
     for await (const chunk of result.textStream) {

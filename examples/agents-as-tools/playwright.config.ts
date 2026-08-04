@@ -39,14 +39,14 @@ export default defineConfig({
   testDir: "./e2e",
   testMatch: /.*\.e2e\.ts/,
   // Real-LLM timing — see the comment block above. The example
-  // uses `@cf/moonshotai/kimi-k2.5`, a heavyweight reasoning model.
+  // uses `@cf/moonshotai/kimi-k2.7-code`, a heavyweight reasoning model.
   // A single helper turn pairs a parent-side LLM call (tool
   // selection) with a helper-side LLM call (the helper's own
   // inference loop), so 60-120s per test is realistic. The compare
   // tool runs two helpers in parallel which doubles that. 180s
   // gives a comfortable margin without being so long that a real
   // hang waits forever.
-  timeout: 180_000,
+  timeout: 240_000,
   expect: {
     // Long enough to wait through a slow first-token latency on
     // Workers AI without wedging on a real-but-flaked test.
@@ -78,7 +78,7 @@ export default defineConfig({
   // into a workerd-running dev server with the real `ai` binding
   // (`remote: true` in wrangler.jsonc).
   webServer: {
-    command: "npm start",
+    command: "rm -rf .wrangler/state .wrangler/tmp && npm start",
     url: `http://localhost:${PORT}`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

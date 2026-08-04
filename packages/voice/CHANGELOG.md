@@ -1,5 +1,62 @@
 # @cloudflare/voice
 
+## 0.3.5
+
+### Patch Changes
+
+- [#1912](https://github.com/cloudflare/agents/pull/1912) [`219d59b`](https://github.com/cloudflare/agents/commit/219d59b8524868a9e258ebc3c437618b25e739a1) Thanks [@cjol](https://github.com/cjol)! - Add AssemblyAI and ElevenLabs streaming STT providers for the voice pipeline.
+
+## 0.3.4
+
+### Patch Changes
+
+- [#1909](https://github.com/cloudflare/agents/pull/1909) [`63491bd`](https://github.com/cloudflare/agents/commit/63491bdff0457118ea13139142d2578e5474fd99) Thanks [@cjol](https://github.com/cjol)! - Honor the configured sample rate for raw `pcm16` audio payloads.
+
+  Adds a `sampleRate` option to `VoiceAgentOptions` (default `16000`) that is declared in the server `audio_config` message. `VoiceClient` reads it (exposed via a new `sampleRate` getter) and constructs `AudioBuffer` instances at that rate for raw `pcm16` playback, so providers with a native rate other than 16 kHz (e.g. 24 kHz Gemini TTS) play at the correct speed. Falls back to 16 kHz when the server omits the field.
+
+- [#1891](https://github.com/cloudflare/agents/pull/1891) [`d1cc317`](https://github.com/cloudflare/agents/commit/d1cc317516878c640438de00b854786381a2b08e) Thanks [@korinne](https://github.com/korinne)! - Add transcriber readiness so voice agents wait for streaming STT startup before entering listening state or running call-start hooks.
+
+## 0.3.3
+
+### Patch Changes
+
+- [#1605](https://github.com/cloudflare/agents/pull/1605) [`8bfebf0`](https://github.com/cloudflare/agents/commit/8bfebf00220879bf7c2c3904542df0fcb15fa0b6) Thanks [@cjol](https://github.com/cjol)! - Support AI SDK fullStream responses in voice turns and warn when textStream is used.
+
+- [#1772](https://github.com/cloudflare/agents/pull/1772) [`d4f27fe`](https://github.com/cloudflare/agents/commit/d4f27fededefebc17cf455218e952ff76ade847b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Include each package's documentation in its published package.
+
+- [#1816](https://github.com/cloudflare/agents/pull/1816) [`f18ff01`](https://github.com/cloudflare/agents/commit/f18ff0123439e30411f92dbb1d1565682eadf428) Thanks [@cjol](https://github.com/cjol)! - Fix assistant speech playing back slow on a new turn after an idle gap. `VoiceClient` routes playback through a `MediaStreamAudioDestinationNode` -> `HTMLAudioElement` bridge, and reusing that element for a fresh burst after it had been idle between turns made the new turn resume at the wrong rate (audible as slow-motion that re-converges to normal over the turn). The bridge is now torn down and rebuilt once it has fully drained and been idle past a short threshold, so each turn plays through a freshly created element. Rebuilds never happen mid-turn, since chunks within a turn keep at least one source scheduled on the playback cursor.
+
+## 0.3.2
+
+### Patch Changes
+
+- [#1747](https://github.com/cloudflare/agents/pull/1747) [`28653b3`](https://github.com/cloudflare/agents/commit/28653b30b5e89592915a3b1e08d3b536c16c18ba) Thanks [@cjol](https://github.com/cjol)! - Fix audible clicks at audio chunk boundaries during agent speech. `VoiceClient` played each response chunk by starting it at `currentTime` and waiting for its `ended` event before scheduling the next, so every chunk seam carried a few milliseconds of silence (event-loop latency plus the next chunk's setup) — audible as a periodic click, roughly one per chunk. Chunks are now scheduled back-to-back on the audio clock via a playback cursor (`start(Math.max(currentTime, cursor))`), so consecutive chunks butt together sample-tight. Because chunks can now be scheduled ahead of playback, the client tracks every scheduled source and stops them all on interrupt/end-call (previously only the single active source needed stopping), and playback counts as active until the last scheduled chunk finishes so barge-in detection keeps working through the scheduled tail.
+
+## 0.3.1
+
+### Patch Changes
+
+- [#1754](https://github.com/cloudflare/agents/pull/1754) [`151d457`](https://github.com/cloudflare/agents/commit/151d457d320fccc9852fccbf168edfc54d72d9a3) Thanks [@threepointone](https://github.com/threepointone)! - Stop fire-and-forget voice lifecycle handlers from leaking unhandled rejections
+  on connection teardown. The `withVoiceInput` mixin dispatches `start_call`,
+  `end_call`, `interrupt`, and transcript emission from the synchronous
+  `onMessage` handler without awaiting them, so a client dropping mid-operation
+  (e.g. while `keepAlive()`'s alarm write is still in flight) could surface a
+  retryable "Network connection lost." rejection. These background tasks now run
+  through a teardown-aware helper that swallows expected connection-teardown
+  errors and logs anything unexpected.
+
+## 0.3.0
+
+### Minor Changes
+
+- [#1711](https://github.com/cloudflare/agents/pull/1711) [`a3a8d83`](https://github.com/cloudflare/agents/commit/a3a8d8357b5043a726e04fd911acdf0dbd20f271) Thanks [@cjol](https://github.com/cjol)! - Add `outputDeviceId` and `setOutputDevice()` for routing assistant playback to a selected audio output device when the browser supports sink selection.
+
+## 0.2.1
+
+### Patch Changes
+
+- [#1568](https://github.com/cloudflare/agents/pull/1568) [`c7649ac`](https://github.com/cloudflare/agents/commit/c7649aceb870ba60a8a6dd55933272d043daa944) Thanks [@cjol](https://github.com/cjol)! - Avoid emitting empty assistant transcript entries when a voice turn produces no response text.
+
 ## 0.2.0
 
 ### Minor Changes

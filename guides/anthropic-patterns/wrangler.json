@@ -5,7 +5,7 @@
   "assets": {
     "directory": "public"
   },
-  "compatibility_date": "2026-01-28",
+  "compatibility_date": "2026-06-11",
   "compatibility_flags": ["nodejs_compat"],
 
   "durable_objects": {
@@ -47,6 +47,10 @@
     }
   ],
   "name": "anthropic-agent-patterns",
+
+  "secrets": {
+    "required": ["OPENAI_API_KEY", "AI_GATEWAY_TOKEN"]
+  },
 
   "vars": {
     "AI_GATEWAY_ACCOUNT_ID": "85d0c02b57ed75faf9b18f92d5c01602",

@@ -1,59 +1,59 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { createBrowserTools } from "../tools/browser";
+import type { BrowserToolsHost } from "./worker";
+
+function host() {
+  const id = env.BrowserToolsHost.idFromName("browser-tools");
+  return env.BrowserToolsHost.get(id) as DurableObjectStub<BrowserToolsHost>;
+}
 
 describe("createBrowserTools", () => {
-  it("returns a ToolSet with browser_search and browser_execute", () => {
-    const tools = createBrowserTools({
-      // Both are required at construction time but not validated until invoked
-      browser: {} as Fetcher,
-      loader: {} as WorkerLoader
-    });
+  it("returns browser_execute plus the default Quick Action tools when a binding is present", async () => {
+    const tools = await host().toolsWithBinding();
 
-    expect(tools).toHaveProperty("browser_search");
-    expect(tools).toHaveProperty("browser_execute");
-    expect(Object.keys(tools)).toHaveLength(2);
+    expect(tools.keys).toEqual([
+      "browser_execute",
+      "browser_extract",
+      "browser_links",
+      "browser_markdown",
+      "browser_scrape"
+    ]);
+    expect(tools.hasExecute).toBe(true);
+    // The runtime tool description lists the cdp connector namespace.
+    expect(tools.description).toContain("`cdp`");
   });
 
-  it("browser_search tool has the correct schema shape", () => {
-    const tools = createBrowserTools({
-      browser: {} as Fetcher,
-      loader: {} as WorkerLoader
+  it("omits Quick Action tools when quickActions is false", async () => {
+    await expect(host().toolsWithoutQuickActions()).resolves.toMatchObject({
+      keys: ["browser_execute"]
     });
-
-    const search = tools.browser_search;
-    expect(search).toBeDefined();
-    expect(typeof search.execute).toBe("function");
   });
 
-  it("browser_execute tool has the correct schema shape", () => {
-    const tools = createBrowserTools({
-      browser: {} as Fetcher,
-      loader: {} as WorkerLoader
+  it("accepts cdpUrl instead of browser binding (Quick Actions skipped without a binding)", async () => {
+    await expect(host().toolsWithCdpUrl()).resolves.toMatchObject({
+      keys: ["browser_execute"]
     });
-
-    const execute = tools.browser_execute;
-    expect(execute).toBeDefined();
-    expect(typeof execute.execute).toBe("function");
   });
 
-  it("accepts cdpUrl instead of browser binding", () => {
-    const tools = createBrowserTools({
-      cdpUrl: "http://localhost:9222",
-      loader: {} as WorkerLoader
+  it("accepts optional timeout and session mode", async () => {
+    await expect(host().toolsWithOptions()).resolves.toMatchObject({
+      keys: expect.arrayContaining(["browser_execute"])
     });
-
-    expect(tools).toHaveProperty("browser_search");
-    expect(tools).toHaveProperty("browser_execute");
   });
 
-  it("accepts optional timeout", () => {
-    const tools = createBrowserTools({
-      browser: {} as Fetcher,
-      loader: {} as WorkerLoader,
-      timeout: 60_000
-    });
+  it("requires a browser binding or cdpUrl", async () => {
+    await expect(host().missingBrowserOrCdpUrlError()).resolves.toContain(
+      "must be provided"
+    );
+  });
 
-    expect(tools).toHaveProperty("browser_search");
-    expect(tools).toHaveProperty("browser_execute");
+  it("exposes the runtime handle and connector via createBrowserRuntime", async () => {
+    await expect(host().runtimeShape()).resolves.toEqual({
+      connectorName: "cdp",
+      runtimeApprove: "function",
+      runtimeExpirePaused: "function",
+      connectorSweep: "function",
+      hasExecute: true
+    });
   });
 });

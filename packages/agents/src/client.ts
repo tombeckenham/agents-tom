@@ -14,62 +14,103 @@ import type {
 import { MessageType } from "./types";
 import { camelCaseToKebabCase, isInternalJsStubProp } from "./utils";
 
+export class AgentConnectionError extends Error {
+  code: number;
+  reason: string;
+  wasClean: boolean;
+
+  constructor(event: CloseEvent) {
+    const reason = event.reason || `WebSocket closed with code ${event.code}`;
+    super(`Agent connection closed: ${reason}`);
+    this.name = "AgentConnectionError";
+    this.code = event.code;
+    this.reason = event.reason;
+    this.wasClean = event.wasClean;
+  }
+}
+
+export function isTerminalCloseEvent(event: CloseEvent): boolean {
+  return event.code === 1008 || (event.code >= 4000 && event.code <= 4999);
+}
+
+type TerminalReconnectOptions = {
+  shouldReconnectOnClose?: (event: CloseEvent) => boolean;
+};
+
 /**
  * Options for creating an AgentClient
  */
 export type AgentClientOptions<State = unknown> = Omit<
   PartySocketOptions,
   "party" | "room"
-> & {
-  /** Name of the agent to connect to (ignored if basePath is set) */
-  agent: string;
-  /** Name of the specific Agent instance (ignored if basePath is set) */
-  name?: string;
-  /**
-   * Full URL path - bypasses agent/name URL construction.
-   * When set, the client connects to this path directly.
-   * Server must handle routing manually (e.g., with getAgentByName + fetch).
-   * @example
-   * // Client connects to /user, server routes based on session
-   * useAgent({ agent: "UserAgent", basePath: "user" })
-   */
-  basePath?: string;
-  /** Called when the Agent's state is updated */
-  onStateUpdate?: (state: State, source: "server" | "client") => void;
-  /** Called when a state update fails (e.g., connection is readonly) */
-  onStateUpdateError?: (error: string) => void;
-  /**
-   * Called when the server sends the agent's identity on connect.
-   * Useful when using basePath, as the actual instance name is determined server-side.
-   * @param name The actual agent instance name
-   * @param agent The agent class name (kebab-case)
-   */
-  onIdentity?: (name: string, agent: string) => void;
-  /**
-   * Called when identity changes on reconnect (different instance than before).
-   * If not provided and identity changes, a warning will be logged.
-   * @param oldName Previous instance name
-   * @param newName New instance name
-   * @param oldAgent Previous agent class name
-   * @param newAgent New agent class name
-   */
-  onIdentityChange?: (
-    oldName: string,
-    newName: string,
-    oldAgent: string,
-    newAgent: string
-  ) => void;
-  /**
-   * Additional path to append to the URL.
-   * Works with both standard routing and basePath.
-   * @example
-   * // With basePath: /user/settings
-   * { basePath: "user", path: "settings" }
-   * // Standard: /agents/my-agent/room/settings
-   * { agent: "MyAgent", name: "room", path: "settings" }
-   */
-  path?: string;
-};
+> &
+  TerminalReconnectOptions & {
+    /** Name of the agent to connect to (ignored if basePath is set) */
+    agent: string;
+    /** Name of the specific Agent instance (ignored if basePath is set) */
+    name?: string;
+    /**
+     * Full URL path - bypasses agent/name URL construction.
+     * When set, the client connects to this path directly.
+     * Server must handle routing manually (e.g., with getAgentByName + fetch).
+     * @example
+     * // Client connects to /user, server routes based on session
+     * useAgent({ agent: "UserAgent", basePath: "user" })
+     */
+    basePath?: string;
+    /** Called when the Agent's state is updated */
+    onStateUpdate?: (state: State, source: "server" | "client") => void;
+    /** Called when a state update fails (e.g., connection is readonly) */
+    onStateUpdateError?: (error: string) => void;
+    /**
+     * Called when the server sends the agent's identity on connect.
+     * Useful when using basePath, as the actual instance name is determined server-side.
+     * @param name The actual agent instance name
+     * @param agent The agent class name (kebab-case)
+     */
+    onIdentity?: (name: string, agent: string) => void;
+    /**
+     * Called when identity changes on reconnect (different instance than before).
+     * If not provided and identity changes, a warning will be logged.
+     * @param oldName Previous instance name
+     * @param newName New instance name
+     * @param oldAgent Previous agent class name
+     * @param newAgent New agent class name
+     */
+    onIdentityChange?: (
+      oldName: string,
+      newName: string,
+      oldAgent: string,
+      newAgent: string
+    ) => void;
+    /**
+     * Additional path to append to the URL.
+     * Works with both standard routing and basePath.
+     * @example
+     * // With basePath: /user/settings
+     * { basePath: "user", path: "settings" }
+     * // Standard: /agents/my-agent/room/settings
+     * { agent: "MyAgent", name: "room", path: "settings" }
+     */
+    path?: string;
+    /**
+     * Default timeout (in milliseconds) applied to non-streaming `call()`s
+     * that don't pass an explicit `timeout`. Defaults to 30 000 ms.
+     * Set to `0` to disable. Streaming calls never get a default timeout.
+     */
+    defaultCallTimeout?: number;
+    /** Called when the connection closes with a terminal code and will not reconnect. */
+    onConnectionError?: (error: AgentConnectionError) => void;
+  };
+
+/**
+ * Default timeout (in milliseconds) applied to non-streaming RPC calls
+ * that don't pass an explicit `timeout`. Acts as a backstop so calls
+ * whose response is lost (e.g. the connection drops mid-flight) reject
+ * instead of hanging forever. Override per client via
+ * `defaultCallTimeout`, or per call via `timeout` (0 disables).
+ */
+export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 
 /**
  * Options for streaming RPC calls
@@ -252,6 +293,12 @@ export class AgentClient<
   identified = false;
 
   /**
+   * Terminal connection error, if the server closed the socket with a code
+   * that should not be retried automatically.
+   */
+  connectionError: AgentConnectionError | null = null;
+
+  /**
    * Promise that resolves when identity has been received from the server.
    * Useful for waiting before making calls that depend on knowing the instance.
    * Resets on connection close so it can be awaited again after reconnect.
@@ -267,6 +314,14 @@ export class AgentClient<
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
       stream?: StreamOptions;
+      /**
+       * Whether the request was actually transmitted to the server.
+       * Requests issued while disconnected sit in PartySocket's internal
+       * buffer (transmitted: false) and are flushed on the next open —
+       * they survive a transient close instead of being rejected, since
+       * the server never saw them and re-delivery can't double-execute.
+       */
+      transmitted: boolean;
     }
   >();
   private _readyPromise!: Promise<void>;
@@ -282,16 +337,25 @@ export class AgentClient<
 
   constructor(options: AgentClientOptions<State>) {
     const agentNamespace = camelCaseToKebabCase(options.agent);
+    const shouldReconnectOnClose = options.shouldReconnectOnClose;
+    const classifyReconnect = (event: CloseEvent) =>
+      (shouldReconnectOnClose?.(event) ?? true) && !isTerminalCloseEvent(event);
 
     // If basePath is provided, use it directly; otherwise construct from agent/name
     const socketOptions = options.basePath
-      ? { basePath: options.basePath, path: options.path, ...options }
+      ? {
+          basePath: options.basePath,
+          path: options.path,
+          ...options,
+          shouldReconnectOnClose: classifyReconnect
+        }
       : {
           party: agentNamespace,
           prefix: "agents",
           room: options.name || "default",
           path: options.path,
-          ...options
+          ...options,
+          shouldReconnectOnClose: classifyReconnect
         };
 
     super(socketOptions);
@@ -378,7 +442,13 @@ export class AgentClient<
         if (parsedMessage.type === MessageType.RPC) {
           const response = parsedMessage as RPCResponse;
           const pending = this._pendingCalls.get(response.id);
-          if (!pending) return;
+          if (!pending) {
+            console.warn(
+              `[AgentClient] Discarded an RPC response with no matching pending call (id "${response.id}"). ` +
+                "The call likely timed out or was rejected when its connection closed before the response arrived."
+            );
+            return;
+          }
 
           if (!response.success) {
             pending.reject(new Error(response.error));
@@ -405,14 +475,39 @@ export class AgentClient<
       }
     });
 
+    // PartySocket flushes its internal message buffer right before
+    // dispatching "open" — anything queued has now been transmitted.
+    this.addEventListener("open", () => {
+      this.connectionError = null;
+      for (const pending of this._pendingCalls.values()) {
+        pending.transmitted = true;
+      }
+    });
+
     // Clean up pending calls and reset ready state when connection closes
-    this.addEventListener("close", () => {
+    this.addEventListener("close", (event) => {
+      const terminalClose = isTerminalCloseEvent(event);
       // Reset ready state for next connection
       this.identified = false;
       this._resetReady();
 
-      // Reject any remaining pending calls (e.g., from unexpected disconnect)
-      this._rejectPendingCalls("Connection closed");
+      if (this.shouldReconnect) {
+        // Transient disconnect: reject calls whose request was already
+        // transmitted — their response can never arrive. Buffered calls
+        // stay pending; PartySocket re-sends them on reconnect.
+        this._rejectPendingCalls("Connection closed", {
+          onlyTransmitted: true
+        });
+      } else {
+        // Permanent close (close() called or retries exhausted): nothing
+        // will ever flush the buffer, so reject everything.
+        this._rejectPendingCalls("Connection closed");
+        if (terminalClose) {
+          const error = new AgentConnectionError(event);
+          this.connectionError = error;
+          this.options.onConnectionError?.(error);
+        }
+      }
     });
 
     this.call = this._callImpl.bind(this) as AgentClientCall<AgentT>;
@@ -422,15 +517,21 @@ export class AgentClient<
   }
 
   /**
-   * Reject all pending RPC calls with the given reason.
+   * Reject pending RPC calls with the given reason.
+   * With `onlyTransmitted`, calls still sitting in the send buffer are
+   * kept pending (they'll be flushed on reconnect).
    */
-  private _rejectPendingCalls(reason: string) {
+  private _rejectPendingCalls(
+    reason: string,
+    { onlyTransmitted = false }: { onlyTransmitted?: boolean } = {}
+  ) {
     const error = new Error(reason);
-    for (const pending of this._pendingCalls.values()) {
+    for (const [id, pending] of this._pendingCalls) {
+      if (onlyTransmitted && !pending.transmitted) continue;
+      this._pendingCalls.delete(id);
       pending.reject(error);
       pending.stream?.onError?.(reason);
     }
-    this._pendingCalls.clear();
   }
 
   setState(state: State) {
@@ -465,6 +566,10 @@ export class AgentClient<
     args: unknown[] = [],
     options?: CallOptions | StreamOptions
   ): Promise<unknown> {
+    if (this.connectionError && this.readyState === this.CLOSED) {
+      throw new Error("Connection closed");
+    }
+
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -480,15 +585,24 @@ export class AgentClient<
         ? undefined
         : (options as CallOptions | undefined)?.timeout;
 
-      // Set up timeout if specified
-      if (timeout) {
+      // Apply the default timeout as a backstop for non-streaming calls
+      // so a lost response rejects instead of hanging forever. An
+      // explicit `timeout` (including 0 = disabled) always wins.
+      const effectiveTimeout =
+        timeout !== undefined
+          ? timeout
+          : streamOptions
+            ? undefined
+            : (this.options.defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS);
+
+      if (effectiveTimeout) {
         timeoutId = setTimeout(() => {
           const pending = this._pendingCalls.get(id);
           this._pendingCalls.delete(id);
-          const errorMessage = `RPC call to ${method} timed out after ${timeout}ms`;
+          const errorMessage = `RPC call to ${method} timed out after ${effectiveTimeout}ms`;
           pending?.stream?.onError?.(errorMessage);
           reject(new Error(errorMessage));
-        }, timeout);
+        }, effectiveTimeout);
       }
 
       this._pendingCalls.set(id, {
@@ -500,7 +614,11 @@ export class AgentClient<
           if (timeoutId) clearTimeout(timeoutId);
           resolve(value);
         },
-        stream: streamOptions
+        stream: streamOptions,
+        // If the socket is open, send() below transmits synchronously;
+        // otherwise the request is buffered until the next open event
+        // (the "open" listener then marks it transmitted).
+        transmitted: this.readyState === this.OPEN
       });
 
       const request: RPCRequest = {

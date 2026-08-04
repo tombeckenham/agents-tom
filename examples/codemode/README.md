@@ -17,7 +17,7 @@ A project management chat app where the LLM writes and executes code to orchestr
 - `useAgentChat` for streaming chat with message persistence
 - Collapsible tool cards showing generated code, results, and console output
 - Kumo design system components with dark/light mode
-- Browser client-tool variant documented in [`../../docs/codemode.md`](../../docs/codemode.md#browser-executor-with-dynamic-client-tools)
+- Browser client-tool variant documented in [`../../docs/agents/codemode.md`](../../docs/agents/codemode.md#browser-executor-with-dynamic-client-tools)
 
 **Tools (`src/tools.ts`):**
 
@@ -32,7 +32,7 @@ npm run build # from repo root
 npm start     # from this directory -- starts Vite dev server
 ```
 
-Uses Workers AI (no API key needed) with `@cf/moonshotai/kimi-k2.5`.
+Uses Workers AI (no API key needed) with `@cf/moonshotai/kimi-k2.7-code`.
 
 ## Try it
 
@@ -53,5 +53,5 @@ the docs now include a companion pattern that:
 - registers the resulting `codemode` tool through
   `useAgentChat({ tools, onToolCall })`
 
-See [`docs/codemode.md`](../../docs/codemode.md#browser-executor-with-dynamic-client-tools)
+See [`docs/agents/codemode.md`](../../docs/agents/codemode.md#browser-executor-with-dynamic-client-tools)
 for the full server + client example.

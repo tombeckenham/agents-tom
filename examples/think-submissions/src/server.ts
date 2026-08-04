@@ -1,21 +1,14 @@
 import { callable, routeAgentRequest } from "agents";
-import { createWorkersAI } from "workers-ai-provider";
 import { Think } from "@cloudflare/think";
 import type {
+  ThinkScheduledTasks,
   ThinkSubmissionInspection,
   ThinkSubmissionStatus
 } from "@cloudflare/think";
 
-type Env = {
-  AI: Ai;
-  TaskAgent: DurableObjectNamespace<TaskAgent>;
-};
-
 export class TaskAgent extends Think<Env> {
   getModel() {
-    return createWorkersAI({ binding: this.env.AI })(
-      "@cf/moonshotai/kimi-k2.6"
-    );
+    return "@cf/moonshotai/kimi-k2.7-code";
   }
 
   getSystemPrompt() {
@@ -23,6 +16,16 @@ export class TaskAgent extends Think<Env> {
       "You are a background task assistant.",
       "Respond with a concise status update and the final answer for the submitted task."
     ].join("\n");
+  }
+
+  getScheduledTasks(): ThinkScheduledTasks {
+    return {
+      hourlyQueueDigest: {
+        schedule: "every 1 hour",
+        prompt:
+          "Write a concise hourly reminder that durable background task queues should be checked for stuck or failed work."
+      }
+    };
   }
 
   @callable()

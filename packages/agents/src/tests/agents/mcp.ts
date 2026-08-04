@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/client/validators/cf-worker";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
   CallToolResult,
@@ -6,12 +7,15 @@ import type {
   ServerNotification,
   ServerRequest
 } from "@modelcontextprotocol/sdk/types.js";
+import { DynamicWorkerExecutor } from "@cloudflare/codemode";
+import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 import { z } from "zod";
 import { McpAgent } from "../../mcp/index.ts";
 import {
   Agent,
   callable,
   getCurrentAgent,
+  __DO_NOT_USE_WILL_BREAK__agentContext as agentContext,
   type AgentContext
 } from "../../index.ts";
 import {
@@ -36,8 +40,39 @@ type Props = {
   testValue: string;
 };
 
+export class TestCodemodeMcpAgent extends McpAgent<
+  Cloudflare.Env & { LOADER: WorkerLoader }
+> {
+  server!: McpServer;
+
+  async init() {
+    this.server = openApiMcpServer({
+      spec: {
+        openapi: "3.1.0",
+        info: { title: "Codemode MCP test", version: "1.0.0" },
+        paths: { "/protected": { delete: { summary: "Protected action" } } }
+      },
+      executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
+      request: async (options, context) => {
+        return this.elicitInput(
+          {
+            message: `Allow ${options.method} ${options.path}?`,
+            requestedSchema: {
+              type: "object",
+              properties: { approved: { type: "boolean" } },
+              required: ["approved"]
+            }
+          },
+          { relatedRequestId: context.requestId }
+        );
+      }
+    });
+  }
+}
+
 export class TestMcpAgent extends McpAgent<Cloudflare.Env, unknown, Props> {
   private tempToolHandle?: { remove: () => void };
+  private collisionBarrierResolvers: Array<() => void> = [];
 
   server = new McpServer(
     { name: "test-server", version: "1.0.0" },
@@ -60,6 +95,83 @@ export class TestMcpAgent extends McpAgent<Cloudflare.Env, unknown, Props> {
       },
       async ({ name }) => {
         return { content: [{ text: `Hello, ${name}!`, type: "text" }] };
+      }
+    );
+
+    // Tool with an outputSchema: the MCP SDK client compiles a JSON Schema
+    // validator for it during discovery, which requires the Worker-safe
+    // validator (the SDK's AJV fallback uses `new Function`, disallowed in
+    // Workers).
+    this.server.registerTool(
+      "structuredGreet",
+      {
+        description: "Greet and return structured output",
+        inputSchema: { name: z.string().describe("Name to greet") },
+        outputSchema: {
+          greeting: z.string(),
+          nameLength: z.number()
+        }
+      },
+      async ({ name }) => {
+        const structuredContent = {
+          greeting: `Hello, ${name}!`,
+          nameLength: name.length
+        };
+        return {
+          content: [{ text: JSON.stringify(structuredContent), type: "text" }],
+          structuredContent
+        };
+      }
+    );
+
+    // Deferred tool used by resumability tests. Emits a progress
+    // notification (with `relatedRequestId` attached by the SDK)
+    // immediately, then sleeps before returning the final result.
+    // The notification gives the test a real event id on the POST
+    // stream which it can use as `Last-Event-ID` to resume.
+    this.server.registerTool(
+      "deferredGreet",
+      {
+        description:
+          "Emit a progress notification, wait, then return the result",
+        inputSchema: {
+          name: z.string(),
+          delayMs: z.number().int().nonnegative().optional()
+        }
+      },
+      async ({ name, delayMs }, extra) => {
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: {
+            progressToken: "deferred-greet",
+            progress: 1,
+            total: 2,
+            message: `working on ${name}`
+          }
+        });
+        await new Promise((r) => setTimeout(r, delayMs ?? 500));
+        return { content: [{ text: `Hello, ${name}!`, type: "text" }] };
+      }
+    );
+
+    this.server.registerTool(
+      "collisionBarrierEcho",
+      {
+        description: "Echo after two concurrent calls reach a barrier",
+        inputSchema: { label: z.string() }
+      },
+      async ({ label }) => {
+        await new Promise<void>((resolve) => {
+          this.collisionBarrierResolvers.push(resolve);
+          if (this.collisionBarrierResolvers.length === 2) {
+            for (const release of this.collisionBarrierResolvers) {
+              release();
+            }
+            this.collisionBarrierResolvers = [];
+          }
+        });
+
+        return { content: [{ text: `collision:${label}`, type: "text" }] };
       }
     );
 
@@ -169,6 +281,98 @@ export class TestMcpAgent extends McpAgent<Cloudflare.Env, unknown, Props> {
 
         return {
           content: [{ type: "text", text: "Custom elicit cancelled" }]
+        };
+      }
+    );
+
+    // The next two tools run their body inside `agentContext.exit(...)`,
+    // i.e. with an empty AsyncLocalStorage store. This simulates host-side
+    // callbacks reached outside the original invocation's call tree — e.g.
+    // via RPC from a Worker Loader child isolate or a service binding —
+    // where `getCurrentAgent()` returns undefined. Regression coverage for
+    // https://github.com/cloudflare/agents/issues/1490.
+    this.server.tool(
+      "elicitNameOutsideContext",
+      "Elicit user input from outside the agent ALS context (request-scoped send)",
+      {},
+      async (_args, extra) => {
+        const result = await agentContext.exit(() =>
+          this.server.server.elicitInput(
+            {
+              message: "What is your name?",
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  name: {
+                    type: "string",
+                    description: "Your name"
+                  }
+                },
+                required: ["name"]
+              }
+            },
+            { relatedRequestId: extra.requestId }
+          )
+        );
+
+        if (result.action === "accept" && result.content?.name) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Outside-context elicit: ${result.content.name}`
+              }
+            ]
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: "Outside-context elicit cancelled" }]
+        };
+      }
+    );
+
+    this.server.tool(
+      "elicitNameOutsideContextStandalone",
+      "Elicit user input from outside the agent ALS context (standalone GET stream send)",
+      {},
+      async () => {
+        // No relatedRequestId: the elicit request goes out on the
+        // standalone GET stream via the transport's sendStandalone path.
+        const result = await agentContext.exit(() =>
+          this.server.server.elicitInput({
+            message: "What is your name?",
+            requestedSchema: {
+              type: "object",
+              properties: {
+                name: {
+                  type: "string",
+                  description: "Your name"
+                }
+              },
+              required: ["name"]
+            }
+          })
+        );
+
+        if (result.action === "accept" && result.content?.name) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Standalone outside-context elicit: ${result.content.name}`
+              }
+            ]
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Standalone outside-context elicit cancelled"
+            }
+          ]
         };
       }
     );
@@ -306,6 +510,39 @@ export class TestRpcMcpClientAgent extends Agent {
       const toolNames = tools.map((t) => t.name);
 
       return { success: true, toolNames };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async testRpcClientUsesWorkerSafeValidator() {
+    try {
+      const { id } = await this.addMcpServer(
+        "rpc-validator-test",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        {
+          props: { testValue: "rpc-validator-value" }
+        }
+      );
+
+      const validator =
+        this.mcp.mcpConnections[id]?.options.client?.jsonSchemaValidator;
+
+      const result = await this.mcp.callTool({
+        serverId: id,
+        name: "structuredGreet",
+        arguments: { name: "RPC User" }
+      });
+
+      return {
+        success: true,
+        usesWorkerSafeValidator:
+          validator instanceof CfWorkerJsonSchemaValidator,
+        structuredContent: result.structuredContent
+      };
     } catch (error) {
       return {
         success: false,
@@ -486,6 +723,178 @@ export class TestRpcMcpClientAgent extends Agent {
     }
   }
 
+  async testRpcStableSuppliedId() {
+    try {
+      const { id } = await this.addMcpServer(
+        "rpc-stable-id-test",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        {
+          id: "my-supplied-id",
+          props: { testValue: "stable-id" }
+        }
+      );
+
+      const toolNames = this.mcp.listTools().map((t) => t.name);
+      const saved = this.mcp
+        .getRpcServersFromStorage()
+        .find((s) => s.id === id);
+
+      return {
+        success: true,
+        id,
+        savedId: saved?.id ?? null,
+        toolNames
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async testRpcNormalizesSuppliedId() {
+    try {
+      const { id } = await this.addMcpServer(
+        "rpc-normalize-id-test",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        {
+          id: "GitHub MCP!",
+          props: { testValue: "normalized" }
+        }
+      );
+      return { success: true, id };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async testRpcSuppliedIdCollision() {
+    try {
+      const first = await this.addMcpServer(
+        "rpc-collide-a",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        {
+          id: "collide",
+          props: { testValue: "a" }
+        }
+      );
+
+      let threw = false;
+      let message = "";
+      try {
+        await this.addMcpServer(
+          "rpc-collide-b",
+          this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+          {
+            id: "collide",
+            props: { testValue: "b" }
+          }
+        );
+      } catch (e) {
+        threw = true;
+        message = e instanceof Error ? e.message : String(e);
+      }
+
+      return { success: true, firstId: first.id, threw, message };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async testRpcSuppliedIdMigratesExistingNanoid() {
+    try {
+      // First call: no supplied id — gets an auto-generated nanoid.
+      const first = await this.addMcpServer(
+        "rpc-migrate-test",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        { props: { testValue: "first" } }
+      );
+
+      const connectionsBefore = Object.keys(this.mcp.mcpConnections).length;
+
+      // Second call: same (name, url) but now supplying a stable id. This is
+      // the natural upgrade path (user adds `{ id }` to existing code) — the
+      // existing row + connection should be migrated in place, NOT thrown.
+      const second = await this.addMcpServer(
+        "rpc-migrate-test",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        { id: "migrated", props: { testValue: "second" } }
+      );
+
+      // After migration: only the new stable id should exist in storage.
+      const storedIds = this.mcp
+        .getRpcServersFromStorage()
+        .filter((s) => s.name === "rpc-migrate-test")
+        .map((s) => s.id);
+
+      const connectionsAfter = Object.keys(this.mcp.mcpConnections).length;
+      const stableConnectionExists =
+        this.mcp.mcpConnections[second.id] !== undefined;
+      const nanoidConnectionGone =
+        this.mcp.mcpConnections[first.id] === undefined;
+
+      // Tool calls should still work against the migrated id.
+      const callResult = await this.mcp.callTool({
+        serverId: second.id,
+        name: "greet",
+        arguments: { name: "Migrated User" }
+      });
+
+      return {
+        success: true,
+        firstId: first.id,
+        secondId: second.id,
+        storedIds,
+        connectionsBefore,
+        connectionsAfter,
+        stableConnectionExists,
+        nanoidConnectionGone,
+        callOk: !callResult.isError
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async testRpcSuppliedIdDedupsOnRepeat() {
+    try {
+      const first = await this.addMcpServer(
+        "rpc-dedup-stable",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        { id: "stable", props: { testValue: "first" } }
+      );
+
+      // Calling again with the same id + (name, url) should dedup, not throw.
+      const second = await this.addMcpServer(
+        "rpc-dedup-stable",
+        this.env.MCP_OBJECT as unknown as DurableObjectNamespace<McpAgent>,
+        { id: "stable", props: { testValue: "second" } }
+      );
+
+      return {
+        success: true,
+        firstId: first.id,
+        secondId: second.id,
+        sameId: first.id === second.id
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
   async testRemoveRpcMcpServer() {
     try {
       const { id } = await this.addMcpServer(
@@ -620,8 +1029,12 @@ export class TestHttpMcpDedupAgent extends Agent {
   }
 
   // Set up a fake "ready" server so the dedup check has something to find
-  private async _seedServer(name: string, url: string): Promise<string> {
-    const id = `test-${name}-${Date.now()}`;
+  private async _seedServer(
+    name: string,
+    url: string,
+    overrideId?: string
+  ): Promise<string> {
+    const id = overrideId ?? `test-${name}-${Date.now()}`;
 
     // Register in storage
     await this.mcp.registerServer(id, {
@@ -700,6 +1113,150 @@ export class TestHttpMcpDedupAgent extends Agent {
       returnedId: result.id,
       deduped: result.id === seededId
     };
+  }
+
+  async testStoredHttpServerWithoutConnectionReusesId() {
+    const id = "stored-without-connection";
+    const url = "https://mcp.example.com/stored";
+    await this.mcp.registerServer(id, {
+      url,
+      name: "stored-server",
+      transport: { type: "auto" as const }
+    });
+    delete this.mcp.mcpConnections[id];
+
+    let returnedId: string | null = null;
+    let threwExpectedConnectionError = false;
+    let connectionError: string | null = null;
+    try {
+      const result = await this.addMcpServer("stored-server", url);
+      returnedId = result.id;
+    } catch (error) {
+      connectionError = error instanceof Error ? error.message : String(error);
+      const expectedPrefix = `Failed to connect to MCP server at ${new URL(url).href}:`;
+      if (!connectionError.startsWith(expectedPrefix)) {
+        throw error;
+      }
+      threwExpectedConnectionError = true;
+      returnedId =
+        this.mcp.listServers().find((s) => s.name === "stored-server")?.id ??
+        null;
+    }
+
+    const storedIds = this.mcp
+      .listServers()
+      .filter((s) => s.name === "stored-server")
+      .map((s) => s.id);
+
+    return {
+      connectionError,
+      returnedId,
+      storedIds,
+      threwExpectedConnectionError
+    };
+  }
+
+  // Test: a server first registered without `id` (under a nanoid) gets
+  // migrated in place when the caller adds `{ id }` on the next call.
+  async testHttpSuppliedIdMigratesNanoid() {
+    // Seed an existing server under a nanoid-ish id, exactly as if the user
+    // had called addMcpServer(name, url) previously without { id }.
+    const oldId = await this._seedServer(
+      "http-migrate-server",
+      "https://mcp.example.com/migrate",
+      "old-nanoid-aaaa"
+    );
+
+    // Drop fake OAuth-style keys under the old prefix to verify the manager
+    // also migrates DO-storage-backed OAuth state, not just the SQL row.
+    const ctx = (this as unknown as { ctx: { storage: DurableObjectStorage } })
+      .ctx;
+    await ctx.storage.put(`/${this.name}/${oldId}/test-client/client_info/`, {
+      client_id: "abc"
+    });
+    await ctx.storage.put(`/${this.name}/${oldId}/test-client/token`, {
+      access_token: "t"
+    });
+
+    let resultId: string | null = null;
+    try {
+      const r = await this.addMcpServer(
+        "http-migrate-server",
+        "https://mcp.example.com/migrate",
+        { id: "stable-migrated" }
+      );
+      resultId = r.id;
+    } catch (_e) {
+      // The mocked connectToServer always fails; that's expected. What we
+      // care about is the storage-level migration that ran before connect.
+      const servers = this.mcp.listServers();
+      resultId =
+        servers.find((s) => s.name === "http-migrate-server")?.id ?? null;
+    }
+
+    const storedIds = this.mcp
+      .listServers()
+      .filter((s) => s.name === "http-migrate-server")
+      .map((s) => s.id);
+
+    // OAuth keys should have moved from old prefix to new prefix.
+    const oldKeys = await ctx.storage.list({
+      prefix: `/${this.name}/${oldId}/`
+    });
+    const newKeys = await ctx.storage.list({
+      prefix: `/${this.name}/stable-migrated/`
+    });
+
+    return {
+      oldId,
+      resultId,
+      storedIds,
+      oldKeyCount: oldKeys.size,
+      newKeyCount: newKeys.size
+    };
+  }
+
+  // Test: caller-supplied id is normalized and used for the new server
+  async testHttpSuppliedIdIsUsed() {
+    try {
+      const result = await this.addMcpServer(
+        "http-stable",
+        "https://mcp.example.com/stable",
+        { id: "GitHub MCP!" }
+      );
+      return { ok: true, id: result.id };
+    } catch (e) {
+      // connectToServer is mocked to fail. The registered server still gets
+      // the requested id; we can read it back from storage.
+      const servers = this.mcp.listServers();
+      const server = servers.find((s) => s.name === "http-stable") ?? null;
+      return {
+        ok: false,
+        id: server?.id ?? null,
+        error: e instanceof Error ? e.message : String(e)
+      };
+    }
+  }
+
+  // Test: caller-supplied id colliding with a different (name,url) throws
+  async testHttpSuppliedIdCollision() {
+    const seededId = await this._seedServer(
+      "http-collide-a",
+      "https://mcp.example.com/a",
+      "collide"
+    );
+
+    let threw = false;
+    let message = "";
+    try {
+      await this.addMcpServer("http-collide-b", "https://mcp.example.com/b", {
+        id: "collide"
+      });
+    } catch (e) {
+      threw = true;
+      message = e instanceof Error ? e.message : String(e);
+    }
+    return { seededId, threw, message };
   }
 
   // Test: different name + same URL should NOT dedup

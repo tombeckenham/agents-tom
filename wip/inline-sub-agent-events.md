@@ -96,7 +96,7 @@ below.
 This WIP note has mostly served its purpose. The pattern explored here
 graduated into the accepted RFC
 `design/rfc-helper-sub-agent-orchestration.md`, the stable design record
-`design/agent-tools.md`, user docs in `docs/agent-tools.md`, and a
+`design/agent-tools.md`, user docs in `docs/agents/agent-tools.md`, and a
 framework implementation under the public **agent tools** name.
 
 **What is done:**
@@ -120,7 +120,7 @@ framework implementation under the public **agent tools** name.
   `agentTool(Cls, options)`, the `agent-tool-event` protocol,
   parent-side `cf_agent_tool_runs`, Think and AIChatAgent child adapter
   methods, and the React `useAgentToolEvents` hook.
-- Docs / release notes: **done.** See `docs/agent-tools.md`,
+- Docs / release notes: **done.** See `docs/agents/agent-tools.md`,
   `design/agent-tools.md`, `packages/think/README.md`,
   `packages/ai-chat/README.md`, and the changeset.
 
@@ -145,7 +145,7 @@ The same word means two different things in this repo and being
 sloppy about it has been a source of confusion:
 
 1. **Sub-agent as nested addressable Durable Object** (what we ship).
-   Documented in `docs/sub-agents.md`:
+   Documented in `docs/agents/sub-agents.md`:
 
    > Sub-agents are child Durable Objects colocated under a parent
    > agent. Each sub-agent has its own isolated SQLite storage and its
@@ -341,7 +341,7 @@ covered by agent tools.
 
 - Routing primitive: `subAgent(Cls, name)`, `parentAgent(Cls)`,
   `onBeforeSubAgent`, `hasSubAgent`, `listSubAgents`,
-  `useAgent({ sub: [...] })`. Documented in `docs/sub-agents.md`.
+  `useAgent({ sub: [...] })`. Documented in `docs/agents/sub-agents.md`.
 - Resumable streaming for the parent's _own_ chat reply, durable
   across reconnect / hibernation. One `ResumableStream` per Think
   / AIChatAgent DO.
@@ -862,12 +862,10 @@ Concrete ones the design has to answer before it can ship:
    channel's tables in-place during constructor; teach the multi-channel
    reader to also read the legacy tables transparently; defer migration
    to a major bump. Pick before shipping Ring 1.
-9. **Wrangler config implications.** Each helper class has to be a
-   bound `new_sqlite_classes` entry per the routing primitive's
-   requirements. How invasive is this for users who just want
-   "spawn a helper"? Possibly a ergonomics issue worth solving with
-   a single `helpers: [HelperA, HelperB, ...]` declaration on the
-   parent class.
+9. **Wrangler config implications.** Helper classes need to be exported from
+   the Worker entry point so `ctx.exports` can resolve them, but they should
+   not be bound or listed in `new_sqlite_classes` unless they are also used as
+   top-level Durable Objects.
 10. **Test infrastructure.** `examples/assistant` finally got a
     vitest+workers harness in #1384's follow-ups. Helper streaming
     needs equivalent coverage: parent broadcasts a helper event,
@@ -1081,7 +1079,7 @@ channel:
    re-establish a forwarding loop after its own crash (separate
    from per-turn helpers, where the run is allowed to be
    interrupted).
-8. Documentation in `docs/`. Decide whether `docs/sub-agents.md`
+8. Documentation in `docs/`. Decide whether `docs/agents/sub-agents.md`
    gains a "helpers" section or whether they get their own doc.
 
 Each PR is independently shippable. Each PR adds a concrete
@@ -1130,7 +1128,7 @@ shape is locked.
 
 - Issue: [`cloudflare/agents#1377`](https://github.com/cloudflare/agents/issues/1377)
 - Existing module: `packages/agents/src/chat/resumable-stream.ts`
-- Routing primitive doc: `docs/sub-agents.md`
+- Routing primitive doc: `docs/agents/sub-agents.md`
 - Shipped multi-session plan: `wip/think-multi-session-assistant-plan.md`
 - Chat-shared-layer extraction: `design/chat-shared-layer.md`
 - Think roadmap (where helper support could land): `design/think-roadmap.md`
@@ -1789,8 +1787,8 @@ Planner } as const` used by `onConnect` / `clearHelperRuns` to
   - Added the `plan(description)` tool, dispatching `Planner` via
     `_runHelperTurn`. Updated the Assistant's system prompt to nudge
     the LLM toward `plan` for "how do I implement X" queries.
-  - Wrangler bumped to a v2 migration adding `Planner` to
-    `new_sqlite_classes` (idempotent for existing deployments).
+  - Planner is exported from the Worker entry point so sub-agent routing can
+    resolve it.
   - Test worker grew a `Planner` test subclass — same mock-model
     plumbing as `TestResearcher`, deliberately duplicated rather
     than mixed in (TypeScript class mixins are gnarlier than two
@@ -1857,11 +1855,9 @@ helperClassByType]`. Adding a class is one site (the registry):
     `"Researcher"` explicitly — closes the footgun where a future
     Planner test could silently check Researcher's facet table and
     pass for the wrong reason.
-  - **Wrangler v2 migration consolidated into v1.** The example
-    isn't deployed anywhere, so the v2 entry that added `Planner`
-    to `new_sqlite_classes` was rolled into v1. Cleaner for first-
-    time deploys; v2-tag-handling is no longer something the
-    example has to think about.
+  - **Wrangler config simplified.** The example is not deployed anywhere, so
+    helper facet classes stay out of `new_sqlite_classes`; only the top-level
+    Assistant class needs a migration entry.
   - **Polish pass.** Updated `runResearchHelper` references in the
     README, server doc-comments, test file headers, and the older
     parts of this design doc to the post-rename name
@@ -1962,7 +1958,7 @@ helperClassByType]`. Adding a class is one site (the registry):
     `webServer`; `workers: 1` keeps tests serialized so they
     don't fight over Workers AI capacity; `retries: 1` rides out
     occasional 504s; `timeout: 180_000` covers the slow
-    `kimi-k2.5` model. Headed and UI modes are wired via
+    `kimi-k2.7-code` model. Headed and UI modes are wired via
     `npm run test:e2e:headed` / `npm run test:e2e:ui`.
   - Added minimal `data-testid` hooks: `helper-panel` (with
     `data-helper-type` / `data-helper-id` / `data-helper-status`)

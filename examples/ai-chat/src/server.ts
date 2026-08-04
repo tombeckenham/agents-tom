@@ -1,20 +1,19 @@
 import { createWorkersAI } from "workers-ai-provider";
 import { routeAgentRequest, callable } from "agents";
 import { createBrowserTools } from "agents/browser/ai";
-import {
-  AIChatAgent,
-  type OnChatMessageOptions,
-  type ChatResponseResult
-} from "@cloudflare/ai-chat";
+
+// The browser tool runs on a durable codemode runtime that lives in a facet
+// of the agent — the facet class must be exported from the worker entry.
+export { CodemodeRuntime } from "@cloudflare/codemode";
+import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   streamText,
   convertToModelMessages,
   pruneMessages,
   tool,
-  stepCountIs
+  isStepCount
 } from "ai";
 import { z } from "zod";
-import { nanoid } from "nanoid";
 
 /**
  * AI Chat Agent showcasing @cloudflare/ai-chat features:
@@ -31,7 +30,14 @@ export class ChatAgent extends AIChatAgent {
   // Keep the last 200 messages in SQLite storage
   maxPersistedMessages = 200;
 
-  private _proactiveScheduled = false;
+  // Recover durable chat turns interrupted by a Durable Object eviction
+  // (deploy, OOM, idle hibernation mid-stream). With this on, each turn runs
+  // inside a fiber with a keepAlive alarm: after an eviction the DO self-wakes,
+  // resumes the turn from the persisted partial (`_chatRecoveryContinue`), and
+  // clients see a live "recovering…" status (also replayed on reconnect).
+  // Defaults to `false` on `AIChatAgent`; `@cloudflare/think` enables it by
+  // default. Bounded by `maxAttempts` (default 6).
+  chatRecovery = true;
 
   // Wait for MCP connections to restore after hibernation before processing messages
   waitForMcpConnections = true;
@@ -66,7 +72,13 @@ export class ChatAgent extends AIChatAgent {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
+    // `createBrowserTools` returns the durable CDP `browser_execute` tool plus
+    // the stateless Quick Action tools (browser_markdown/extract/links/scrape)
+    // by default, since the BROWSER binding supports both. Prefer the Quick
+    // Actions for simple one-shot reads, and browser_execute for interactive,
+    // multi-step automation.
     const browserTools = createBrowserTools({
+      ctx: this.ctx,
       browser: this.env.BROWSER,
       loader: this.env.LOADER
     });
@@ -74,14 +86,19 @@ export class ChatAgent extends AIChatAgent {
 
     const result = streamText({
       abortSignal: options?.abortSignal,
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system:
+      instructions:
         "You are a helpful assistant. You can check the weather, get the user's timezone, " +
-        "run calculations, and use a browser to inspect web pages via Chrome DevTools Protocol. " +
-        "For page-scoped browser commands, create a target, attach with cdp.attachToTarget(targetId), " +
-        "and pass the returned sessionId to Page, Runtime, and DOM commands. " +
+        "run calculations, and browse the web. " +
+        "For simple one-shot reads, prefer the Quick Action tools: browser_markdown (read a " +
+        "page as Markdown), browser_extract (pull structured data with a prompt/schema), " +
+        "browser_links (list links), and browser_scrape (grab elements by CSS selector). " +
+        "For interactive, multi-step automation use browser_execute, which runs TypeScript " +
+        "with a cdp connector: create a target with cdp.send({ method: 'Target.createTarget', ... }), " +
+        "attach with const { sessionId } = await cdp.attachToTarget({ targetId }), and pass " +
+        "that sessionId to Page, Runtime, and DOM commands. " +
         "For calculations with large numbers (over 1000), you need user approval first.",
       // Prune old tool calls and reasoning to save tokens on long conversations
       messages: pruneMessages({
@@ -93,7 +110,7 @@ export class ChatAgent extends AIChatAgent {
         // MCP tools from connected servers
         ...mcpTools,
 
-        // Browser tools: search CDP spec + execute CDP commands
+        // Browser tools: durable CDP browser_execute + stateless Quick Actions
         ...browserTools,
 
         // Server-side tool: executes automatically
@@ -155,48 +172,10 @@ export class ChatAgent extends AIChatAgent {
           }
         })
       },
-      stopWhen: stepCountIs(20)
+      stopWhen: isStepCount(20)
     });
 
     return result.toUIMessageStreamResponse();
-  }
-
-  protected async onChatResponse(result: ChatResponseResult) {
-    if (result.status === "completed") {
-      this.broadcast(JSON.stringify({ type: "streaming_done" }));
-    }
-
-    // After the very first user message, schedule a proactive follow-up.
-    // This demonstrates server-driven messaging: the agent sends a
-    // message on its own after a delay, and connected clients see
-    // the response stream in real time via isStreaming.
-    if (
-      !result.continuation &&
-      !this._proactiveScheduled &&
-      this.messages.filter((m) => m.role === "user").length === 1
-    ) {
-      this._proactiveScheduled = true;
-      await this.schedule(5, "sendProactiveMessage");
-    }
-  }
-
-  async sendProactiveMessage() {
-    const ready = await this.waitUntilStable({ timeout: 10_000 });
-    if (!ready) return;
-
-    await this.saveMessages((messages) => [
-      ...messages,
-      {
-        id: nanoid(),
-        role: "user" as const,
-        parts: [
-          {
-            type: "text" as const,
-            text: "Give me a one-sentence fun fact about the last topic we discussed."
-          }
-        ]
-      }
-    ]);
   }
 }
 

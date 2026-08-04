@@ -27,6 +27,12 @@ import {
 } from "@cloudflare/kumo";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useSFUVoice } from "./use-sfu-voice";
+import {
+  DEFAULT_STT_SETTINGS,
+  ProviderSettings,
+  getSttQuery,
+  type SttSettings
+} from "./stt-settings";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -110,12 +116,22 @@ function ModeToggle() {
 
 type LlmModel = "kimi" | "glm" | "gpt-oss-20b";
 
+function getAudioOutputLabel(device: MediaDeviceInfo, index: number) {
+  if (device.deviceId === "default") return "System default";
+  if (device.deviceId === "communications") return "Communications default";
+  return device.label || `Speaker ${index + 1}`;
+}
+
 function WebRTCApp({
   llmModel,
-  onLlmModelChange
+  onLlmModelChange,
+  sttSettings,
+  onSttSettingsChange
 }: {
   llmModel: LlmModel;
   onLlmModelChange: (m: LlmModel) => void;
+  sttSettings: SttSettings;
+  onSttSettingsChange: (settings: SttSettings) => void;
 }) {
   const sessionId = useRef(getSessionId()).current;
 
@@ -135,7 +151,7 @@ function WebRTCApp({
   } = useSFUVoice({
     agent: "my-voice-agent",
     name: sessionId,
-    query: { llm: llmModel }
+    query: { llm: llmModel, ...getSttQuery(sttSettings) }
   });
 
   const transcriptEndRef = useRef<HTMLDivElement>(null);
@@ -195,6 +211,12 @@ function WebRTCApp({
           Kimi
         </Button>
       </div>
+
+      <ProviderSettings
+        settings={sttSettings}
+        disabled={isInCall}
+        onChange={onSttSettingsChange}
+      />
 
       {/* Error banner */}
       {error && (
@@ -374,8 +396,10 @@ function App() {
   const [transport, setTransport] = useState<"websocket" | "webrtc">(
     "websocket"
   );
-  const [sttModel, setSttModel] = useState<"flux" | "nova-3">("flux");
+  const [sttSettings, setSttSettings] =
+    useState<SttSettings>(DEFAULT_STT_SETTINGS);
   const [llmModel, setLlmModel] = useState<LlmModel>("glm");
+  const [outputDeviceId, setOutputDeviceId] = useState("default");
 
   const {
     status,
@@ -386,6 +410,7 @@ function App() {
     isMuted,
     connected,
     error,
+    outputDeviceError,
     startCall,
     endCall,
     toggleMute,
@@ -393,7 +418,8 @@ function App() {
   } = useVoiceAgent({
     agent: "my-voice-agent",
     name: sessionId,
-    query: { model: sttModel, llm: llmModel },
+    query: { llm: llmModel, ...getSttQuery(sttSettings) },
+    outputDeviceId,
     onReconnect: () => {
       setToast("Reconnected to agent.");
     }
@@ -404,6 +430,9 @@ function App() {
   const [speakerConflict, setSpeakerConflict] = useState(false);
   const [kicked, setKicked] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [audioOutputDevices, setAudioOutputDevices] = useState<
+    MediaDeviceInfo[]
+  >([]);
 
   // Listen for custom protocol messages (speaker_conflict, kicked, speaker_available)
   // by observing the VoiceClient's raw message events. Since useVoiceAgent abstracts
@@ -432,10 +461,41 @@ function App() {
     }
   }, [toast]);
 
+  const refreshAudioOutputs = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setAudioOutputDevices(
+      devices.filter((device) => device.kind === "audiooutput")
+    );
+  }, []);
+
+  useEffect(() => {
+    refreshAudioOutputs().catch(() => {
+      setToast("Could not list speakers for this browser.");
+    });
+
+    navigator.mediaDevices?.addEventListener(
+      "devicechange",
+      refreshAudioOutputs
+    );
+    return () => {
+      navigator.mediaDevices?.removeEventListener(
+        "devicechange",
+        refreshAudioOutputs
+      );
+    };
+  }, [refreshAudioOutputs]);
+
   // Auto-scroll transcript
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcript, interimTranscript]);
+
+  const handleStartCall = useCallback(async () => {
+    await startCall();
+    await refreshAudioOutputs().catch(() => {});
+  }, [refreshAudioOutputs, startCall]);
 
   // Detect speaker conflict from error messages
   useEffect(() => {
@@ -552,7 +612,12 @@ function App() {
             </Button>
           </div>
 
-          <WebRTCApp llmModel={llmModel} onLlmModelChange={setLlmModel} />
+          <WebRTCApp
+            llmModel={llmModel}
+            onLlmModelChange={setLlmModel}
+            sttSettings={sttSettings}
+            onSttSettingsChange={setSttSettings}
+          />
 
           {/* Footer */}
           <div className="mt-4 flex justify-center">
@@ -609,24 +674,11 @@ function App() {
           </Button>
         </div>
 
-        {/* STT model selector */}
-        <div className="mb-4 flex items-center justify-center gap-2">
-          <span className="text-xs text-kumo-secondary">STT Model:</span>
-          <Button
-            variant={sttModel === "flux" ? "primary" : "ghost"}
-            size="sm"
-            onClick={() => setSttModel("flux")}
-          >
-            Flux
-          </Button>
-          <Button
-            variant={sttModel === "nova-3" ? "primary" : "ghost"}
-            size="sm"
-            onClick={() => setSttModel("nova-3")}
-          >
-            Nova 3
-          </Button>
-        </div>
+        <ProviderSettings
+          settings={sttSettings}
+          disabled={isInCall}
+          onChange={setSttSettings}
+        />
 
         {/* LLM model selector */}
         <div className="mb-4 flex items-center justify-center gap-2">
@@ -801,10 +853,32 @@ function App() {
         </Surface>
 
         {/* Controls */}
-        <div className="flex items-center justify-center gap-4">
+        <div className="flex flex-col items-center justify-center gap-3 sm:flex-row">
+          <div className="flex flex-col items-center gap-1">
+            <select
+              aria-label="Audio output"
+              value={outputDeviceId}
+              onChange={(event) => setOutputDeviceId(event.target.value)}
+              className="min-w-0 rounded-lg border border-kumo-line bg-kumo-base px-3 py-2 text-sm text-kumo-default"
+            >
+              <option value="default">System default</option>
+              {audioOutputDevices
+                .filter((device) => device.deviceId !== "default")
+                .map((device, index) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {getAudioOutputLabel(device, index)}
+                  </option>
+                ))}
+            </select>
+            {outputDeviceError && (
+              <span className="max-w-48 text-center text-xs text-kumo-warning">
+                {outputDeviceError}
+              </span>
+            )}
+          </div>
           {!isInCall ? (
             <Button
-              onClick={startCall}
+              onClick={handleStartCall}
               className="px-8 justify-center"
               variant="primary"
               disabled={!connected || speakerConflict}

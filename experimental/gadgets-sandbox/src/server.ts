@@ -44,7 +44,7 @@ import { createWorkersAI } from "workers-ai-provider";
 import { Agent, routeAgentRequest } from "agents";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { streamText, convertToModelMessages, tool, stepCountIs } from "ai";
+import { streamText, convertToModelMessages, tool, isStepCount } from "ai";
 import { z } from "zod";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,7 +153,6 @@ export class DatabaseLoopback extends WorkerEntrypoint<Env, LoopbackProps> {
   private _agentId: string = this.ctx.props.agentId;
 
   private _getAgent(): DurableObjectStub<SandboxAgent> {
-    // @ts-expect-error — experimental: ctx.exports
     const ns = this.ctx.exports
       .SandboxAgent as DurableObjectNamespace<SandboxAgent>;
     return ns.get(ns.idFromString(this._agentId));
@@ -205,9 +204,6 @@ export class TailLoopback extends WorkerEntrypoint<Env, TailLoopbackProps> {
     // Round-trip through JSON to make traces serializable
     const serializable = JSON.parse(JSON.stringify(event));
 
-    // ctx.exports is available on WorkerEntrypoints in the experimental runtime,
-    // but the types only declare it on DurableObjectState.
-    // @ts-expect-error — experimental: ctx.exports on WorkerEntrypoint
     const ns = this.ctx.exports
       .SandboxAgent as DurableObjectNamespace<SandboxAgent>;
     const stub = ns.get(ns.idFromString(this.ctx.props.agentId));
@@ -343,17 +339,15 @@ export class SandboxAgent extends AIChatAgent<Env, SandboxState> {
       agentId: this.ctx.id.toString()
     };
 
-    // @ts-expect-error — experimental: ctx.exports
     const dbBinding = this.ctx.exports.DatabaseLoopback({
       props: loopbackProps
     });
-    // @ts-expect-error — experimental: ctx.exports
     const tailBinding = this.ctx.exports.TailLoopback({ props: tailProps });
 
     // Create the dynamic isolate via the Worker Loader.
     // Each execution gets a unique ID so isolates don't collide.
     const worker = this.env.LOADER.get(executionId, () => ({
-      compatibilityDate: "2026-01-28",
+      compatibilityDate: "2026-06-11",
       mainModule: "harness.js",
       modules: {
         "harness.js": CODE_HARNESS,
@@ -417,10 +411,10 @@ export class SandboxAgent extends AIChatAgent<Env, SandboxState> {
     const agent = this;
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
         sessionAffinity: this.sessionAffinity
       }),
-      system: `You are a helpful assistant that can write and execute JavaScript code to work with a customer database.
+      instructions: `You are a helpful assistant that can write and execute JavaScript code to work with a customer database.
 
 You have access to an executeCode tool. The code you write runs in a SANDBOX — a completely
 isolated environment with no internet access. The only thing the code can do is interact with
@@ -500,7 +494,7 @@ Write clean, readable code. Handle errors gracefully.`,
           }
         })
       },
-      stopWhen: stepCountIs(5)
+      stopWhen: isStepCount(5)
     });
 
     return result.toUIMessageStreamResponse();

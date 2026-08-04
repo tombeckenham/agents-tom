@@ -38,6 +38,8 @@ export {
   type SessionManagerOptions
 } from "./manager";
 export type {
+  HistoryRowStat,
+  RecentHistoryResult,
   SearchResult,
   SessionProvider,
   StoredCompaction
@@ -62,7 +64,11 @@ export { AgentSearchProvider, isSearchProvider } from "./search";
 export type { SkillProvider } from "./skills";
 export { isSkillProvider, R2SkillProvider } from "./skills";
 export type {
+  CompactAfterOptions,
+  CompactionErrorHandler,
   SessionMessage,
   SessionMessagePart,
-  SessionOptions
+  SessionOptions,
+  SessionTokenCounter,
+  SessionTokenCounterInput
 } from "./types";

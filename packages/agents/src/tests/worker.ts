@@ -8,6 +8,7 @@ import {
 // Re-export all test agents so existing imports (e.g. `import { type Env } from "./worker"`)
 // and wrangler bindings continue to work.
 export {
+  TestCodemodeMcpAgent,
   TestMcpAgent,
   TestMcpJurisdiction,
   TestAddMcpServerAgent,
@@ -29,6 +30,10 @@ export {
   TestOnStartScheduleExplicitFalseAgent,
   TestScheduleAgent,
   TestWorkflowAgent,
+  TestWorkflowOnStartSubAgent,
+  TestWorkflowSubAgent,
+  TestAgentToolReplayAgent,
+  TestAgentToolStubChild,
   TestOAuthAgent,
   TestCustomOAuthAgent,
   TestReadonlyAgent,
@@ -36,6 +41,7 @@ export {
   TestCallableAgent,
   TestParentAgent,
   TestChildAgent,
+  TestChatSdkStateHostAgent,
   TestQueueAgent,
   TestRaceAgent,
   TestRetryAgent,
@@ -66,6 +72,7 @@ export {
   TestUnboundParentAgent,
   TestMinifiedNameParentAgent
 } from "./agents";
+export { ChatSdkStateAgent } from "./agents";
 export { TestRunFiberAgent } from "./agents/run-fiber";
 import type { TestRunFiberAgent } from "./agents/run-fiber";
 
@@ -78,7 +85,10 @@ export {
   ThrowInRunWorkflow,
   ReportErrorThenThrowWorkflow,
   ReportErrorOnlyWorkflow,
-  ThrowNonErrorWorkflow
+  ThrowNonErrorWorkflow,
+  FacetOriginWorkflow,
+  FacetApprovalWorkflow,
+  FacetEventStateWorkflow
 } from "./test-workflow";
 
 // ── Env type ─────────────────────────────────────────────────────────
@@ -86,6 +96,7 @@ export {
 // circular dependencies.
 
 import type {
+  TestCodemodeMcpAgent,
   TestRpcMcpClientAgent,
   TestEmailAgent,
   TestCaseSensitiveAgent,
@@ -102,6 +113,7 @@ import type {
   TestProtocolMessagesAgent,
   TestScheduleAgent,
   TestWorkflowAgent,
+  TestAgentToolReplayAgent,
   TestAddMcpServerAgent,
   TestHttpMcpDedupAgent,
   TestStateAgent,
@@ -112,6 +124,7 @@ import type {
   TestNoIdentityAgent,
   TestCallableAgent,
   TestChildAgent,
+  TestChatSdkStateHostAgent,
   TestQueueAgent,
   TestRetryAgent,
   TestRetryDefaultsAgent,
@@ -133,7 +146,9 @@ import type {
 } from "./agents";
 
 export type Env = {
+  LOADER: WorkerLoader;
   MCP_OBJECT: DurableObjectNamespace<McpAgent>;
+  TestCodemodeMcpAgent: DurableObjectNamespace<TestCodemodeMcpAgent>;
   EmailAgent: DurableObjectNamespace<TestEmailAgent>;
   CaseSensitiveAgent: DurableObjectNamespace<TestCaseSensitiveAgent>;
   UserNotificationAgent: DurableObjectNamespace<TestUserNotificationAgent>;
@@ -149,6 +164,7 @@ export type Env = {
   TestProtocolMessagesAgent: DurableObjectNamespace<TestProtocolMessagesAgent>;
   TestScheduleAgent: DurableObjectNamespace<TestScheduleAgent>;
   TestWorkflowAgent: DurableObjectNamespace<TestWorkflowAgent>;
+  TestAgentToolReplayAgent: DurableObjectNamespace<TestAgentToolReplayAgent>;
   TestAddMcpServerAgent: DurableObjectNamespace<TestAddMcpServerAgent>;
   TestRpcMcpClientAgent: DurableObjectNamespace<TestRpcMcpClientAgent>;
   TestHttpMcpDedupAgent: DurableObjectNamespace<TestHttpMcpDedupAgent>;
@@ -160,6 +176,7 @@ export type Env = {
   TestNoIdentityAgent: DurableObjectNamespace<TestNoIdentityAgent>;
   TestCallableAgent: DurableObjectNamespace<TestCallableAgent>;
   TestChildAgent: DurableObjectNamespace<TestChildAgent>;
+  TestChatSdkStateHostAgent: DurableObjectNamespace<TestChatSdkStateHostAgent>;
   TestQueueAgent: DurableObjectNamespace<TestQueueAgent>;
   TestRetryAgent: DurableObjectNamespace<TestRetryAgent>;
   TestRetryDefaultsAgent: DurableObjectNamespace<TestRetryDefaultsAgent>;
@@ -184,6 +201,9 @@ export type Env = {
   // Workflow bindings for integration testing
   TEST_WORKFLOW: Workflow;
   SIMPLE_WORKFLOW: Workflow;
+  FACET_ORIGIN_WORKFLOW: Workflow;
+  FACET_APPROVAL_WORKFLOW: Workflow;
+  FACET_EVENT_STATE_WORKFLOW: Workflow;
   THROW_IN_RUN_WORKFLOW: Workflow;
   REPORT_ERROR_THEN_THROW_WORKFLOW: Workflow;
   REPORT_ERROR_ONLY_WORKFLOW: Workflow;
@@ -192,7 +212,10 @@ export type Env = {
 
 // ── Fetch handler ────────────────────────────────────────────────────
 
-import { TestMcpAgent as McpAgentImpl } from "./agents";
+import {
+  TestCodemodeMcpAgent as CodemodeMcpAgentImpl,
+  TestMcpAgent as McpAgentImpl
+} from "./agents";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
@@ -210,6 +233,12 @@ export default {
 
     if (url.pathname === "/mcp") {
       return McpAgentImpl.serve("/mcp").fetch(request, env, ctx);
+    }
+
+    if (url.pathname === "/codemode-mcp") {
+      return CodemodeMcpAgentImpl.serve("/codemode-mcp", {
+        binding: "TestCodemodeMcpAgent"
+      }).fetch(request, env, ctx);
     }
 
     if (url.pathname === "/auto" || url.pathname === "/auto/message") {
@@ -236,6 +265,17 @@ export default {
         env.HookingSubAgentParent,
         parentName
       );
+      return routeSubAgentRequest(request, parent, { fromPath: rest });
+    }
+
+    // Workflow facet routing exercising `routeSubAgentRequest` directly.
+    // URL shape: /wf-sub/{parent}/sub/{child-class-kebab}/{child-name}[/...]
+    // Proves the documented HTTP escape hatch reaches a workflow facet.
+    if (url.pathname.startsWith("/wf-sub/")) {
+      const match = url.pathname.match(/^\/wf-sub\/([^/]+)(\/.*)$/);
+      if (!match) return new Response("Bad wf-sub path", { status: 400 });
+      const [, parentName, rest] = match;
+      const parent = await getAgentByName(env.TestWorkflowAgent, parentName);
       return routeSubAgentRequest(request, parent, { fromPath: rest });
     }
 

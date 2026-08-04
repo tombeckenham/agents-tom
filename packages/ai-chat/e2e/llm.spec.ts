@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 /**
- * E2E tests that make real LLM calls via Workers AI (@cf/moonshotai/kimi-k2.5).
+ * E2E tests that make real LLM calls via Workers AI (@cf/moonshotai/kimi-k2.7-code).
  * These verify the full streaming pipeline: streamText → SSE → WebSocket → client.
  *
  * Uses the AI binding configured in wrangler.jsonc -- no API key needed.
@@ -112,7 +112,7 @@ test.describe("LLM e2e (Workers AI)", () => {
   test.setTimeout(30_000);
 
   test.beforeEach(async ({ page }) => {
-    await page.goto("about:blank");
+    await page.goto("/__health");
   });
 
   test("SSE streaming: receives text-start, text-delta(s), text-end from real model", async ({

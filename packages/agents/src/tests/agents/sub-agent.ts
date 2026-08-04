@@ -11,6 +11,7 @@ import { RpcTarget } from "cloudflare:workers";
 
 export class CounterSubAgent extends Agent {
   private _heldKeepAliveDisposers: Array<() => void> = [];
+  private _constructorName = this.name;
 
   onStart() {
     this.sql`
@@ -252,6 +253,10 @@ export class CounterSubAgent extends Agent {
 
   getName(): string {
     return this.name;
+  }
+
+  getConstructorName(): string {
+    return this._constructorName;
   }
 
   /** Return the facet's own `parentPath` (root-first ancestor chain). */
@@ -1030,6 +1035,28 @@ export class BroadcastSubAgent extends Agent<Cloudflare.Env, BroadcastState> {
   }
 
   /**
+   * Returns the ids of the connections this facet sees via
+   * `this.getConnections()`. A facet must only ever see its own (virtual)
+   * sub-agent connections — never the ROOT DO's direct connections. Touching
+   * the root's hibernatable WebSockets from a facet's I/O context throws
+   * "Cannot perform I/O on behalf of a different Durable Object (Native)" in
+   * production. See issue #1677.
+   */
+  connectionIds(): string[] {
+    return [...this.getConnections()].map((connection) => connection.id);
+  }
+
+  /** Count of connections visible to this facet (see `connectionIds`). */
+  connectionCount(): number {
+    return [...this.getConnections()].length;
+  }
+
+  /** Resolve a connection by id through the facet's `getConnection()`. */
+  hasConnection(id: string): boolean {
+    return this.getConnection(id) !== undefined;
+  }
+
+  /**
    * A dummy onStart observation: the base Agent's wrapped `onStart`
    * calls `broadcastMcpServers()` before the user's `onStart` runs.
    * If the `_isFacet` flag isn't set in time, that call would throw
@@ -1116,6 +1143,14 @@ export class TestSubAgentParent extends Agent {
   async subAgentPing(subAgentName: string): Promise<string> {
     const child = await this.subAgent(CounterSubAgent, subAgentName);
     return child.ping();
+  }
+
+  async seedLegacyCounterSubAgentRegistry(subAgentName: string): Promise<void> {
+    this.hasSubAgent("CounterSubAgent", subAgentName);
+    this.sql`
+      INSERT OR IGNORE INTO cf_agents_sub_agents (class, name, created_at)
+      VALUES (${"CounterSubAgent"}, ${subAgentName}, ${Date.now()})
+    `;
   }
 
   async subAgentIncrement(
@@ -1429,6 +1464,11 @@ export class TestSubAgentParent extends Agent {
   async subAgentGetName(subAgentName: string): Promise<string> {
     const child = await this.subAgent(CounterSubAgent, subAgentName);
     return child.getName();
+  }
+
+  async subAgentGetConstructorName(subAgentName: string): Promise<string> {
+    const child = await this.subAgent(CounterSubAgent, subAgentName);
+    return child.getConstructorName();
   }
 
   // ── Error tests ───────────────────────────────────────────────
@@ -1790,6 +1830,38 @@ export class TestSubAgentParent extends Agent {
   async subAgentInitOk(subAgentName: string): Promise<boolean> {
     const child = await this.subAgent(BroadcastSubAgent, subAgentName);
     return child.initializedOk();
+  }
+
+  /** Count of connections the ROOT itself sees (its own direct connections). */
+  connectionCount(): number {
+    return [...this.getConnections()].length;
+  }
+
+  /** Connection ids visible to a freshly-resolved facet child (issue #1677). */
+  async subAgentConnectionIds(subAgentName: string): Promise<string[]> {
+    const child = await this.subAgent(BroadcastSubAgent, subAgentName);
+    return child.connectionIds();
+  }
+
+  /** Connection count visible to a freshly-resolved facet child (#1677). */
+  async subAgentConnectionCount(subAgentName: string): Promise<number> {
+    const child = await this.subAgent(BroadcastSubAgent, subAgentName);
+    return child.connectionCount();
+  }
+
+  /** Whether a facet child resolves the ROOT's connection id (#1677). */
+  async subAgentHasConnection(
+    subAgentName: string,
+    connectionId: string
+  ): Promise<boolean> {
+    const child = await this.subAgent(BroadcastSubAgent, subAgentName);
+    return child.hasConnection(connectionId);
+  }
+
+  /** A connection id the ROOT currently sees, or null. */
+  firstConnectionId(): string | null {
+    const [connection] = [...this.getConnections()];
+    return connection ? connection.id : null;
   }
 
   // ── parentPath / registry exposure for Phase-1 tests ──────────────

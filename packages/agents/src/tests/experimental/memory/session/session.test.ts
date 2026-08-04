@@ -20,6 +20,7 @@ import {
   createCompactFunction,
   type CompactResult
 } from "../../../../experimental/memory/utils/compaction-helpers";
+import { estimateMessageTokens } from "../../../../experimental/memory/utils/tokens";
 
 // ── Test helpers ────────────────────────────────────────────────
 
@@ -918,6 +919,465 @@ describe("Session.compact()", () => {
     expect(messages).toHaveLength(1);
   });
 
+  it("appendMessage includes session system prompt in auto-compaction estimate", async () => {
+    let compactCalled = false;
+    const messages: SessionMessage[] = [];
+    const compactions: StoredCompaction[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: (summary, fromMessageId, toMessageId) => {
+        const compaction = {
+          id: "c1",
+          summary,
+          fromMessageId,
+          toMessageId,
+          createdAt: ""
+        };
+        compactions.push(compaction);
+        return compaction;
+      },
+      getCompactions: () => compactions
+    };
+    const session = new Session(storage, {
+      context: [
+        {
+          label: "big",
+          provider: new ReadonlyBlockProvider("x".repeat(400))
+        }
+      ]
+    })
+      .onCompaction(async () => {
+        compactCalled = true;
+        return {
+          fromMessageId: "m0",
+          toMessageId: "m1",
+          summary: "context-triggered"
+        };
+      })
+      .compactAfter(50);
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "short" }]
+    });
+
+    await session.appendMessage({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "ok" }]
+    });
+
+    expect(compactCalled).toBe(true);
+    expect(compactions[0].summary).toBe("context-triggered");
+  });
+
+  it("auto-compaction estimates do not persist a new cached prompt", async () => {
+    const promptStore = new MemoryBlockProvider(null);
+    const messages: SessionMessage[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: () => {
+        throw new Error("should not compact");
+      },
+      getCompactions: () => []
+    };
+    const session = new Session(storage, {
+      context: [
+        {
+          label: "soul",
+          provider: new ReadonlyBlockProvider("do not persist during estimate")
+        }
+      ],
+      promptStore
+    })
+      .onCompaction(async () => null)
+      .compactAfter(1000000);
+
+    await session.appendMessage({
+      id: "m1",
+      role: "user",
+      parts: [{ type: "text", text: "hello" }]
+    });
+
+    expect(await promptStore.get()).toBeNull();
+  });
+
+  it("auto-compaction estimates reuse an existing frozen prompt snapshot", async () => {
+    let compactCalled = false;
+    const provider = new MemoryBlockProvider("x".repeat(400));
+    const messages: SessionMessage[] = [];
+    const compactions: StoredCompaction[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: (summary, fromMessageId, toMessageId) => {
+        const compaction = {
+          id: "c1",
+          summary,
+          fromMessageId,
+          toMessageId,
+          createdAt: ""
+        };
+        compactions.push(compaction);
+        return compaction;
+      },
+      getCompactions: () => compactions
+    };
+    const session = new Session(storage, {
+      context: [{ label: "memory", provider }]
+    })
+      .onCompaction(async () => {
+        compactCalled = true;
+        return {
+          fromMessageId: "m0",
+          toMessageId: "m1",
+          summary: "should not trigger from unfrozen changes"
+        };
+      })
+      .compactAfter(50);
+
+    await session.freezeSystemPrompt();
+    await provider.set("short");
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "short" }]
+    });
+
+    await session.appendMessage({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "ok" }]
+    });
+
+    expect(compactCalled).toBe(true);
+  });
+
+  it("compactAfter accepts a custom token counter", async () => {
+    let compactCalled = false;
+    let counterSawPrompt = false;
+    const messages: SessionMessage[] = [];
+    const compactions: StoredCompaction[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: (summary, fromMessageId, toMessageId) => {
+        const compaction = {
+          id: "c1",
+          summary,
+          fromMessageId,
+          toMessageId,
+          createdAt: ""
+        };
+        compactions.push(compaction);
+        return compaction;
+      },
+      getCompactions: () => compactions
+    };
+    const session = new Session(storage, {
+      context: [
+        {
+          label: "memory",
+          provider: new ReadonlyBlockProvider("remember this")
+        }
+      ]
+    })
+      .onCompaction(async () => {
+        compactCalled = true;
+        return {
+          fromMessageId: "m0",
+          toMessageId: "m1",
+          summary: "custom-counter"
+        };
+      })
+      .compactAfter(10, {
+        tokenCounter: ({ messages: history, systemPrompt, contextBlocks }) => {
+          counterSawPrompt =
+            history.length === 2 &&
+            systemPrompt.includes("remember this") &&
+            contextBlocks[0].label === "memory";
+          return 11;
+        }
+      });
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "short" }]
+    });
+
+    await session.appendMessage({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "ok" }]
+    });
+
+    expect(counterSawPrompt).toBe(true);
+    expect(compactCalled).toBe(true);
+  });
+
+  it("loads context blocks for a custom counter when prompt store is cached", async () => {
+    const counterInputs: Array<{
+      historyLength: number;
+      systemPrompt: string;
+      blockLabels: string[];
+      blockContents: string[];
+    }> = [];
+    const messages: SessionMessage[] = [];
+    const compactions: StoredCompaction[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: (summary, fromMessageId, toMessageId) => {
+        const compaction = {
+          id: "c1",
+          summary,
+          fromMessageId,
+          toMessageId,
+          createdAt: ""
+        };
+        compactions.push(compaction);
+        return compaction;
+      },
+      getCompactions: () => compactions
+    };
+    const session = new Session(storage, {
+      context: [
+        {
+          label: "memory",
+          provider: new ReadonlyBlockProvider("current block content")
+        }
+      ],
+      promptStore: new MemoryBlockProvider("cached frozen prompt")
+    })
+      .onCompaction(async () => ({
+        fromMessageId: "m0",
+        toMessageId: "m1",
+        summary: "cached prompt counter"
+      }))
+      .compactAfter(10, {
+        tokenCounter: ({ messages: history, systemPrompt, contextBlocks }) => {
+          counterInputs.push({
+            historyLength: history.length,
+            systemPrompt,
+            blockLabels: contextBlocks.map((block) => block.label),
+            blockContents: contextBlocks.map((block) => block.content)
+          });
+          return 11;
+        }
+      });
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "short" }]
+    });
+
+    await session.appendMessage({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "ok" }]
+    });
+
+    expect(counterInputs).toContainEqual({
+      historyLength: 2,
+      systemPrompt: "cached frozen prompt",
+      blockLabels: ["memory"],
+      blockContents: ["current block content"]
+    });
+    expect(compactions[0].summary).toBe("cached prompt counter");
+  });
+
+  it("treats non-finite custom token counter results as zero", async () => {
+    let compactCalled = false;
+    const { session, setTokenThreshold } = createCompactableSession(
+      async (): Promise<CompactResult> => {
+        compactCalled = true;
+        return {
+          fromMessageId: "m0",
+          toMessageId: "m0",
+          summary: "should not happen"
+        };
+      }
+    );
+
+    session.compactAfter(1, {
+      tokenCounter: () => Number.NaN
+    });
+    setTokenThreshold(1);
+
+    await session.appendMessage({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "short" }]
+    });
+
+    expect(compactCalled).toBe(false);
+  });
+
+  it("counts reasoning parts in message token estimates", () => {
+    const withReasoning = estimateMessageTokens([
+      {
+        id: "m1",
+        role: "assistant",
+        parts: [
+          {
+            type: "reasoning",
+            text: "Let me think through the constraints carefully."
+          }
+        ]
+      }
+    ]);
+
+    const withoutReasoning = estimateMessageTokens([
+      { id: "m1", role: "assistant", parts: [] }
+    ]);
+
+    expect(withReasoning).toBeGreaterThan(withoutReasoning);
+  });
+
+  it("calls onCompactionError when auto-compaction fails", async () => {
+    const errors: unknown[] = [];
+    const messages: SessionMessage[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: () => {
+        throw new Error("storage unavailable");
+      },
+      getCompactions: () => []
+    };
+    const session = new Session(storage)
+      .onCompaction(async () => ({
+        fromMessageId: "m0",
+        toMessageId: "m1",
+        summary: "will fail"
+      }))
+      .onCompactionError((err) => {
+        errors.push(err);
+      })
+      .compactAfter(1);
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "enough tokens to trigger" }]
+    });
+
+    await session.appendMessage({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "ok" }]
+    });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(Error);
+  });
+
+  it("keeps appendMessage non-fatal when onCompactionError throws", async () => {
+    const messages: SessionMessage[] = [];
+    const storage: SessionProvider = {
+      getMessage: (id) => messages.find((m) => m.id === id) ?? null,
+      getHistory: () => messages,
+      getLatestLeaf: () => messages[messages.length - 1] ?? null,
+      getBranches: () => [],
+      getPathLength: () => messages.length,
+      appendMessage: (msg) => {
+        messages.push(msg);
+      },
+      updateMessage: () => {},
+      deleteMessages: () => {},
+      clearMessages: () => {},
+      addCompaction: () => {
+        throw new Error("storage unavailable");
+      },
+      getCompactions: () => []
+    };
+    const session = new Session(storage)
+      .onCompaction(async () => ({
+        fromMessageId: "m0",
+        toMessageId: "m1",
+        summary: "will fail"
+      }))
+      .onCompactionError(() => {
+        throw new Error("logger unavailable");
+      })
+      .compactAfter(1);
+
+    messages.push({
+      id: "m0",
+      role: "user",
+      parts: [{ type: "text", text: "enough tokens to trigger" }]
+    });
+
+    await expect(
+      session.appendMessage({
+        id: "m1",
+        role: "assistant",
+        parts: [{ type: "text", text: "ok" }]
+      })
+    ).resolves.toBeUndefined();
+    expect(messages).toHaveLength(2);
+  });
+
   it("iterative compaction with overlay messages in history", async () => {
     // Simulate getHistory() returning overlay messages from a previous compaction.
     // The compaction function should receive these overlays (filtering is its job),
@@ -1135,6 +1595,158 @@ describe("createCompactFunction", () => {
     expect(result!.summary).toBe("summary");
     expect(result!.fromMessageId).toMatch(/^m/);
     expect(result!.toMessageId).toMatch(/^m/);
+  });
+
+  it("documents that tail budgeting can skip tool-heavy histories when the heuristic under-counts", async () => {
+    let summarizeCalls = 0;
+    const messages: SessionMessage[] = [
+      {
+        id: "head",
+        role: "user",
+        parts: [{ type: "text", text: "start" }]
+      },
+      ...Array.from({ length: 8 }, (_, i): SessionMessage => {
+        const output = Array.from({ length: 120 }, (__, j) => ({
+          file: `/repo/file-${i}-${j}.ts`,
+          line: j,
+          snippet: `export const value${j} = ${JSON.stringify({
+            nested: ["alpha", "beta", "gamma"],
+            enabled: true
+          })};`
+        }));
+        return {
+          id: `tool-${i}`,
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-read_many",
+              toolCallId: `call-${i}`,
+              toolName: "read_many",
+              state: "output-available",
+              input: { glob: "**/*.ts" },
+              output
+            }
+          ]
+        };
+      })
+    ];
+
+    const heuristicTailTokens = estimateMessageTokens(messages.slice(1));
+    const tailTokenBudget = heuristicTailTokens + 1;
+    const modelReportedTailTokens = heuristicTailTokens * 5;
+    const compact = createCompactFunction({
+      summarize: async () => {
+        summarizeCalls++;
+        return "summary";
+      },
+      protectHead: 1,
+      minTailMessages: 1,
+      tailTokenBudget
+    });
+
+    expect(modelReportedTailTokens).toBeGreaterThan(tailTokenBudget);
+    await expect(compact(messages)).resolves.toBeNull();
+    expect(summarizeCalls).toBe(0);
+  });
+
+  it("uses a supplied token counter for tail budgeting tool-heavy histories", async () => {
+    let summarizeCalls = 0;
+    const messages: SessionMessage[] = [
+      {
+        id: "head",
+        role: "user",
+        parts: [{ type: "text", text: "start" }]
+      },
+      ...Array.from(
+        { length: 8 },
+        (_, i): SessionMessage => ({
+          id: `tool-${i}`,
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-read_many",
+              toolCallId: `call-${i}`,
+              toolName: "read_many",
+              state: "output-available",
+              input: { glob: "**/*.ts" },
+              output: "x".repeat(25_000)
+            }
+          ]
+        })
+      )
+    ];
+
+    const compact = createCompactFunction({
+      summarize: async () => {
+        summarizeCalls++;
+        return "summary";
+      },
+      protectHead: 1,
+      minTailMessages: 1,
+      tailTokenBudget: 10_000,
+      tokenCounter: (countedMessages) =>
+        countedMessages.reduce(
+          (sum, message) => sum + JSON.stringify(message.parts).length,
+          0
+        )
+    });
+
+    const result = await compact(messages);
+    expect(result).toMatchObject({
+      fromMessageId: "tool-0",
+      summary: "summary"
+    });
+    expect(summarizeCalls).toBe(1);
+  });
+
+  it("uses the Session-flowed tokenCounter (CompactContext) when no explicit counter is given", async () => {
+    let summarizeCalls = 0;
+    const messages: SessionMessage[] = [
+      { id: "head", role: "user", parts: [{ type: "text", text: "start" }] },
+      ...Array.from(
+        { length: 8 },
+        (_, i): SessionMessage => ({
+          id: `tool-${i}`,
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-read_many",
+              toolCallId: `call-${i}`,
+              toolName: "read_many",
+              state: "output-available",
+              input: { glob: "**/*.ts" },
+              output: "x".repeat(4000)
+            }
+          ]
+        })
+      )
+    ];
+
+    // Budget set just above the heuristic total so the default heuristic
+    // protects the entire tail (the failure mode from the issue).
+    const heuristicTailTokens = estimateMessageTokens(messages.slice(1));
+    const compact = createCompactFunction({
+      summarize: async () => {
+        summarizeCalls++;
+        return "summary";
+      },
+      protectHead: 1,
+      minTailMessages: 1,
+      tailTokenBudget: heuristicTailTokens + 1
+    });
+
+    // No explicit counter and no context → heuristic under-counts → no-op.
+    expect(await compact(messages)).toBeNull();
+    expect(summarizeCalls).toBe(0);
+
+    // Same function, but the Session flows its authoritative counter via
+    // CompactContext (whole-prompt shape) → the boundary now compresses.
+    const result = await compact(messages, {
+      tokenCounter: ({ messages: counted }) =>
+        estimateMessageTokens(counted) * 5
+    });
+    expect(result).toMatchObject({ summary: "summary" });
+    expect(summarizeCalls).toBe(1);
   });
 });
 
@@ -1391,5 +2003,236 @@ describe("Session.create with SessionProvider", () => {
 
     const tools = await session.tools();
     expect(Object.keys(tools)).toHaveLength(0);
+  });
+});
+
+// ── Bounded init reads (#1710) ────────────────────────────────────
+//
+// The init-time loaded-skill restore used to read the FULL history on
+// every wake, bypassing byte-budgeted hydration. It must be skipped when
+// no skill provider is configured, and memory-bounded (row stats + one
+// message at a time) when one is.
+
+/** Counting stub provider with optional row-stats support. */
+function createCountingProvider(seed: SessionMessage[], rowStats: boolean) {
+  const messages = [...seed];
+  const counts = {
+    getHistory: 0,
+    getHistoryRowStats: 0,
+    getMessage: 0,
+    updateMessage: 0
+  };
+  const provider: SessionProvider = {
+    getMessage: (id) => {
+      counts.getMessage++;
+      return messages.find((m) => m.id === id) ?? null;
+    },
+    getHistory: () => {
+      counts.getHistory++;
+      return messages;
+    },
+    getLatestLeaf: () => messages[messages.length - 1] ?? null,
+    getBranches: () => [],
+    getPathLength: () => messages.length,
+    appendMessage: (msg) => {
+      messages.push(msg);
+    },
+    updateMessage: (msg) => {
+      counts.updateMessage++;
+      const idx = messages.findIndex((m) => m.id === msg.id);
+      if (idx !== -1) messages[idx] = msg;
+    },
+    deleteMessages: () => {},
+    clearMessages: () => {
+      messages.length = 0;
+    },
+    addCompaction: () => ({
+      id: "",
+      summary: "",
+      fromMessageId: "",
+      toMessageId: "",
+      createdAt: ""
+    }),
+    getCompactions: () => []
+  };
+  if (rowStats) {
+    provider.getHistoryRowStats = () => {
+      counts.getHistoryRowStats++;
+      return messages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        bytes: JSON.stringify(m).length
+      }));
+    };
+  }
+  return { provider, counts, messages };
+}
+
+function loadContextMessage(id: string, label: string, key: string) {
+  return {
+    id,
+    role: "assistant",
+    parts: [
+      {
+        type: "tool-load_context",
+        toolName: "load_context",
+        toolCallId: `${id}-call`,
+        state: "output-available",
+        input: { label, key },
+        output: "skill content"
+      }
+    ]
+  } as unknown as SessionMessage;
+}
+
+class StubSkillProvider implements SkillProvider {
+  async get() {
+    return "pirate: talk like a pirate";
+  }
+  async load() {
+    return "Arr";
+  }
+}
+
+describe("Session init reads are bounded (#1710)", () => {
+  const seed = (): SessionMessage[] => [
+    { id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] },
+    loadContextMessage("a1", "skills", "pirate"),
+    { id: "u2", role: "user", parts: [{ type: "text", text: "more" }] }
+  ];
+
+  it("skips the skill-restore history scan when no skill provider is configured", async () => {
+    const { provider, counts } = createCountingProvider(seed(), false);
+    const session = Session.create(provider).withContext("memory", {
+      provider: { get: async () => "notes", set: async () => {} }
+    });
+
+    // Drive init via a budgeted read — the only getHistory call must be
+    // the fallback read itself (provider lacks getRecentHistory), with NO
+    // additional full read from the skill-restore scan.
+    await session.getRecentHistory(1024);
+    expect(counts.getHistory).toBe(1);
+
+    // And a provider WITH budgeted-read support never reads full history.
+    const withStats = createCountingProvider(seed(), true);
+    withStats.provider.getRecentHistory = (_leaf, _max) => ({
+      messages: [],
+      truncated: false,
+      totalContentBytes: 0
+    });
+    const session2 = Session.create(withStats.provider);
+    await session2.getRecentHistory(1024);
+    expect(withStats.counts.getHistory).toBe(0);
+  });
+
+  it("restores loaded skills via row stats + per-message reads when supported", async () => {
+    const { provider, counts } = createCountingProvider(seed(), true);
+    const session = Session.create(provider).withContext("skills", {
+      provider: new StubSkillProvider()
+    });
+
+    const tools = await session.tools();
+    // The restore scan saw the load_context result — the skill is tracked
+    // as loaded again after "hibernation".
+    const desc = (tools.unload_context as { description: string }).description;
+    expect(desc).toContain("skills:pirate");
+
+    // Bounded path: row stats enumerated, only the ASSISTANT row fetched
+    // individually — never a full-history materialization.
+    expect(counts.getHistory).toBe(0);
+    expect(counts.getHistoryRowStats).toBe(1);
+    expect(counts.getMessage).toBe(1);
+  });
+
+  it("falls back to a full read for skill restore when row stats are unsupported", async () => {
+    const { provider, counts } = createCountingProvider(seed(), false);
+    const session = Session.create(provider).withContext("skills", {
+      provider: new StubSkillProvider()
+    });
+
+    const tools = await session.tools();
+    const desc = (tools.unload_context as { description: string }).description;
+    expect(desc).toContain("skills:pirate");
+    expect(counts.getHistory).toBe(1);
+  });
+
+  it("a skill block added later via addContext triggers the restore scan", async () => {
+    const { provider, counts } = createCountingProvider(seed(), true);
+    const session = Session.create(provider);
+
+    // No skill providers at init — no scan.
+    await session.getHistory();
+    expect(counts.getHistoryRowStats).toBe(0);
+
+    await session.addContext("skills", {
+      provider: new StubSkillProvider()
+    });
+    expect(counts.getHistoryRowStats).toBe(1);
+
+    const tools = await session.tools();
+    const desc = (tools.unload_context as { description: string }).description;
+    expect(desc).toContain("skills:pirate");
+  });
+});
+
+describe("Session.getRecentHistory fallback (#1710)", () => {
+  it("reports honest metadata when the provider lacks budgeted reads", async () => {
+    const { provider } = createCountingProvider(
+      [
+        { id: "m1", role: "user", parts: [{ type: "text", text: "hello" }] },
+        { id: "m2", role: "assistant", parts: [{ type: "text", text: "hi" }] }
+      ],
+      false
+    );
+    const session = Session.create(provider);
+
+    const result = await session.getRecentHistory(1);
+    // Nothing was actually truncated (the FULL history was loaded), and
+    // the reported size reflects the real serialized footprint instead of
+    // a misleading 0.
+    expect(result.truncated).toBe(false);
+    expect(result.messages.map((m) => m.id)).toEqual(["m1", "m2"]);
+    expect(result.totalContentBytes).toBe(
+      result.messages.reduce((sum, m) => sum + JSON.stringify(m).length, 0)
+    );
+  });
+});
+
+describe("Session.internal_rewriteMessage (#1710)", () => {
+  it("writes storage and notifies the listener without a status broadcast", async () => {
+    const { sql } = createSqlStub();
+    const frames: string[] = [];
+    const session = Session.create({
+      sql,
+      broadcast: (msg: string | ArrayBufferLike) => {
+        if (typeof msg === "string") frames.push(msg);
+      }
+    } as Parameters<typeof Session.create>[0]);
+
+    const events: string[] = [];
+    session.internal_onMessagesChanged((event) => {
+      events.push(event.type);
+    });
+
+    const message: SessionMessage = {
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text: "rewritten" }]
+    };
+
+    // Public update — emits a cf_agent_session status frame (with its
+    // full-history token estimate).
+    await session.updateMessage(message);
+    const statusFrames = () =>
+      frames.filter((f) => f.includes("cf_agent_session")).length;
+    const afterPublic = statusFrames();
+    expect(afterPublic).toBeGreaterThan(0);
+    expect(events).toContain("update");
+
+    // Maintenance rewrite — storage write + listener, NO status frame.
+    events.length = 0;
+    await session.internal_rewriteMessage(message);
+    expect(statusFrames()).toBe(afterPublic);
+    expect(events).toEqual(["update"]);
   });
 });

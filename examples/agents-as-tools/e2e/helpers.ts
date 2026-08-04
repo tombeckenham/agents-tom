@@ -99,7 +99,7 @@ export async function waitForChatReady(page: Page): Promise<void> {
  *
  * Timeout is generous (90s) because the wait window has to cover
  * the parent's first-token latency on Workers AI (which can be
- * 5-30s for `kimi-k2.5`) plus the time to actually pick a tool
+ * 5-30s for `kimi-k2.7-code`) plus the time to actually pick a tool
  * and emit the synthesized `started` event the panel renders from.
  */
 export async function waitForHelperOfType(
@@ -119,11 +119,11 @@ export async function waitForHelperOfType(
  *
  * Helper turns (the helper's OWN inference loop, separate from the
  * parent's tool-selection loop) can take a while — especially when
- * the helper has its own internal tool calls to make. 90s.
+ * the helper has its own internal tool calls to make. 150s.
  */
 export async function waitForHelperTerminal(panel: Locator): Promise<void> {
   await expect(panel).toHaveAttribute("data-helper-status", /^(done|error)$/, {
-    timeout: 90_000
+    timeout: 150_000
   });
 }
 

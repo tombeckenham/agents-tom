@@ -1,33 +1,35 @@
 # TODO: Chat SDK Messenger Agents
 
 The first implementation is complete: Chat SDK owns messenger ingress,
-`ChatStateAgent` backs Chat SDK state, and `ConversationAgent extends Think`
+`ChatSdkStateAgent` backs Chat SDK state, and `ConversationAgent extends Think`
 owns per-thread AI history with Think `chat()` streaming. AI replies are
 accepted through managed fibers so webhook retries reuse a stable idempotency
 key.
 
 ## Streaming Polish
 
-- Decide whether long turns should keep webhook handling open with
-  `waitForCompletion: true` or acknowledge immediately and send an async
-  follow-up.
 - Consider provider-specific streaming affordances beyond text deltas.
-- Keep reasoning chunks hidden by default unless a deliberate debug mode exists.
+- Keep reasoning, tool calls, and tool results visible only in deliberate admin
+  debug surfaces, not in messenger output.
 - Decide whether partial responses should end with only an interruption apology,
   a retry button, or provider-specific recovery UI.
+- Generalize the Telegram long-reply policy into provider-aware delivery helpers
+  with documented limits, formatting expansion headroom, and retry semantics.
 
 ## Production Hardening
 
 - Route `ChatIngressAgent` names by tenant, bot, or workspace instead of always
   using `default`.
+- Put real authentication in front of the admin dashboard before exposing it
+  outside local development or trusted deployments.
 - Verify provider webhook signatures before choosing an ingress Agent name.
 - Add clearer user-facing error messages for model failures, rate limits, and
   unsupported message types.
 - Review queue, lock, and debounce settings under high-volume group chats.
 - Decide whether terminal `error` or `aborted` managed fibers should support
   user-triggered retry, operator-triggered retry, or manual reconciliation only.
-- Decide whether retained managed fibers need an admin/status inspection command
-  or should remain an implementation detail.
+- Add operator retry/reconciliation controls for failed reply jobs now that the
+  admin dashboard can inspect retained managed fibers.
 - Decide whether to reduce internal subagent/facet calls on hot paths or simply
   document the expected observability noise.
 
@@ -51,3 +53,17 @@ key.
   is stable.
 - Keep provider-specific rendering in `ChatIngressAgent`, not in
   `ConversationAgent`.
+
+## SDK Extraction Candidates
+
+- Continue hardening the Agents-backed Chat SDK `StateAdapter` in `agents/chat-sdk`
+  as more examples validate sharding and TTL behavior.
+- Use `src/intelligence/` as the staging area for a future Think-to-Chat-SDK
+  streaming bridge once one more provider validates the cancellation,
+  empty-response, long-reply, and partial-failure semantics.
+- Use `src/provider/telegram.ts` as the reference shape for provider-aware
+  delivery policy, then extract only after another adapter validates the split
+  between editable first streams, overflow chunks, final-edit no-ops, rate
+  limits, and partial delivery failures.
+- Keep admin dashboard shape and Telegram-specific operations in examples until
+  there is another consumer with the same product requirements.

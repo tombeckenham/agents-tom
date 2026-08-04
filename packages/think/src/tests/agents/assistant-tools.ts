@@ -1,6 +1,7 @@
 import { Agent } from "agents";
 import { Workspace } from "@cloudflare/shell";
 import { createWorkspaceTools } from "../../tools/workspace";
+import type { WorkspaceToolsOptions } from "../../tools/workspace";
 
 export class TestAssistantToolsAgent extends Agent {
   workspace = new Workspace({
@@ -50,7 +51,8 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }
@@ -68,7 +70,8 @@ export class TestAssistantToolsAgent extends Agent {
     const output = (await tools.read.execute!(input, {
       toolCallId: "test",
       messages: [],
-      abortSignal: new AbortController().signal
+      abortSignal: new AbortController().signal,
+      context: {}
     })) as ReadModelOutputOptions["output"];
 
     return tools.read.toModelOutput?.({
@@ -85,7 +88,8 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }
@@ -101,7 +105,8 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }
@@ -117,7 +122,8 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }
@@ -129,7 +135,8 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }
@@ -147,7 +154,29 @@ export class TestAssistantToolsAgent extends Agent {
       {
         toolCallId: "test",
         messages: [],
-        abortSignal: new AbortController().signal
+        abortSignal: new AbortController().signal,
+        context: {}
+      }
+    );
+  }
+
+  async toolBash(
+    script: string,
+    cwd?: string,
+    options?: Exclude<WorkspaceToolsOptions["bash"], boolean>
+  ): Promise<unknown> {
+    const tools = options
+      ? createWorkspaceTools(this.workspace, { bash: options })
+      : this.getTools();
+    const bash = tools.bash;
+    if (!bash?.execute) throw new Error("bash tool is not available");
+    return bash.execute(
+      { script, cwd },
+      {
+        toolCallId: "test",
+        messages: [],
+        abortSignal: new AbortController().signal,
+        context: {}
       }
     );
   }

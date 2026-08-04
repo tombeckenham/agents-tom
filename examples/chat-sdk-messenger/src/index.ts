@@ -1,15 +1,41 @@
 import { createTelegramAdapter } from "@chat-adapter/telegram";
-import { Agent, getAgentByName } from "agents";
+import { Agent, callable, getAgentByName, routeAgentRequest } from "agents";
 import type {
   FiberContext,
   FiberRecoveryContext,
   FiberRecoveryResult,
   SubAgentStub
 } from "agents";
+import {
+  TextStreamCallback,
+  ThinkMessengerStateAgent
+} from "@cloudflare/think/messengers";
+import { createChatSdkState } from "agents/chat-sdk";
 import { Chat } from "chat";
 import type { Message, Thread } from "chat";
+import {
+  adminConversationFromRow,
+  adminReplyJobFromFiber,
+  conversationTitle,
+  messagePreview,
+  providerFromThreadId,
+  type AdminConversation,
+  type AdminConversationRow,
+  type AdminReplyJob,
+  type AdminSetupInfo
+} from "./admin/directory";
 import { APPROVE_ACTION_ID, REJECT_ACTION_ID } from "./demos";
 import { ConversationAgent } from "./intelligence/conversation-agent";
+import {
+  AI_REPLY_FIBER_NAME,
+  EMPTY_AI_RESPONSE,
+  INTERRUPTED_AI_RESPONSE,
+  aiReplyFailureMode,
+  aiReplyRecoveryMode,
+  aiReplySnapshot,
+  parseAiReplySnapshot,
+  type AiReplySnapshot
+} from "./intelligence/delivery";
 import {
   conversationNameForThread,
   isMenuCommand,
@@ -17,7 +43,6 @@ import {
   shouldRouteToAi,
   toThinkUserMessage
 } from "./intelligence/messages";
-import { TextStreamCallback } from "./intelligence/stream-callback";
 import {
   ASK_AGENT_ACTION_ID,
   DEMO_LOOKUP,
@@ -26,86 +51,29 @@ import {
   postMainMenu,
   postMenu
 } from "./menu";
-import { createAgentChatState } from "./state";
+import {
+  isExpectedTelegramFinalEditNoop as isExpectedFinalEditNoop,
+  shardTelegramStateKey,
+  splitTelegramMessageText,
+  TELEGRAM_STREAM_SOFT_LIMIT
+} from "@cloudflare/think/messengers/telegram";
+import { WEBHOOK_PATH, setupTelegramWebhook } from "./provider/telegram";
 
 export { ConversationAgent } from "./intelligence/conversation-agent";
-export { ChatStateAgent } from "./state";
+export { ThinkMessengerStateAgent };
 
-const WEBHOOK_PATH = "/webhooks/telegram";
+export type {
+  AdminConversation,
+  AdminReplyJob,
+  AdminSetupInfo
+} from "./admin/directory";
+export type { AiReplySnapshot } from "./intelligence/delivery";
+export type { TelegramWebhookSetupResult } from "./provider/telegram";
+
 const DEFAULT_AGENT_NAME = "default";
-const AI_REPLY_FIBER_NAME = "chat-sdk-messenger:ai-reply";
-const EMPTY_AI_RESPONSE =
-  "I couldn't produce a text response. Please try again.";
-const INTERRUPTED_AI_RESPONSE =
-  "Sorry, my reply was interrupted. Please send your message again if you'd like me to retry.";
-
-export type AiReplyStage = "accepted" | "streaming" | "completed";
-
-export type AiReplySnapshot = {
-  type: typeof AI_REPLY_FIBER_NAME;
-  stage: AiReplyStage;
-  thread: unknown;
-  message: unknown;
-};
-
-export function aiReplyRecoveryMode(
-  snapshot: AiReplySnapshot
-): "answer" | "apologize" | null {
-  if (snapshot.stage === "accepted") {
-    return "answer";
-  }
-  if (snapshot.stage === "streaming") {
-    return "apologize";
-  }
-  return null;
-}
-
-export function aiReplyFailureMode(
-  hasStreamedText: boolean
-): "apologize" | "error" {
-  return hasStreamedText ? "apologize" : "error";
-}
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function parseAiReplySnapshot(snapshot: unknown): AiReplySnapshot | null {
-  if (snapshot === null || typeof snapshot !== "object") {
-    return null;
-  }
-
-  const candidate = snapshot as Partial<AiReplySnapshot>;
-  if (
-    candidate.type !== AI_REPLY_FIBER_NAME ||
-    (candidate.stage !== "accepted" &&
-      candidate.stage !== "streaming" &&
-      candidate.stage !== "completed") ||
-    candidate.thread === undefined ||
-    candidate.message === undefined
-  ) {
-    return null;
-  }
-
-  return {
-    type: AI_REPLY_FIBER_NAME,
-    stage: candidate.stage,
-    thread: candidate.thread,
-    message: candidate.message
-  };
-}
-
-function aiReplySnapshot(
-  stage: AiReplyStage,
-  thread: Thread,
-  message: Message
-): AiReplySnapshot {
-  return {
-    type: AI_REPLY_FIBER_NAME,
-    stage,
-    thread: thread.toJSON(),
-    message: message.toJSON()
-  };
 }
 
 function setupErrorResponse(error: Error): Response {
@@ -129,6 +97,7 @@ export class ChatIngressAgent extends Agent {
   private botStartupError?: Error;
 
   onStart(): void {
+    this.ensureAdminSchema();
     try {
       this.bot = this.createBot();
       this.botStartupError = undefined;
@@ -138,73 +107,12 @@ export class ChatIngressAgent extends Agent {
     }
   }
 
-  override async onFiberRecovered(
-    ctx: FiberRecoveryContext
-  ): Promise<void | FiberRecoveryResult> {
-    if (ctx.name !== AI_REPLY_FIBER_NAME) {
-      return;
-    }
-
-    const snapshot = parseAiReplySnapshot(ctx.snapshot);
-    if (!snapshot) {
-      return;
-    }
-
-    await this.recoverAiReply(snapshot);
-    return { status: "completed" };
-  }
-
-  private async recoverAiReply(snapshot: AiReplySnapshot): Promise<void> {
-    const bot = this.getBot();
-    if (bot instanceof Error) {
-      throw bot;
-    }
-
-    const restored = JSON.parse(JSON.stringify(snapshot), bot.reviver()) as {
-      thread: Thread;
-      message: Message;
-    };
-    const mode = aiReplyRecoveryMode(snapshot);
-    if (mode === "answer") {
-      await this.answerWithConversationAgent(restored.thread, restored.message);
-      return;
-    }
-
-    if (mode === "apologize") {
-      await restored.thread.post(INTERRUPTED_AI_RESPONSE);
-    }
-  }
-
-  async onRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (request.method !== "POST" || url.pathname !== WEBHOOK_PATH) {
-      return new Response("Not found", { status: 404 });
-    }
-
-    const bot = this.getBot();
-    if (bot instanceof Error) {
-      return setupErrorResponse(bot);
-    }
-
-    return bot.webhooks.telegram(request, {
-      waitUntil: (task: Promise<unknown>) => this.ctx.waitUntil(task)
-    });
-  }
-
-  private getBot(): Chat | Error {
-    if (this.bot) {
-      return this.bot;
-    }
-
-    return (
-      this.botStartupError ??
-      new Error("Chat SDK runtime was not created during Agent startup")
-    );
-  }
-
   private createBot(): Chat {
     if (!this.env.TELEGRAM_BOT_TOKEN) {
       throw new Error("TELEGRAM_BOT_TOKEN is required");
+    }
+    if (!this.env.TELEGRAM_WEBHOOK_SECRET_TOKEN) {
+      throw new Error("TELEGRAM_WEBHOOK_SECRET_TOKEN is required");
     }
 
     const userName =
@@ -219,9 +127,10 @@ export class ChatIngressAgent extends Agent {
     const bot = new Chat({
       userName,
       adapters: { telegram },
-      state: createAgentChatState({
-        parent: this,
-        shardKey: (threadId) => threadId.split(":").slice(0, 2).join(":")
+      state: createChatSdkState({
+        agent: ThinkMessengerStateAgent,
+        keyShard: (key) => shardTelegramStateKey(key, this.shardThread),
+        shardKey: this.shardThread
       }),
       concurrency: { strategy: "burst", debounceMs: 600 }
     });
@@ -306,24 +215,250 @@ export class ChatIngressAgent extends Agent {
     return bot.registerSingleton();
   }
 
+  private ensureAdminSchema(): void {
+    this.sql`
+      CREATE TABLE IF NOT EXISTS chat_admin_conversations (
+        thread_id TEXT PRIMARY KEY,
+        conversation_name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        title TEXT NOT NULL,
+        last_message_preview TEXT,
+        created_at INTEGER NOT NULL,
+        last_message_at INTEGER NOT NULL
+      )
+    `;
+    this.sql`
+      CREATE INDEX IF NOT EXISTS idx_chat_admin_conversations_last_message
+      ON chat_admin_conversations(last_message_at)
+    `;
+  }
+
+  override async onFiberRecovered(
+    ctx: FiberRecoveryContext
+  ): Promise<void | FiberRecoveryResult> {
+    if (ctx.name !== AI_REPLY_FIBER_NAME) {
+      return;
+    }
+
+    const snapshot = parseAiReplySnapshot(ctx.snapshot);
+    if (!snapshot) {
+      return;
+    }
+
+    await this.recoverAiReply(snapshot);
+    return { status: "completed" };
+  }
+
+  override async onBeforeSubAgent(
+    _request: Request,
+    { className, name }: { className: string; name: string }
+  ): Promise<Request | Response | void> {
+    if (className !== ConversationAgent.name) {
+      return new Response("Sub-agent not found", { status: 404 });
+    }
+
+    const rows = this.sql<{ thread_id: string }>`
+      SELECT thread_id
+      FROM chat_admin_conversations
+      WHERE conversation_name = ${name}
+      LIMIT 1
+    `;
+    if (!rows[0]) {
+      return new Response(`Conversation "${name}" not found`, { status: 404 });
+    }
+  }
+
+  @callable()
+  getSetupInfo(): AdminSetupInfo {
+    return {
+      webhookPath: WEBHOOK_PATH,
+      agentName: DEFAULT_AGENT_NAME,
+      telegramConfigured: Boolean(this.env.TELEGRAM_BOT_TOKEN),
+      telegramUserName:
+        this.env.TELEGRAM_BOT_USERNAME ?? "cloudflare_chat_sdk_bot"
+    };
+  }
+
+  @callable()
+  listConversations(): AdminConversation[] {
+    return this.readConversations();
+  }
+
+  @callable()
+  inspectConversation(threadId: string): AdminConversation | null {
+    return (
+      this.readConversations().find(
+        (conversation) => conversation.threadId === threadId
+      ) ?? null
+    );
+  }
+
+  @callable()
+  async resetConversationByThread(threadId: string): Promise<void> {
+    const conversation = this.readConversation(threadId);
+    if (!conversation) {
+      throw new Error(`Unknown conversation for thread ${threadId}`);
+    }
+    await (
+      await this.subAgent(ConversationAgent, conversation.conversationName)
+    ).resetConversation();
+  }
+
+  @callable()
+  async listReplyJobs(threadId?: string): Promise<AdminReplyJob[]> {
+    return (
+      await this.listFibers({
+        name: AI_REPLY_FIBER_NAME,
+        limit: 100
+      })
+    )
+      .map(adminReplyJobFromFiber)
+      .filter((job) => threadId === undefined || job.threadId === threadId);
+  }
+
+  @callable()
+  async cancelReplyJob(fiberId: string): Promise<boolean> {
+    return this.cancelFiber(fiberId, "Cancelled from messenger admin UI");
+  }
+
+  private async recoverAiReply(snapshot: AiReplySnapshot): Promise<void> {
+    const bot = this.getBot();
+    if (bot instanceof Error) {
+      throw bot;
+    }
+
+    const restored = JSON.parse(JSON.stringify(snapshot), bot.reviver()) as {
+      thread: Thread;
+      message: Message;
+    };
+    const mode = aiReplyRecoveryMode(snapshot);
+    if (mode === "answer") {
+      await this.answerWithConversationAgent(restored.thread, restored.message);
+      return;
+    }
+
+    if (mode === "apologize") {
+      await restored.thread.post(INTERRUPTED_AI_RESPONSE);
+    }
+  }
+
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || url.pathname !== WEBHOOK_PATH) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const bot = this.getBot();
+    if (bot instanceof Error) {
+      return setupErrorResponse(bot);
+    }
+
+    return bot.webhooks.telegram(request, {
+      waitUntil: (task: Promise<unknown>) => this.ctx.waitUntil(task)
+    });
+  }
+
+  private getBot(): Chat | Error {
+    if (this.bot) {
+      return this.bot;
+    }
+
+    return (
+      this.botStartupError ??
+      new Error("Chat SDK runtime was not created during Agent startup")
+    );
+  }
+
+  private readConversation(threadId: string): AdminConversation | null {
+    const rows = this.sql<AdminConversationRow>`
+      SELECT thread_id, conversation_name, provider, title,
+             last_message_preview, created_at, last_message_at
+      FROM chat_admin_conversations
+      WHERE thread_id = ${threadId}
+      LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+
+    return adminConversationFromRow(row);
+  }
+
+  private readConversations(): AdminConversation[] {
+    const rows = this.sql<AdminConversationRow>`
+      SELECT thread_id, conversation_name, provider, title,
+             last_message_preview, created_at, last_message_at
+      FROM chat_admin_conversations
+      ORDER BY last_message_at DESC
+      LIMIT 100
+    `;
+
+    return rows.map(adminConversationFromRow);
+  }
+
+  private async recordConversation(
+    thread: Thread,
+    message: Message
+  ): Promise<AdminConversation> {
+    const now = Date.now();
+    const conversationName = conversationNameForThread(thread);
+    const provider = providerFromThreadId(thread.id);
+    const title = conversationTitle(thread);
+    const preview = messagePreview(message);
+
+    await this.subAgent(ConversationAgent, conversationName);
+    this.sql`
+      INSERT INTO chat_admin_conversations
+        (thread_id, conversation_name, provider, title, last_message_preview,
+         created_at, last_message_at)
+      VALUES
+        (${thread.id}, ${conversationName}, ${provider}, ${title}, ${preview},
+         ${now}, ${now})
+      ON CONFLICT(thread_id) DO UPDATE SET
+        conversation_name = excluded.conversation_name,
+        provider = excluded.provider,
+        title = excluded.title,
+        last_message_preview = excluded.last_message_preview,
+        last_message_at = excluded.last_message_at
+    `;
+
+    return {
+      threadId: thread.id,
+      conversationName,
+      provider,
+      title,
+      lastMessagePreview: preview || undefined,
+      createdAt: now,
+      lastMessageAt: now
+    };
+  }
+
   private async answerWithConversationAgent(
     thread: Thread,
     message: Message,
     fiber?: FiberContext
   ): Promise<void> {
-    const callback = new TextStreamCallback();
+    const callback = new TextStreamCallback({
+      visibleSoftLimit: TELEGRAM_STREAM_SOFT_LIMIT
+    });
     let agent: SubAgentStub<ConversationAgent> | undefined;
+    let completedModelTurn = false;
     fiber?.stash(aiReplySnapshot("streaming", thread, message));
     const post = thread
       .post(callback.stream())
       .catch(async (error: unknown) => {
-        callback.fail(error);
+        if (isExpectedFinalEditNoop(error, callback)) {
+          return;
+        }
+
         const requestId = callback.requestId();
         if (agent && requestId) {
           await agent
             .cancelChat(requestId, toError(error).message)
             .catch(() => undefined);
         }
+        callback.fail(error);
         throw error;
       });
 
@@ -331,16 +466,30 @@ export class ChatIngressAgent extends Agent {
       await thread.startTyping("Thinking...");
       agent = await this.getConversationAgent(thread);
       await agent.chat(toThinkUserMessage(message), callback);
+      completedModelTurn = true;
       callback.close();
       await post;
       if (!callback.hasText()) {
         await thread.post(EMPTY_AI_RESPONSE);
       }
+      for (const chunk of splitTelegramMessageText(callback.remainingText())) {
+        await thread.post(chunk);
+      }
       fiber?.stash(aiReplySnapshot("completed", thread, message));
     } catch (error) {
       callback.fail(error);
       await post.catch(() => undefined);
-      if (aiReplyFailureMode(callback.hasText()) === "apologize") {
+      const failureMode = aiReplyFailureMode(
+        callback.hasText(),
+        completedModelTurn,
+        isExpectedFinalEditNoop(error, callback)
+      );
+      if (failureMode === null) {
+        fiber?.stash(aiReplySnapshot("completed", thread, message));
+        return;
+      }
+
+      if (failureMode === "apologize") {
         await thread.post(INTERRUPTED_AI_RESPONSE).catch(() => undefined);
         fiber?.stash(aiReplySnapshot("completed", thread, message));
         return;
@@ -358,6 +507,7 @@ export class ChatIngressAgent extends Agent {
     thread: Thread,
     message: Message
   ): Promise<void> {
+    await this.recordConversation(thread, message);
     const result = await this.startFiber(
       AI_REPLY_FIBER_NAME,
       async (fiber: FiberContext) => {
@@ -396,6 +546,10 @@ export class ChatIngressAgent extends Agent {
     thread: Thread
   ): Promise<SubAgentStub<ConversationAgent>> {
     return this.subAgent(ConversationAgent, conversationNameForThread(thread));
+  }
+
+  private shardThread(threadId: string): string {
+    return threadId.split(":").slice(0, 2).join(":");
   }
 
   private shouldUseAi(message: Message, thread: Thread): boolean {
@@ -451,12 +605,24 @@ export default {
       return setupResponse(request, env);
     }
 
+    if (
+      request.method === "POST" &&
+      url.pathname === "/setup/telegram-webhook"
+    ) {
+      return setupTelegramWebhook(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === WEBHOOK_PATH) {
       const agent = await getAgentByName(
         env.ChatIngressAgent,
         getIngressAgentName(request)
       );
       return agent.fetch(request);
+    }
+
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) {
+      return agentResponse;
     }
 
     return new Response("Not found", { status: 404 });

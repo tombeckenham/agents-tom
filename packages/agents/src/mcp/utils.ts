@@ -3,6 +3,7 @@ import {
   type JSONRPCMessage,
   type MessageExtraInfo,
   InitializeRequestSchema,
+  SUPPORTED_PROTOCOL_VERSIONS,
   isJSONRPCResultResponse,
   isJSONRPCNotification
 } from "@modelcontextprotocol/sdk/types.js";
@@ -10,6 +11,7 @@ import type { McpAgent } from ".";
 import { getAgentByName } from "..";
 import type { CORSOptions } from "./types";
 import { MessageType } from "../types";
+import { startKeepalive } from "./sse-keepalive";
 
 /**
  * Since we use WebSockets to bridge the client to the
@@ -27,6 +29,32 @@ export const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 export const MCP_MESSAGE_HEADER = "cf-mcp-message";
 
 const MAXIMUM_MESSAGE_SIZE_BYTES = 4 * 1024 * 1024; // 4MB
+
+function unsupportedProtocolVersionResponse(
+  request: Request
+): Response | undefined {
+  const protocolVersion = request.headers.get("mcp-protocol-version");
+  if (
+    protocolVersion === null ||
+    SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)
+  ) {
+    return undefined;
+  }
+
+  return Response.json(
+    {
+      error: {
+        code: -32000,
+        message:
+          `Bad Request: Unsupported protocol version: ${protocolVersion}` +
+          ` (supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")})`
+      },
+      id: null,
+      jsonrpc: "2.0"
+    },
+    { status: 400 }
+  );
+}
 
 export const createStreamingHttpHandler = (
   basePath: string,
@@ -172,6 +200,16 @@ export const createStreamingHttpHandler = (
           return new Response(body, { status: 400 });
         }
 
+        // McpAgent's WebSocket bridge bypasses the SDK v1 HTTP transport's
+        // protocol-version header check. Apply that one ingress validation
+        // before looking up or waking a session; initialize negotiation itself
+        // remains entirely owned by SDK v1.
+        if (!maybeInitializeRequest) {
+          const unsupportedVersion =
+            unsupportedProtocolVersionResponse(request);
+          if (unsupportedVersion) return unsupportedVersion;
+        }
+
         // If an Mcp-Session-Id is returned by the server during initialization,
         // clients using the Streamable HTTP transport MUST include it
         // in the Mcp-Session-Id header on all of their subsequent HTTP requests.
@@ -264,6 +302,31 @@ export const createStreamingHttpHandler = (
         // Accept the WebSocket
         ws.accept();
 
+        // If there are no requests, we send the messages to the agent and
+        // acknowledge the request with a 202 since we don't expect any
+        // responses back through this connection. Decide this *before*
+        // arming a keepalive on the SSE writer so we don't leak a timer.
+        const hasOnlyNotificationsOrResponses = messages.every(
+          (msg) => isJSONRPCNotification(msg) || isJSONRPCResultResponse(msg)
+        );
+        if (hasOnlyNotificationsOrResponses) {
+          // closing the websocket will also close the SSE connection
+          ws.close();
+
+          return new Response(null, {
+            headers: corsHeaders(request, options.corsOptions),
+            status: 202
+          });
+        }
+
+        // Long-running tool calls can sit silent for many seconds while
+        // the DO runs the handler. Arm a keepalive on the response stream
+        // so the Cloudflare edge ~5min idle watchdog doesn't close us
+        // before the tool result arrives. POST streams are scoped to a
+        // specific request id and can't be resumed via Last-Event-ID,
+        // so there's no alternative recovery path here.
+        const keepAlive = startKeepalive(writer, encoder);
+
         // Handle messages from the Durable Object
         ws.addEventListener("message", (event) => {
           async function onMessage(event: MessageEvent) {
@@ -284,6 +347,7 @@ export const createStreamingHttpHandler = (
 
               // If we have received all the responses, close the connection
               if (message.close) {
+                clearInterval(keepAlive);
                 ws?.close();
                 await writer.close().catch(() => {});
               }
@@ -297,6 +361,7 @@ export const createStreamingHttpHandler = (
         // Handle WebSocket errors
         ws.addEventListener("error", (error) => {
           async function onError(_error: Event) {
+            clearInterval(keepAlive);
             await writer.close().catch(() => {});
           }
           onError(error).catch(console.error);
@@ -305,25 +370,11 @@ export const createStreamingHttpHandler = (
         // Handle WebSocket closure
         ws.addEventListener("close", () => {
           async function onClose() {
+            clearInterval(keepAlive);
             await writer.close().catch(() => {});
           }
           onClose().catch(console.error);
         });
-
-        // If there are no requests, we send the messages to the agent and acknowledge the request with a 202
-        // since we don't expect any responses back through this connection
-        const hasOnlyNotificationsOrResponses = messages.every(
-          (msg) => isJSONRPCNotification(msg) || isJSONRPCResultResponse(msg)
-        );
-        if (hasOnlyNotificationsOrResponses) {
-          // closing the websocket will also close the SSE connection
-          ws.close();
-
-          return new Response(null, {
-            headers: corsHeaders(request, options.corsOptions),
-            status: 202
-          });
-        }
 
         // Return the SSE response. We handle closing the stream in the ws "message"
         // handler
@@ -367,6 +418,9 @@ export const createStreamingHttpHandler = (
             }),
             { status: 400 }
           );
+
+        const unsupportedVersion = unsupportedProtocolVersionResponse(request);
+        if (unsupportedVersion) return unsupportedVersion;
 
         // Create SSE stream
         const { readable, writable } = new TransformStream();
@@ -457,6 +511,9 @@ export const createStreamingHttpHandler = (
           status: 200
         });
       } else if (request.method === "DELETE") {
+        const unsupportedVersion = unsupportedProtocolVersionResponse(request);
+        if (unsupportedVersion) return unsupportedVersion;
+
         const sessionId = request.headers.get("mcp-session-id");
         if (!sessionId) {
           return new Response(
@@ -487,13 +544,16 @@ export const createStreamingHttpHandler = (
             { status: 404, headers: corsHeaders(request, options.corsOptions) }
           );
         }
-        // .destroy() passes an uncatchable Error, so we make sure we first return
-        // the response to the client.
-        ctx.waitUntil(
-          agent.destroy().catch(() => {
-            /* This will always throw. We silently catch here */
-          })
-        );
+        // Defer the actual teardown to the agent's own alarm invocation
+        // (#1625). Running `destroy()` on this request's `waitUntil` was
+        // unreliable: the client is usually already gone by the time the
+        // DELETE lands, the runtime gives a canceled request's trailing
+        // work little to no grace, and the multi-step teardown got cut
+        // short — leaving half-deleted session DOs. Scheduling is two fast
+        // storage writes, so it is awaited before responding; the alarm
+        // then runs the real teardown with a fresh execution budget and a
+        // durable marker that survives any further interruption.
+        await agent._cf_scheduleDestroy();
         return new Response(null, {
           status: 204,
           headers: corsHeaders(request, options.corsOptions)

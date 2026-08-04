@@ -42,6 +42,8 @@ export type StreamChunkData = {
   preliminary?: boolean;
   /** Approval ID for tools with needsApproval */
   approvalId?: string;
+  /** Optional framework-specific metadata for the approval request. */
+  approvalDescriptor?: unknown;
   providerMetadata?: Record<string, unknown>;
   /** Whether the tool was executed by the provider (e.g. Gemini code execution) */
   providerExecuted?: boolean;
@@ -55,6 +57,46 @@ export type StreamChunkData = {
   messageMetadata?: unknown;
   [key: string]: unknown;
 };
+
+/** Whether a value is a plain (non-array, non-null) object. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Coerce a tool part's `input` into a provider-acceptable object.
+ *
+ * The Anthropic Messages API requires `tool_use.input` to be a JSON **object** —
+ * `null`, `undefined`, `""`, a raw string, **or an array** are all rejected with
+ * `tool_use.input: Input should be an object` (verified empirically against the
+ * live API: `{}` → 200, but `""`, `[]`, and `[{...}]` all → 400). A streamed
+ * tool call that finishes with no `input_json_delta` events (the model called
+ * the tool with no args), or whose input surfaces as a stringified JSON blob,
+ * can persist one of these shapes — and because it lives in durable storage, the
+ * session is then wedged across reconnects, redeploys, and DO evictions.
+ * Enforcing the invariant at the write boundary (and as a read-side repair
+ * backstop) keeps the transcript valid.
+ *
+ * - A plain (non-array) object is returned untouched (`changed: false`).
+ * - A string that parses to a plain object is parsed.
+ * - Everything else (`null`, `undefined`, `""`, arrays, primitives, non-object
+ *   or unparseable JSON) collapses to `{}`.
+ */
+export function normalizeToolInput(raw: unknown): {
+  input: unknown;
+  changed: boolean;
+} {
+  if (isPlainObject(raw)) return { input: raw, changed: false };
+  if (typeof raw === "string" && raw.trim().startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (isPlainObject(parsed)) return { input: parsed, changed: true };
+    } catch {
+      // Unparseable / partial JSON — fall through to the empty-object default.
+    }
+  }
+  return { input: {}, changed: true };
+}
 
 /**
  * Applies a stream chunk to a mutable parts array, building up the message
@@ -242,7 +284,7 @@ export function applyChunkToParts(
         // resolved input/output. See the comment on tool-input-start.
         if (p.state === "input-streaming") {
           p.state = "input-available";
-          p.input = chunk.input;
+          p.input = normalizeToolInput(chunk.input).input;
           if (chunk.providerExecuted != null) {
             p.providerExecuted = chunk.providerExecuted;
           }
@@ -260,7 +302,7 @@ export function applyChunkToParts(
         toolCallId: chunk.toolCallId,
         toolName: chunk.toolName,
         state: "input-available",
-        input: chunk.input,
+        input: normalizeToolInput(chunk.input).input,
         ...(chunk.providerExecuted != null
           ? { providerExecuted: chunk.providerExecuted }
           : {}),
@@ -289,7 +331,7 @@ export function applyChunkToParts(
         }
         p.state = "output-error";
         p.errorText = chunk.errorText;
-        p.input = chunk.input;
+        p.input = normalizeToolInput(chunk.input).input;
         if (chunk.providerExecuted != null) {
           p.providerExecuted = chunk.providerExecuted;
         }
@@ -302,7 +344,7 @@ export function applyChunkToParts(
           toolCallId: chunk.toolCallId,
           toolName: chunk.toolName,
           state: "output-error",
-          input: chunk.input,
+          input: normalizeToolInput(chunk.input).input,
           errorText: chunk.errorText,
           ...(chunk.providerExecuted != null
             ? { providerExecuted: chunk.providerExecuted }
@@ -319,8 +361,27 @@ export function applyChunkToParts(
       const toolPart = findToolPartByCallId(parts, chunk.toolCallId);
       if (toolPart) {
         const p = toolPart as Record<string, unknown>;
+        // First-write-wins: a continuation can replay the prior tool
+        // round-trip and re-emit `tool-approval-request`. Never regress a part
+        // the user has already responded to (`approval-responded`) or that has
+        // otherwise settled — that would silently discard the approval
+        // decision. Matches the guards on the `tool-input-*` /
+        // `tool-output-denied` handlers.
+        if (
+          p.state === "approval-responded" ||
+          p.state === "output-available" ||
+          p.state === "output-error" ||
+          p.state === "output-denied"
+        ) {
+          return true;
+        }
         p.state = "approval-requested";
-        p.approval = { id: chunk.approvalId };
+        p.approval = {
+          id: chunk.approvalId,
+          ...(chunk.approvalDescriptor !== undefined && {
+            descriptor: chunk.approvalDescriptor
+          })
+        };
       }
       return true;
     }
@@ -329,6 +390,21 @@ export function applyChunkToParts(
       const toolPart = findToolPartByCallId(parts, chunk.toolCallId);
       if (toolPart) {
         const p = toolPart as Record<string, unknown>;
+        // First-write-wins: a tool that's already terminal must not be
+        // regressed by a later/replayed chunk. Also preserve an
+        // `approval-responded` (user-approved) part — a continuation that
+        // re-validates the transcript can emit `tool-output-denied` for an
+        // approval the SDK deems unneeded (e.g. a tool without
+        // `needsApproval`); that must not silently flip a granted approval
+        // into a denial.
+        if (
+          p.state === "output-available" ||
+          p.state === "output-error" ||
+          p.state === "output-denied" ||
+          p.state === "approval-responded"
+        ) {
+          return true;
+        }
         p.state = "output-denied";
       }
       return true;
@@ -426,11 +502,41 @@ export function applyChunkToParts(
  * - `tool-input-available` for a `toolCallId` whose existing part is no
  *   longer `input-streaming` (i.e. has already advanced to `input-available`
  *   or any terminal state).
+ * - `tool-output-denied` for a `toolCallId` whose existing part is already
+ *   settled (`output-available` / `output-error` / `output-denied`) or
+ *   user-approved (`approval-responded`). A continuation that re-validates
+ *   the transcript can re-emit a denial for an approval the SDK now deems
+ *   unneeded; `applyChunkToParts` already drops it server-side, and this stops
+ *   it reaching the client (where the in-place `updateToolPart` would flip the
+ *   part to `output-denied`) and the replay buffer. Mirrors the
+ *   first-write-wins guard in `applyChunkToParts`.
+ * - `tool-approval-request` for a `toolCallId` whose existing part is already
+ *   `approval-responded` or settled. A continuation replaying a prior tool
+ *   round-trip can re-emit the approval request; left unfiltered it would
+ *   revert an already-approved tool back to `approval-requested` on the client
+ *   (re-showing Approve/Reject) and replay that regression on reconnect. Same
+ *   pattern and rationale as `tool-output-denied`.
  */
 export function isReplayChunk(
   parts: MessagePart[],
   chunk: StreamChunkData
 ): boolean {
+  if (
+    chunk.type === "tool-output-denied" ||
+    chunk.type === "tool-approval-request"
+  ) {
+    if (!chunk.toolCallId) return false;
+    const existing = findToolPartByCallId(parts, chunk.toolCallId);
+    if (!existing) return false;
+    const state = (existing as Record<string, unknown>).state;
+    return (
+      state === "output-available" ||
+      state === "output-error" ||
+      state === "output-denied" ||
+      state === "approval-responded"
+    );
+  }
+
   if (
     chunk.type !== "tool-input-start" &&
     chunk.type !== "tool-input-delta" &&
@@ -515,4 +621,39 @@ function findDataPartByTypeAndId(
     }
   }
   return undefined;
+}
+
+/**
+ * Rebuild the partial text + parts of an interrupted assistant turn from its
+ * stored resumable-stream chunks. Replays each chunk body through
+ * {@link applyChunkToParts}; malformed bodies are skipped. Shared by
+ * `AIChatAgent` and `Think`, which read the chunks from their
+ * `ResumableStream` (`getStreamChunks`) and pass them in.
+ *
+ * `@internal`
+ */
+export function getPartialStreamText(chunks: ReadonlyArray<{ body: string }>): {
+  text: string;
+  parts: MessagePart[];
+} {
+  const parts: MessagePart[] = [];
+
+  for (const chunk of chunks) {
+    try {
+      const data = JSON.parse(chunk.body);
+      applyChunkToParts(parts, data);
+    } catch {
+      // Skip malformed chunk bodies
+    }
+  }
+
+  const text = parts
+    .filter(
+      (p): p is MessagePart & { type: "text"; text: string } =>
+        p.type === "text" && "text" in p
+    )
+    .map((p) => p.text)
+    .join("");
+
+  return { text, parts };
 }

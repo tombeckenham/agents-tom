@@ -1,5 +1,7 @@
 import type { Workspace, FileInfo } from "@cloudflare/shell";
-import type { JSONValue } from "ai";
+import type { JSONValue, Tool } from "ai";
+import type { InitialFiles } from "just-bash";
+import { Bash } from "just-bash";
 import { tool } from "ai";
 import { z } from "zod";
 
@@ -75,6 +77,21 @@ export interface GrepOperations {
   readFile(path: string): Promise<string | null>;
 }
 
+export interface BashOperations {
+  readDir(
+    dir: string,
+    opts?: { limit?: number; offset?: number }
+  ): Promise<FileInfo[]> | FileInfo[];
+  readFileBytes(path: string): Promise<Uint8Array | null>;
+  writeFile(path: string, content: string): Promise<void>;
+  writeFileBytes?: (path: string, content: Uint8Array) => Promise<void>;
+  mkdir(path: string, opts?: { recursive?: boolean }): Promise<void> | void;
+  rm(
+    path: string,
+    opts?: { recursive?: boolean; force?: boolean }
+  ): Promise<void>;
+}
+
 // ── Workspace-backed operation factories ──────────────────────────
 
 function workspaceReadOps(ws: WorkspaceLike): ReadOperations {
@@ -124,6 +141,41 @@ function workspaceGrepOps(ws: WorkspaceLike): GrepOperations {
   };
 }
 
+function workspaceBashOps(ws: WorkspaceLike): BashOperations {
+  const maybeBytesWriter = ws as WorkspaceLike & {
+    writeFileBytes?: (path: string, content: Uint8Array) => Promise<void>;
+  };
+  return {
+    readDir: (dir, opts) => ws.readDir(dir, opts),
+    readFileBytes: (path) => ws.readFileBytes(path),
+    writeFile: (path, content) => ws.writeFile(path, content),
+    writeFileBytes: maybeBytesWriter.writeFileBytes
+      ? (path, content) => maybeBytesWriter.writeFileBytes!(path, content)
+      : undefined,
+    mkdir: (path, opts) => ws.mkdir(path, opts),
+    rm: (path, opts) => ws.rm(path, opts)
+  };
+}
+
+export interface WorkspaceToolsOptions {
+  /**
+   * Include the default workspace Bash tool. Enabled by default; pass `false`
+   * to omit it, or an options object to tune execution limits.
+   */
+  bash?: boolean | Omit<BashToolOptions, "ops">;
+}
+
+export type WorkspaceTools = {
+  read: ReturnType<typeof createReadTool>;
+  write: ReturnType<typeof createWriteTool>;
+  edit: ReturnType<typeof createEditTool>;
+  list: ReturnType<typeof createListTool>;
+  find: ReturnType<typeof createFindTool>;
+  grep: ReturnType<typeof createGrepTool>;
+  delete: ReturnType<typeof createDeleteTool>;
+  bash?: ReturnType<typeof createBashTool>;
+};
+
 /**
  * Create a complete set of AI SDK tools backed by a workspace.
  *
@@ -146,8 +198,11 @@ function workspaceGrepOps(ws: WorkspaceLike): GrepOperations {
  * }
  * ```
  */
-export function createWorkspaceTools(workspace: WorkspaceLike) {
-  return {
+export function createWorkspaceTools(
+  workspace: WorkspaceLike,
+  options: WorkspaceToolsOptions = {}
+): WorkspaceTools {
+  const tools: WorkspaceTools = {
     read: createReadTool({ ops: workspaceReadOps(workspace) }),
     write: createWriteTool({ ops: workspaceWriteOps(workspace) }),
     edit: createEditTool({ ops: workspaceEditOps(workspace) }),
@@ -156,6 +211,15 @@ export function createWorkspaceTools(workspace: WorkspaceLike) {
     grep: createGrepTool({ ops: workspaceGrepOps(workspace) }),
     delete: createDeleteTool({ ops: workspaceDeleteOps(workspace) })
   };
+
+  if (options.bash !== false) {
+    tools.bash = createBashTool({
+      ...(typeof options.bash === "object" ? options.bash : {}),
+      ops: workspaceBashOps(workspace)
+    });
+  }
+
+  return tools;
 }
 
 // ── Read ────────────────────────────────────────────────────────────
@@ -216,7 +280,7 @@ export interface ReadToolOptions {
   ops: ReadOperations;
 }
 
-export function createReadTool(options: ReadToolOptions) {
+export function createReadTool(options: ReadToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -348,21 +412,15 @@ export function createReadTool(options: ReadToolOptions) {
       const data = uint8ArrayToBase64(bytes);
       const note = `Read ${replayOutput.path} (${replayOutput.mediaType}, ${formatSize(bytes.byteLength)}).`;
 
-      if (replayOutput.kind === "image") {
-        return {
-          type: "content",
-          value: [
-            { type: "text", text: note },
-            { type: "image-data", data, mediaType: replayOutput.mediaType }
-          ]
-        };
-      }
-
       return {
         type: "content",
         value: [
           { type: "text", text: note },
           {
+            // `file-data` (base64 string `data`) is accepted by both AI SDK v6
+            // and v7. v7 also offers the newer `{ type: "file", data: { type:
+            // "data", data } }` shape, but that does not exist in v6, so we use
+            // the cross-major form here.
             type: "file-data",
             data,
             mediaType: replayOutput.mediaType,
@@ -587,7 +645,7 @@ export interface WriteToolOptions {
   ops: WriteOperations;
 }
 
-export function createWriteTool(options: WriteToolOptions) {
+export function createWriteTool(options: WriteToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -623,7 +681,7 @@ export interface EditToolOptions {
   ops: EditOperations;
 }
 
-export function createEditTool(options: EditToolOptions) {
+export function createEditTool(options: EditToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -802,7 +860,7 @@ export interface ListToolOptions {
   ops: ListOperations;
 }
 
-export function createListTool(options: ListToolOptions) {
+export function createListTool(options: ListToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -863,7 +921,7 @@ export interface FindToolOptions {
   ops: FindOperations;
 }
 
-export function createFindTool(options: FindToolOptions) {
+export function createFindTool(options: FindToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -915,7 +973,7 @@ export interface GrepToolOptions {
   ops: GrepOperations;
 }
 
-export function createGrepTool(options: GrepToolOptions) {
+export function createGrepTool(options: GrepToolOptions): Tool {
   const { ops } = options;
 
   return tool({
@@ -1066,13 +1124,436 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// ── Bash ─────────────────────────────────────────────────────────────
+
+const DEFAULT_BASH_TIMEOUT_MS = 30_000;
+const DEFAULT_BASH_MAX_WORKSPACE_FILES = 1_000;
+const DEFAULT_BASH_MAX_WORKSPACE_FILE_BYTES = 1_000_000;
+const DEFAULT_BASH_MAX_OUTPUT_BYTES = 64_000;
+const BASH_READDIR_PAGE_SIZE = 1_000;
+// Synthetic paths the bash sandbox creates for itself (shell builtins under
+// /bin and /usr/bin, pseudo-filesystems, scratch space). New files here must
+// never be persisted to the workspace — only pre-existing workspace files
+// under these roots keep syncing.
+const BASH_EXCLUDED_SYNC_ROOTS = ["/bin", "/usr", "/dev", "/proc", "/sys"];
+
+type BashToolInput = {
+  script: string;
+  cwd?: string;
+};
+
+type BashChangedFiles = {
+  created: string[];
+  updated: string[];
+  deleted: string[];
+  directoriesCreated: string[];
+  directoriesDeleted: string[];
+};
+
+export interface BashToolOptions {
+  ops: BashOperations;
+  timeout?: number;
+  network?: boolean;
+  maxWorkspaceFiles?: number;
+  maxWorkspaceFileBytes?: number;
+  maxOutputBytes?: number;
+}
+
+export function createBashTool(options: BashToolOptions): Tool {
+  return tool({
+    description:
+      "Run a Bash script against the workspace. Use for shell-style workflows " +
+      "that combine multiple file operations. The script runs in a sandboxed " +
+      "virtual filesystem with the workspace mounted at `/` (also the default " +
+      "working directory) — there is no `/workspace` or `/home`; use absolute " +
+      "paths like `/notes.txt`. Changed files are written back to the workspace.",
+    inputSchema: z.object({
+      script: z.string().describe("Bash script to run"),
+      cwd: z
+        .string()
+        .optional()
+        .describe(
+          "Working directory for the script. Defaults to / (the workspace root)"
+        )
+    }),
+    execute: async ({ script, cwd }: BashToolInput) => {
+      const timeout = options.timeout ?? DEFAULT_BASH_TIMEOUT_MS;
+      const maxOutputBytes =
+        options.maxOutputBytes ?? DEFAULT_BASH_MAX_OUTPUT_BYTES;
+      const snapshot = await snapshotWorkspaceForBash(options);
+      const bash = new Bash({
+        files: snapshot.files,
+        cwd: normalizeWorkspacePath(cwd ?? "/"),
+        defenseInDepth: true,
+        network: options.network ? {} : undefined
+      });
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+      let result:
+        | {
+            stdout: string;
+            stderr: string;
+            exitCode: number;
+          }
+        | undefined;
+      try {
+        for (const directory of snapshot.directories) {
+          await bash.fs.mkdir(directory, { recursive: true }).catch(() => {});
+        }
+
+        try {
+          result = await bash.exec(script, {
+            cwd: normalizeWorkspacePath(cwd ?? "/"),
+            signal: controller.signal,
+            rawScript: true
+          });
+        } catch (error) {
+          result = {
+            stdout: "",
+            stderr: errorMessage(error),
+            exitCode: controller.signal.aborted ? 124 : 1
+          };
+        }
+
+        const sync = await syncBashFilesToWorkspace({
+          ops: options.ops,
+          bash,
+          initialFiles: snapshot.initialFiles,
+          initialDirectories: snapshot.initialDirectories,
+          protectedPaths: snapshot.protectedPaths
+        });
+
+        return {
+          stdout: truncateToolOutput(result.stdout, maxOutputBytes),
+          stderr: truncateToolOutput(result.stderr, maxOutputBytes),
+          exitCode: result.exitCode,
+          changedFiles: sync.changedFiles,
+          ...(snapshot.skippedFiles.length > 0
+            ? { skippedFiles: snapshot.skippedFiles }
+            : {}),
+          ...(sync.errors.length > 0 ? { errors: sync.errors } : {})
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  });
+}
+
+async function snapshotWorkspaceForBash(options: BashToolOptions): Promise<{
+  files: InitialFiles;
+  initialFiles: Map<string, Uint8Array>;
+  initialDirectories: Set<string>;
+  protectedPaths: Set<string>;
+  directories: string[];
+  skippedFiles: string[];
+}> {
+  const maxFiles =
+    options.maxWorkspaceFiles ?? DEFAULT_BASH_MAX_WORKSPACE_FILES;
+  const maxFileBytes =
+    options.maxWorkspaceFileBytes ?? DEFAULT_BASH_MAX_WORKSPACE_FILE_BYTES;
+  const files: InitialFiles = {};
+  const initialFiles = new Map<string, Uint8Array>();
+  const initialDirectories = new Set<string>(["/"]);
+  const protectedPaths = new Set<string>();
+  const skippedFiles: string[] = [];
+  const pending = ["/"];
+
+  while (pending.length > 0) {
+    const dir = pending.shift()!;
+    const entries = await readAllBashDirEntries(options.ops, dir);
+    for (const entry of entries) {
+      const path = normalizeWorkspacePath(entry.path);
+      if (entry.type === "directory") {
+        initialDirectories.add(path);
+        pending.push(path);
+        continue;
+      }
+      if (entry.type !== "file") continue;
+      if (initialFiles.size >= maxFiles || entry.size > maxFileBytes) {
+        protectedPaths.add(path);
+        skippedFiles.push(path);
+        continue;
+      }
+      const bytes = await options.ops.readFileBytes(path);
+      if (bytes === null) {
+        protectedPaths.add(path);
+        skippedFiles.push(path);
+        continue;
+      }
+      files[path] = bytes;
+      initialFiles.set(path, bytes);
+    }
+  }
+
+  return {
+    files,
+    initialFiles,
+    initialDirectories,
+    protectedPaths,
+    directories: [...initialDirectories].sort((a, b) => a.localeCompare(b)),
+    skippedFiles
+  };
+}
+
+async function readAllBashDirEntries(
+  ops: BashOperations,
+  dir: string
+): Promise<FileInfo[]> {
+  const entries: FileInfo[] = [];
+  let offset = 0;
+
+  while (true) {
+    const page = await ops.readDir(dir, {
+      limit: BASH_READDIR_PAGE_SIZE,
+      offset
+    });
+    entries.push(...page);
+    if (page.length !== BASH_READDIR_PAGE_SIZE) break;
+    offset += page.length;
+  }
+
+  return entries;
+}
+
+async function syncBashFilesToWorkspace({
+  ops,
+  bash,
+  initialFiles,
+  initialDirectories,
+  protectedPaths
+}: {
+  ops: BashOperations;
+  bash: {
+    fs: {
+      getAllPaths(): string[];
+      stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean }>;
+      readFileBuffer(path: string): Promise<Uint8Array>;
+    };
+  };
+  initialFiles: Map<string, Uint8Array>;
+  initialDirectories: Set<string>;
+  protectedPaths: Set<string>;
+}): Promise<{ changedFiles: BashChangedFiles; errors: string[] }> {
+  const changedFiles: BashChangedFiles = {
+    created: [],
+    updated: [],
+    deleted: [],
+    directoriesCreated: [],
+    directoriesDeleted: []
+  };
+  const errors: string[] = [];
+  const finalFiles = new Map<string, Uint8Array>();
+  const finalDirectories = new Set<string>(["/"]);
+
+  for (const rawPath of bash.fs.getAllPaths()) {
+    const path = normalizeWorkspacePath(rawPath);
+    if (!shouldSyncBashPath(path, initialFiles, protectedPaths)) continue;
+    const stat = await bash.fs.stat(path).catch(() => null);
+    if (stat?.isDirectory) {
+      finalDirectories.add(path);
+      continue;
+    }
+    if (stat?.isFile) {
+      finalFiles.set(path, await bash.fs.readFileBuffer(path));
+    }
+  }
+
+  for (const path of [...finalDirectories].sort((a, b) => a.localeCompare(b))) {
+    if (path === "/" || initialDirectories.has(path)) continue;
+    if (hasProtectedDescendant(path, protectedPaths)) {
+      errors.push(
+        `Skipped creating directory ${path}: contains protected paths.`
+      );
+      continue;
+    }
+    const created = await Promise.resolve(ops.mkdir(path, { recursive: true }))
+      .then(() => true)
+      .catch((error: unknown) => {
+        errors.push(
+          `Failed to create directory ${path}: ${errorMessage(error)}`
+        );
+        return false;
+      });
+    if (!created) continue;
+    changedFiles.directoriesCreated.push(path);
+  }
+
+  for (const [path, bytes] of finalFiles) {
+    if (protectedPaths.has(path)) {
+      errors.push(`Skipped writing protected workspace file: ${path}`);
+      continue;
+    }
+    const existing = initialFiles.get(path);
+    if (existing && bytesEqual(existing, bytes)) continue;
+    const written = await writeWorkspaceBytes(ops, path, bytes, errors);
+    if (!written) continue;
+    if (existing) changedFiles.updated.push(path);
+    else changedFiles.created.push(path);
+  }
+
+  for (const path of [...initialFiles.keys()].sort((a, b) =>
+    b.localeCompare(a)
+  )) {
+    if (finalFiles.has(path) || protectedPaths.has(path)) continue;
+    const deleted = await ops
+      .rm(path, { force: true })
+      .then(() => true)
+      .catch((error: unknown) => {
+        errors.push(`Failed to delete ${path}: ${errorMessage(error)}`);
+        return false;
+      });
+    if (!deleted) continue;
+    changedFiles.deleted.push(path);
+  }
+
+  for (const path of [...initialDirectories].sort((a, b) =>
+    b.localeCompare(a)
+  )) {
+    if (path === "/" || finalDirectories.has(path)) continue;
+    if (hasProtectedDescendant(path, protectedPaths)) {
+      errors.push(`Skipped deleting protected workspace directory: ${path}`);
+      continue;
+    }
+    const deleted = await ops
+      .rm(path, { recursive: true, force: true })
+      .then(() => true)
+      .catch((error: unknown) => {
+        errors.push(
+          `Failed to delete directory ${path}: ${errorMessage(error)}`
+        );
+        return false;
+      });
+    if (!deleted) continue;
+    changedFiles.directoriesDeleted.push(path);
+  }
+
+  changedFiles.created.sort();
+  changedFiles.updated.sort();
+  changedFiles.deleted.sort();
+  changedFiles.directoriesCreated.sort();
+  changedFiles.directoriesDeleted.sort();
+
+  return { changedFiles, errors };
+}
+
+async function writeWorkspaceBytes(
+  ops: BashOperations,
+  path: string,
+  bytes: Uint8Array,
+  errors: string[]
+): Promise<boolean> {
+  const parent = parentDir(path);
+  if (parent !== "/") {
+    const parentCreated = await Promise.resolve(
+      ops.mkdir(parent, { recursive: true })
+    )
+      .then(() => true)
+      .catch((error: unknown) => {
+        errors.push(
+          `Failed to create parent directory ${parent}: ${errorMessage(error)}`
+        );
+        return false;
+      });
+    if (!parentCreated) return false;
+  }
+
+  if (ops.writeFileBytes) {
+    return ops
+      .writeFileBytes(path, bytes)
+      .then(() => true)
+      .catch((error: unknown) => {
+        errors.push(`Failed to write ${path}: ${errorMessage(error)}`);
+        return false;
+      });
+  }
+
+  if (!looksLikeText(bytes)) {
+    errors.push(
+      `Could not persist binary file ${path}: workspace does not support writeFileBytes.`
+    );
+    return false;
+  }
+
+  const content = new TextDecoder().decode(bytes);
+  return ops
+    .writeFile(path, content)
+    .then(() => true)
+    .catch((error: unknown) => {
+      errors.push(`Failed to write ${path}: ${errorMessage(error)}`);
+      return false;
+    });
+}
+
+function shouldSyncBashPath(
+  path: string,
+  initialFiles: Map<string, Uint8Array>,
+  protectedPaths: Set<string>
+): boolean {
+  if (path === "/") return false;
+  if (initialFiles.has(path)) return true;
+  if (protectedPaths.has(path)) return true;
+  if (path === "/tmp" || path.startsWith("/tmp/")) return false;
+  return !BASH_EXCLUDED_SYNC_ROOTS.some(
+    (root) => path === root || path.startsWith(`${root}/`)
+  );
+}
+
+function hasProtectedDescendant(
+  path: string,
+  protectedPaths: Set<string>
+): boolean {
+  const prefix = path.endsWith("/") ? path : `${path}/`;
+  for (const protectedPath of protectedPaths) {
+    if (protectedPath.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function normalizeWorkspacePath(path: string): string {
+  const parts: string[] = [];
+  const raw = path.startsWith("/") ? path : `/${path}`;
+  for (const part of raw.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join("/")}`;
+}
+
+function parentDir(path: string): string {
+  const normalized = normalizeWorkspacePath(path);
+  const index = normalized.lastIndexOf("/");
+  return index <= 0 ? "/" : normalized.slice(0, index);
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function truncateToolOutput(value: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.byteLength <= maxBytes) return value;
+  const truncated = new TextDecoder().decode(bytes.slice(0, maxBytes));
+  return `${truncated}\n... (${formatSize(bytes.byteLength - maxBytes)} truncated)`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 // ── Delete ──────────────────────────────────────────────────────────
 
 export interface DeleteToolOptions {
   ops: DeleteOperations;
 }
 
-export function createDeleteTool(options: DeleteToolOptions) {
+export function createDeleteTool(options: DeleteToolOptions): Tool {
   const { ops } = options;
 
   return tool({

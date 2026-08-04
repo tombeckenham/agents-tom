@@ -12,43 +12,22 @@
 
 import { CHAT_MESSAGE_TYPES } from "./protocol";
 import type { ClientToolSchema } from "./client-tools";
+import { sendIfOpen, type ChatConnection } from "./connection";
 
 const MSG_STREAM_RESUME_NONE = CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE;
 
-function sendIfOpen(
-  connection: ContinuationConnection,
-  message: string
-): boolean {
-  try {
-    connection.send(message);
-    return true;
-  } catch (error) {
-    if (isWebSocketClosedSendError(error)) return false;
-    throw error;
-  }
-}
-
-function isWebSocketClosedSendError(error: unknown): boolean {
-  return (
-    error instanceof TypeError &&
-    error.message.includes("WebSocket send() after close")
-  );
-}
-
 /**
- * Minimal connection interface for sending WebSocket messages.
- * Matches the Connection type from agents without importing it.
- * Uses a permissive send signature so Connection (which extends
- * WebSocket with its own send overload) is structurally assignable.
+ * Minimal connection interface for sending WebSocket messages. Alias of the
+ * shared {@link ChatConnection} — kept as a named export for back-compat with
+ * existing `ContinuationConnection` consumers.
  */
-export interface ContinuationConnection {
-  readonly id: string;
-  send(message: string): void;
-}
+export type ContinuationConnection = ChatConnection;
 
-export interface ContinuationPending {
-  connection: ContinuationConnection;
-  connectionId: string;
+export interface ContinuationPending<
+  TConnection extends ContinuationConnection = ContinuationConnection
+> {
+  connection: TConnection;
+  connectionId: string | null;
   requestId: string;
   clientTools?: ClientToolSchema[];
   body?: Record<string, unknown>;
@@ -57,21 +36,25 @@ export interface ContinuationPending {
   pastCoalesce: boolean;
 }
 
-export interface ContinuationDeferred {
-  connection: ContinuationConnection;
-  connectionId: string;
+export interface ContinuationDeferred<
+  TConnection extends ContinuationConnection = ContinuationConnection
+> {
+  connection: TConnection;
+  connectionId: string | null;
   clientTools?: ClientToolSchema[];
   body?: Record<string, unknown>;
   errorPrefix: string;
   prerequisite: Promise<boolean> | null;
 }
 
-export class ContinuationState {
-  pending: ContinuationPending | null = null;
-  deferred: ContinuationDeferred | null = null;
+export class ContinuationState<
+  TConnection extends ContinuationConnection = ContinuationConnection
+> {
+  pending: ContinuationPending<TConnection> | null = null;
+  deferred: ContinuationDeferred<TConnection> | null = null;
   activeRequestId: string | null = null;
   activeConnectionId: string | null = null;
-  awaitingConnections: Map<string, ContinuationConnection> = new Map();
+  awaitingConnections: Map<string, TConnection> = new Map();
 
   /** Clear pending state and awaiting connections (without sending RESUME_NONE). */
   clearPending(): void {
@@ -91,6 +74,23 @@ export class ContinuationState {
   }
 
   /**
+   * Mark a connection as no longer available without canceling the
+   * continuation it initiated.
+   */
+  releaseConnection(connectionId: string): void {
+    this.awaitingConnections.delete(connectionId);
+    if (this.pending?.connectionId === connectionId) {
+      this.pending = { ...this.pending, connectionId: null };
+    }
+    if (this.deferred?.connectionId === connectionId) {
+      this.deferred = { ...this.deferred, connectionId: null };
+    }
+    if (this.activeConnectionId === connectionId) {
+      this.activeConnectionId = null;
+    }
+  }
+
+  /**
    * Send STREAM_RESUME_NONE to all connections waiting for a
    * continuation stream to start, then clear the map.
    */
@@ -106,9 +106,7 @@ export class ContinuationState {
    * Flush awaiting connections by notifying each one via the provided
    * callback (typically sends STREAM_RESUMING), then clear.
    */
-  flushAwaitingConnections(
-    notify: (conn: ContinuationConnection) => void
-  ): void {
+  flushAwaitingConnections(notify: (conn: TConnection) => void): void {
     for (const connection of this.awaitingConnections.values()) {
       notify(connection);
     }
@@ -136,7 +134,7 @@ export class ContinuationState {
    */
   activateDeferred(
     generateRequestId: () => string
-  ): ContinuationPending | null {
+  ): ContinuationPending<TConnection> | null {
     if (this.pending || !this.deferred) return null;
 
     const d = this.deferred;
@@ -155,7 +153,9 @@ export class ContinuationState {
       pastCoalesce: false
     };
 
-    this.awaitingConnections.set(d.connectionId, d.connection);
+    if (d.connectionId !== null) {
+      this.awaitingConnections.set(d.connectionId, d.connection);
+    }
     return this.pending;
   }
 }

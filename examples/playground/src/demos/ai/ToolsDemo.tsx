@@ -151,6 +151,7 @@ function ToolCard({
   state,
   input: toolInput,
   output,
+  errorText,
   approvalId,
   onApprove,
   onReject
@@ -159,6 +160,7 @@ function ToolCard({
   state: string;
   input?: unknown;
   output?: unknown;
+  errorText?: string;
   approvalId?: string;
   onApprove?: (id: string) => void;
   onReject?: (id: string) => void;
@@ -227,6 +229,12 @@ function ToolCard({
           </pre>
         )}
 
+        {isError && (
+          <pre className="font-mono text-xs text-red-400 overflow-x-auto bg-red-500/10 rounded p-2 border border-red-500/20">
+            {errorText ?? "Tool execution failed."}
+          </pre>
+        )}
+
         {isApproval && approvalId && onApprove && onReject && (
           <div className="flex gap-2 mt-2">
             <Button
@@ -276,6 +284,7 @@ function ToolsUI() {
     status
   } = useAgentChat({
     agent,
+    experimental_throttle: 100,
     onToolCall: async ({ toolCall, addToolOutput }) => {
       if (toolCall.toolName === "getUserTimezone") {
         addToolOutput({
@@ -454,6 +463,11 @@ function ToolsUI() {
                         output={
                           part.state === "output-available"
                             ? part.output
+                            : undefined
+                        }
+                        errorText={
+                          part.state === "output-error"
+                            ? (part as { errorText?: string }).errorText
                             : undefined
                         }
                         approvalId={approvalId}

@@ -2,7 +2,7 @@ import { test, expect } from "@playwright/test";
 
 /**
  * E2E tests for onChatResponse + server-initiated streaming with a real LLM.
- * Uses Workers AI (@cf/moonshotai/kimi-k2.5) via the StreamEndLlmAgent.
+ * Uses Workers AI (@cf/moonshotai/kimi-k2.7-code) via the StreamEndLlmAgent.
  *
  * These verify:
  * 1. onChatResponse fires with status "completed" after a real LLM stream
@@ -122,7 +122,7 @@ test.describe("onChatResponse e2e (real LLM)", () => {
   test.setTimeout(30_000);
 
   test.beforeEach(async ({ page }) => {
-    await page.goto("about:blank");
+    await page.goto("/__health");
   });
 
   test("onChatResponse fires with status=completed after a real LLM stream", async ({
@@ -333,7 +333,7 @@ test.describe("onChatResponse chaining e2e (real LLM)", () => {
   test.setTimeout(60_000);
 
   test.beforeEach(async ({ page }) => {
-    await page.goto("about:blank");
+    await page.goto("/__health");
   });
 
   test("saveMessages from onChatResponse triggers a second real LLM turn without deadlock", async ({

@@ -91,6 +91,9 @@ out
 .nuxt
 dist
 
+# Generated package documentation (source lives in /docs)
+packages/*/docs
+
 # Gatsby files
 .cache/
 # Comment in the public line in if your project uses Gatsby and not Next.js
@@ -140,10 +143,15 @@ dist
 .wrangler-*-state
 .dev.vars
 
+# e2e recovery harness miniflare/SQLite state
+**/.smoke-state/
+
 # macOS
 .DS_Store
 
 .astro
+.react-router
+examples/think-react-router/build
 # Vitest browser test screenshots
 __screenshots__
 
@@ -153,3 +161,9 @@ test-results/
 # Nx
 .nx/cache
 .nx/workspace-data
+
+# Temporary compat-verification harness (Layer A)
+.compat-harness/
+
+# npm artifacts (repo uses pnpm)
+package-lock.json
