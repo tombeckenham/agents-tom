@@ -93,9 +93,16 @@ wall of spurious "Cannot find module" cascades.
   `pnpm install` dies on it, scope the install with
   `--filter "agents..." --filter "@cloudflare/ai-chat-vercel..."` etc.
 - Adapter peer ranges track upstream `@cloudflare/ai-chat`:
-  `ai@^6 || ^7`, `@ai-sdk/react@^3 || ^4`, `agents@>=0.17.1 <1.0.0`. The
-  TanStack adapter tracks the workspace pins: `@tanstack/ai@0.38.0`,
-  `ai-react@0.16.0`, `ai-client@0.19.0`.
+  `ai@^6 || ^7`, `@ai-sdk/react@^3 || ^4`, `agents@>=0.17.1 <1.0.0`.
+- The TanStack adapter is on the latest published TanStack AI:
+  `@tanstack/ai@0.42.0`, `ai-react@0.18.1`, `ai-client@0.22.1`. The rest of
+  the workspace (`agents`, `codemode`, `experimental/tanstack-recovery`) is
+  still pinned to `@tanstack/ai@0.38.0`, so the tree carries two copies.
+  This is benign today — `ServerTool`, the only type crossing the boundary
+  (`agents/mcp/tanstack-ai.ts` re-exports it), is identical in both, and
+  the adapter itself only consumes `ai-react` / `ai-client`, which nothing
+  else in the workspace uses. Worth collapsing to one version the next time
+  upstream moves its own pin.
 
 ## Open work — next session
 
