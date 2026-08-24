@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     projects: [
       "src/tests/vitest.config.ts",
+      "src/agui-tests/vitest.config.ts",
       "src/lifecycle-tests/vitest.config.ts",
       "src/react-tests/vitest.config.ts",
       "src/cli-tests/vitest.config.ts",

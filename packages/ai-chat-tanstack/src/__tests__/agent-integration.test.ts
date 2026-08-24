@@ -121,4 +121,77 @@ describe("AGUIChatAgent + WebSocketChatTransport — end to end (TanStack)", () 
     // Subsequent read fails with AbortError.
     await expect(iterator.next()).rejects.toThrow();
   });
+
+  it("a second connection resumes a live stream via reconnectToStream", async () => {
+    const room = crypto.randomUUID();
+    const ws1 = await openAgent(`/agents/slow-tanstack-agent/${room}`);
+    const transport1 = new WebSocketChatTransport({
+      agent: wsToAgentConnection(ws1)
+    });
+
+    // Kick off a ~1s run and wait until it has demonstrably started.
+    const iterable = transport1.streamFactory([
+      { role: "user", content: "go" }
+    ]);
+    const iterator1 = iterable[Symbol.asyncIterator]();
+    const first = await iterator1.next();
+    expect(first.done).toBe(false);
+
+    // Second client joins the same room mid-stream. The transport learns
+    // about STREAM_RESUMING / RESUME_NONE frames from whatever socket
+    // layer hosts it (the React hook in production) — wire that here.
+    const ws2 = await openAgent(`/agents/slow-tanstack-agent/${room}`);
+    const transport2 = new WebSocketChatTransport({
+      agent: wsToAgentConnection(ws2)
+    });
+    ws2.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      let frame: { type?: string; id?: string };
+      try {
+        frame = JSON.parse(event.data) as { type?: string; id?: string };
+      } catch {
+        return;
+      }
+      if (frame.type === MessageType.CF_AGENT_STREAM_RESUMING && frame.id) {
+        transport2.handleStreamResuming({ id: frame.id });
+      } else if (frame.type === MessageType.CF_AGENT_STREAM_RESUME_NONE) {
+        transport2.handleStreamResumeNone();
+      }
+    });
+
+    const resumed = await transport2.reconnectToStream();
+    expect(resumed).not.toBeNull();
+    if (!resumed) return;
+
+    const events = await drain(resumed);
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.at(-1)?.type).toBe("RUN_FINISHED");
+    expect(events.some((e) => e.type === "TEXT_MESSAGE_CONTENT")).toBe(true);
+
+    // The originating client's stream also runs to completion.
+    let last = first;
+    while (!last.done) last = await iterator1.next();
+  });
+
+  it("a stream that errors mid-body surfaces as a rejected iterator read", async () => {
+    const room = crypto.randomUUID();
+    const ws = await openAgent(`/agents/erroring-tanstack-agent/${room}`);
+    const transport = new WebSocketChatTransport({
+      agent: wsToAgentConnection(ws)
+    });
+
+    const iterable = transport.streamFactory([{ role: "user", content: "hi" }]);
+    const iterator = iterable[Symbol.asyncIterator]();
+    // The RUN_STARTED emitted before the failure arrives first…
+    const first = await iterator.next();
+    expect(first.done).toBe(false);
+    // …then the server's error frame rejects the read.
+    await expect(
+      (async () => {
+        while (!(await iterator.next()).done) {
+          // drain until the error frame lands
+        }
+      })()
+    ).rejects.toThrow(/agent exploded/);
+  });
 });

@@ -2690,6 +2690,8 @@ importers:
         specifier: ^4.115.0
         version: 4.115.0(@cloudflare/workers-types@5.20260729.1)
 
+  examples/think-react-router: {}
+
   examples/think-submissions:
     dependencies:
       '@cloudflare/kumo':
@@ -2747,6 +2749,8 @@ importers:
       wrangler:
         specifier: ^4.115.0
         version: 4.115.0(@cloudflare/workers-types@5.20260729.1)
+
+  examples/think-tanstack-start: {}
 
   examples/think-workflows:
     dependencies:
@@ -4157,7 +4161,7 @@ importers:
         specifier: '>=0.17.1 <1.0.0'
         version: link:../agents
       nanoid:
-        specifier: ^5.1.11
+        specifier: ^5.1.16
         version: 5.1.16
     devDependencies:
       '@tanstack/ai':
@@ -4170,10 +4174,10 @@ importers:
         specifier: 0.18.1
         version: 0.18.1(@opentelemetry/api@1.9.1)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(@types/react@19.2.17)(react@19.2.8)
       '@types/react':
-        specifier: ^19.2.14
+        specifier: ^19.2.17
         version: 19.2.17
       react:
-        specifier: ^19.2.6
+        specifier: ^19.2.7
         version: 19.2.8
       zod:
         specifier: ^4.4.3
@@ -4188,17 +4192,17 @@ importers:
         specifier: '>=0.17.1 <1.0.0'
         version: link:../agents
       nanoid:
-        specifier: ^5.1.11
+        specifier: ^5.1.16
         version: 5.1.16
     devDependencies:
       '@types/react':
-        specifier: ^19.2.14
+        specifier: ^19.2.17
         version: 19.2.17
       ai:
         specifier: ^7.0.0
         version: 7.0.18(zod@4.4.3)
       react:
-        specifier: ^19.2.6
+        specifier: ^19.2.7
         version: 19.2.8
       zod:
         specifier: ^4.4.3
@@ -4228,6 +4232,8 @@ importers:
       zod:
         specifier: ^4.4.3
         version: 4.4.3
+
+  packages/create-think: {}
 
   packages/hono-agents:
     devDependencies:

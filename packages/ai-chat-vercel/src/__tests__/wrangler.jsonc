@@ -18,13 +18,31 @@
       {
         "class_name": "ToolApprovalAguiAgent",
         "name": "ToolApprovalAguiAgent"
+      },
+      {
+        "class_name": "SlowStreamAguiAgent",
+        "name": "SlowStreamAguiAgent"
+      },
+      {
+        "class_name": "ErroringStreamAguiAgent",
+        "name": "ErroringStreamAguiAgent"
+      },
+      {
+        "class_name": "ToolCallAguiAgent",
+        "name": "ToolCallAguiAgent"
       }
     ]
   },
   "main": "worker.ts",
   "migrations": [
     {
-      "new_sqlite_classes": ["TestAguiAgent", "ToolApprovalAguiAgent"],
+      "new_sqlite_classes": [
+        "TestAguiAgent",
+        "ToolApprovalAguiAgent",
+        "SlowStreamAguiAgent",
+        "ErroringStreamAguiAgent",
+        "ToolCallAguiAgent"
+      ],
       "tag": "v1"
     }
   ]

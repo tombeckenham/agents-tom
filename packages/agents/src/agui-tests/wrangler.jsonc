@@ -1,0 +1,43 @@
+{
+  "main": "./worker.ts",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "enable_nodejs_tty_module",
+    "enable_nodejs_fs_module",
+    "enable_nodejs_http_modules",
+    "enable_nodejs_perf_hooks_module",
+    "enable_nodejs_v8_module",
+    "enable_nodejs_process_v2"
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "EchoAguiAgent", "class_name": "EchoAguiAgent" },
+      { "name": "ToolCallAguiAgent", "class_name": "ToolCallAguiAgent" },
+      { "name": "SlowAguiAgent", "class_name": "SlowAguiAgent" },
+      { "name": "PlaintextAguiAgent", "class_name": "PlaintextAguiAgent" },
+      { "name": "ErrorStreamAguiAgent", "class_name": "ErrorStreamAguiAgent" },
+      { "name": "ApprovalAguiAgent", "class_name": "ApprovalAguiAgent" },
+      {
+        "name": "MaxPersistedAguiAgent",
+        "class_name": "MaxPersistedAguiAgent"
+      },
+      { "name": "SaveMessagesAguiAgent", "class_name": "SaveMessagesAguiAgent" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "EchoAguiAgent",
+        "ToolCallAguiAgent",
+        "SlowAguiAgent",
+        "PlaintextAguiAgent",
+        "ErrorStreamAguiAgent",
+        "ApprovalAguiAgent",
+        "MaxPersistedAguiAgent",
+        "SaveMessagesAguiAgent"
+      ]
+    }
+  ]
+}

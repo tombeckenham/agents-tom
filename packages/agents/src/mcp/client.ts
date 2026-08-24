@@ -17,7 +17,6 @@ import type {
 } from "@modelcontextprotocol/client";
 export type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import { type RetryOptions, tryN } from "../retries";
-import type { ToolSet } from "ai";
 import { toolDefinition, type ServerTool } from "@tanstack/ai";
 import { z } from "zod";
 import { nanoid } from "nanoid";

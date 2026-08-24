@@ -55,8 +55,8 @@ No code is changed in this phase.
   `stream-accumulator`, `broadcast-state`, plus `index.ts` in `ai-chat`.
 - **A new `applyEventToSnapshot(message, event)` analogue replaces
   `applyChunkToParts`.** The reducer state shape changes from
-  `MessagePart[]` (Vercel) to `Message` (AG-UI) — we accumulate an *array of
-  Messages* (because TOOL_CALL_RESULT produces a separate `ToolMessage` rather
+  `MessagePart[]` (Vercel) to `Message` (AG-UI) — we accumulate an _array of
+  Messages_ (because TOOL_CALL_RESULT produces a separate `ToolMessage` rather
   than a part on the assistant message). Sketch in §6.
 
 ---
@@ -65,12 +65,12 @@ No code is changed in this phase.
 
 ### Packages and versions (npm, current as of writing)
 
-| Package | Version | Purpose | Runtime deps |
-|---|---|---|---|
-| `@ag-ui/core` | `0.0.53` | Event / Message types, Zod schemas, `EventType` enum, `Message` union | `zod ^3.22.4` |
-| `@ag-ui/encoder` | `0.0.53` | `EventEncoder` — encodes events as SSE `data:` lines or protobuf binary based on `Accept` header | `@ag-ui/core`, `@ag-ui/proto` |
-| `@ag-ui/client` | `0.0.53` | RxJS-based client transport, agent state, message reconstruction | `rxjs 7.8.1`, `fast-json-patch`, `untruncate-json`, `uuid`, `@ag-ui/core`, `@ag-ui/encoder`, `@ag-ui/proto` |
-| `@ag-ui/proto` | `0.0.53` | protobuf wire format | (heavy; avoid) |
+| Package          | Version  | Purpose                                                                                          | Runtime deps                                                                                                |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `@ag-ui/core`    | `0.0.53` | Event / Message types, Zod schemas, `EventType` enum, `Message` union                            | `zod ^3.22.4`                                                                                               |
+| `@ag-ui/encoder` | `0.0.53` | `EventEncoder` — encodes events as SSE `data:` lines or protobuf binary based on `Accept` header | `@ag-ui/core`, `@ag-ui/proto`                                                                               |
+| `@ag-ui/client`  | `0.0.53` | RxJS-based client transport, agent state, message reconstruction                                 | `rxjs 7.8.1`, `fast-json-patch`, `untruncate-json`, `uuid`, `@ag-ui/core`, `@ag-ui/encoder`, `@ag-ui/proto` |
+| `@ag-ui/proto`   | `0.0.53` | protobuf wire format                                                                             | (heavy; avoid)                                                                                              |
 
 `core` is the only one we'd consider for the `agents` package. `client` pulls
 RxJS which is a no-go in Workers without a fight. `encoder` is small but its
@@ -97,69 +97,69 @@ All events extend:
 
 ```ts
 type BaseEvent = {
-  type: EventType;            // discriminator
-  timestamp?: number;         // ms epoch, optional
-  rawEvent?: unknown;         // pre-transform original, optional
+  type: EventType; // discriminator
+  timestamp?: number; // ms epoch, optional
+  rawEvent?: unknown; // pre-transform original, optional
 };
 ```
 
 **Lifecycle**
 
-| Event | Required fields | Optional |
-|---|---|---|
-| `RUN_STARTED` | `threadId: string`, `runId: string` | `parentRunId?`, `input?: RunAgentInput` |
-| `RUN_FINISHED` | `threadId`, `runId` | `result?: unknown` |
-| `RUN_ERROR` | `message: string` | `code?: string`, *(in some SDKs `runId?`)* |
-| `STEP_STARTED` | `stepName: string` | — |
-| `STEP_FINISHED` | `stepName: string` | — |
+| Event           | Required fields                     | Optional                                   |
+| --------------- | ----------------------------------- | ------------------------------------------ |
+| `RUN_STARTED`   | `threadId: string`, `runId: string` | `parentRunId?`, `input?: RunAgentInput`    |
+| `RUN_FINISHED`  | `threadId`, `runId`                 | `result?: unknown`                         |
+| `RUN_ERROR`     | `message: string`                   | `code?: string`, _(in some SDKs `runId?`)_ |
+| `STEP_STARTED`  | `stepName: string`                  | —                                          |
+| `STEP_FINISHED` | `stepName: string`                  | —                                          |
 
 **Text messages**
 
-| Event | Required | Optional |
-|---|---|---|
-| `TEXT_MESSAGE_START` | `messageId: string`, `role: "assistant"` | — |
-| `TEXT_MESSAGE_CONTENT` | `messageId`, `delta: string` *(non-empty)* | — |
-| `TEXT_MESSAGE_END` | `messageId` | — |
+| Event                  | Required                                   | Optional |
+| ---------------------- | ------------------------------------------ | -------- |
+| `TEXT_MESSAGE_START`   | `messageId: string`, `role: "assistant"`   | —        |
+| `TEXT_MESSAGE_CONTENT` | `messageId`, `delta: string` _(non-empty)_ | —        |
+| `TEXT_MESSAGE_END`     | `messageId`                                | —        |
 
 **Tool calls** (note: AG-UI splits the tool call lifecycle across the assistant
-message *and* a separate `TOOL_CALL_RESULT` event whose persisted form is a
+message _and_ a separate `TOOL_CALL_RESULT` event whose persisted form is a
 `ToolMessage`)
 
-| Event | Required | Optional |
-|---|---|---|
-| `TOOL_CALL_START` | `toolCallId: string`, `toolCallName: string` | `parentMessageId?: string` |
-| `TOOL_CALL_ARGS` | `toolCallId`, `delta: string` *(JSON fragment to append)* | — |
-| `TOOL_CALL_END` | `toolCallId` | — |
-| `TOOL_CALL_RESULT` | `messageId: string`, `toolCallId`, `content: string` | `role?: "tool"` |
+| Event              | Required                                                  | Optional                   |
+| ------------------ | --------------------------------------------------------- | -------------------------- |
+| `TOOL_CALL_START`  | `toolCallId: string`, `toolCallName: string`              | `parentMessageId?: string` |
+| `TOOL_CALL_ARGS`   | `toolCallId`, `delta: string` _(JSON fragment to append)_ | —                          |
+| `TOOL_CALL_END`    | `toolCallId`                                              | —                          |
+| `TOOL_CALL_RESULT` | `messageId: string`, `toolCallId`, `content: string`      | `role?: "tool"`            |
 
 **State**
 
-| Event | Required | Optional |
-|---|---|---|
-| `STATE_SNAPSHOT` | `snapshot: unknown` (whole state) | — |
-| `STATE_DELTA` | `delta: JSONPatchOp[]` (RFC 6902) | — |
-| `MESSAGES_SNAPSHOT` | `messages: Message[]` | — |
-| `ACTIVITY_SNAPSHOT` | `activity: unknown` | — *(under-specified)* |
-| `ACTIVITY_DELTA` | `delta: JSONPatchOp[]` | — *(under-specified)* |
+| Event               | Required                          | Optional              |
+| ------------------- | --------------------------------- | --------------------- |
+| `STATE_SNAPSHOT`    | `snapshot: unknown` (whole state) | —                     |
+| `STATE_DELTA`       | `delta: JSONPatchOp[]` (RFC 6902) | —                     |
+| `MESSAGES_SNAPSHOT` | `messages: Message[]`             | —                     |
+| `ACTIVITY_SNAPSHOT` | `activity: unknown`               | — _(under-specified)_ |
+| `ACTIVITY_DELTA`    | `delta: JSONPatchOp[]`            | — _(under-specified)_ |
 
 **Special**
 
-| Event | Required | Optional |
-|---|---|---|
-| `RAW` | (provider-specific payload — under-specified in v0.0.53 docs) | — |
-| `CUSTOM` | `name: string`, `value: unknown` | — |
+| Event    | Required                                                      | Optional |
+| -------- | ------------------------------------------------------------- | -------- |
+| `RAW`    | (provider-specific payload — under-specified in v0.0.53 docs) | —        |
+| `CUSTOM` | `name: string`, `value: unknown`                              | —        |
 
 **Reasoning** (block-level vs. message-level)
 
-| Event | Required | Optional |
-|---|---|---|
-| `REASONING_START` | `messageId: string` | — |
-| `REASONING_END` | `messageId: string` | — |
-| `REASONING_MESSAGE_START` | `messageId: string`, `role: "reasoning"` | — |
-| `REASONING_MESSAGE_CONTENT` | `messageId`, `delta: string` | — |
-| `REASONING_MESSAGE_END` | `messageId` | — |
-| `REASONING_MESSAGE_CHUNK` | `delta` *(first chunk also carries `messageId`)* | — *(client expands to START/CONTENT/END)* |
-| `REASONING_ENCRYPTED_VALUE` | `subtype: "message" \| "tool-call"`, `entityId: string`, `encryptedValue: string` | — |
+| Event                       | Required                                                                          | Optional                                  |
+| --------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------- |
+| `REASONING_START`           | `messageId: string`                                                               | —                                         |
+| `REASONING_END`             | `messageId: string`                                                               | —                                         |
+| `REASONING_MESSAGE_START`   | `messageId: string`, `role: "reasoning"`                                          | —                                         |
+| `REASONING_MESSAGE_CONTENT` | `messageId`, `delta: string`                                                      | —                                         |
+| `REASONING_MESSAGE_END`     | `messageId`                                                                       | —                                         |
+| `REASONING_MESSAGE_CHUNK`   | `delta` _(first chunk also carries `messageId`)_                                  | — _(client expands to START/CONTENT/END)_ |
+| `REASONING_ENCRYPTED_VALUE` | `subtype: "message" \| "tool-call"`, `entityId: string`, `encryptedValue: string` | —                                         |
 
 ### Canonical `Message` shape
 
@@ -167,16 +167,31 @@ message *and* a separate `TOOL_CALL_RESULT` event whose persisted form is a
 
 ```ts
 type Role =
-  | "developer" | "system" | "assistant" | "user"
-  | "tool" | "activity" | "reasoning";
+  | "developer"
+  | "system"
+  | "assistant"
+  | "user"
+  | "tool"
+  | "activity"
+  | "reasoning";
 
-type DeveloperMessage = { id: string; role: "developer"; content: string; name?: string };
-type SystemMessage    = { id: string; role: "system";    content: string; name?: string };
+type DeveloperMessage = {
+  id: string;
+  role: "developer";
+  content: string;
+  name?: string;
+};
+type SystemMessage = {
+  id: string;
+  role: "system";
+  content: string;
+  name?: string;
+};
 
 type AssistantMessage = {
   id: string;
   role: "assistant";
-  content?: string;             // optional if tool calls only
+  content?: string; // optional if tool calls only
   name?: string;
   toolCalls?: ToolCall[];
   // (encryptedContent: string is described in concept docs; absent from
@@ -186,14 +201,14 @@ type AssistantMessage = {
 type UserMessage = {
   id: string;
   role: "user";
-  content: string | InputContent[];   // multimodal
+  content: string | InputContent[]; // multimodal
   name?: string;
 };
 
 type ToolMessage = {
   id: string;
   role: "tool";
-  content: string;              // tool result, typically JSON-encoded
+  content: string; // tool result, typically JSON-encoded
   toolCallId: string;
   error?: string;
   encryptedValue?: string;
@@ -206,7 +221,7 @@ type ReasoningMessage = {
   // (encrypted chain-of-thought attached separately via REASONING_ENCRYPTED_VALUE)
 };
 
-type ActivityMessage = { id: string; role: "activity"; /* under-specified */ };
+type ActivityMessage = { id: string; role: "activity" /* under-specified */ };
 
 type ToolCall = {
   id: string;
@@ -216,14 +231,30 @@ type ToolCall = {
 
 type InputContent =
   | { type: "text"; text: string }
-  | { type: "image";    source: InputContentSource; metadata?: Record<string, unknown> }
-  | { type: "audio";    source: InputContentSource; metadata?: Record<string, unknown> }
-  | { type: "video";    source: InputContentSource; metadata?: Record<string, unknown> }
-  | { type: "document"; source: InputContentSource; metadata?: Record<string, unknown> };
+  | {
+      type: "image";
+      source: InputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "audio";
+      source: InputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "video";
+      source: InputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "document";
+      source: InputContentSource;
+      metadata?: Record<string, unknown>;
+    };
 
 type InputContentSource =
-  | { type: "data"; value: string; mimeType: string }   // base64 or similar
-  | { type: "url";  value: string; mimeType?: string };
+  | { type: "data"; value: string; mimeType: string } // base64 or similar
+  | { type: "url"; value: string; mimeType?: string };
 ```
 
 ### SSE / wire format
@@ -244,8 +275,8 @@ type RunAgentInput = {
   parentRunId?: string;
   state: unknown;
   messages: Message[];
-  tools: Tool[];                // { name, description, parameters: JSONSchema }
-  context: Context[];           // [{ description: string, value: string }]
+  tools: Tool[]; // { name, description, parameters: JSONSchema }
+  context: Context[]; // [{ description: string, value: string }]
   forwardedProps: unknown;
 };
 ```
@@ -267,11 +298,11 @@ There is no separate discovery endpoint — capabilities are passed per-request.
 
 ## Vendor vs depend recommendation: **hybrid**
 
-| Option | Pros | Cons |
-|---|---|---|
-| A. Depend on `@ag-ui/core` from `packages/agents` | Single source of truth, free spec updates | Pulls Zod (~50KB min) into every Workers bundle; couples our public types to a pre-1.0 SDK; semver risk; runtime validation cost on every event |
-| B. Vendor structural types into `agents/chat/agui-types.ts` | Zero runtime cost; Workers-friendly; insulated from breaking 0.0.x changes; we own the types we expose publicly | Manual sync when AG-UI adds events; no built-in validators |
-| **C. Hybrid (recommended)** | `agents` core stays dependency-free; adapters that *need* runtime validation or the encoder import `@ag-ui/core`/`@ag-ui/encoder` as deps; users picking an adapter accept its deps | Two declarations of the same type surface (ours and `@ag-ui/core`'s) — must be structurally compatible. Mitigated by a one-shot type-equality test in CI. |
+| Option                                                      | Pros                                                                                                                                                                                | Cons                                                                                                                                                      |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Depend on `@ag-ui/core` from `packages/agents`           | Single source of truth, free spec updates                                                                                                                                           | Pulls Zod (~50KB min) into every Workers bundle; couples our public types to a pre-1.0 SDK; semver risk; runtime validation cost on every event           |
+| B. Vendor structural types into `agents/chat/agui-types.ts` | Zero runtime cost; Workers-friendly; insulated from breaking 0.0.x changes; we own the types we expose publicly                                                                     | Manual sync when AG-UI adds events; no built-in validators                                                                                                |
+| **C. Hybrid (recommended)**                                 | `agents` core stays dependency-free; adapters that _need_ runtime validation or the encoder import `@ag-ui/core`/`@ag-ui/encoder` as deps; users picking an adapter accept its deps | Two declarations of the same type surface (ours and `@ag-ui/core`'s) — must be structurally compatible. Mitigated by a one-shot type-equality test in CI. |
 
 **Recommendation: C.** Specifically:
 
@@ -302,16 +333,32 @@ chat agent. The encoder is also trivially small to reproduce — the format is
 
 // ============= Core enum (mirrors @ag-ui/core EventType) =============
 export type AGUIEventType =
-  | "TEXT_MESSAGE_START" | "TEXT_MESSAGE_CONTENT" | "TEXT_MESSAGE_END"
-  | "TOOL_CALL_START"    | "TOOL_CALL_ARGS"      | "TOOL_CALL_END" | "TOOL_CALL_RESULT"
-  | "STATE_SNAPSHOT"     | "STATE_DELTA"         | "MESSAGES_SNAPSHOT"
-  | "ACTIVITY_SNAPSHOT"  | "ACTIVITY_DELTA"
-  | "RAW" | "CUSTOM"
-  | "RUN_STARTED"  | "RUN_FINISHED" | "RUN_ERROR"
-  | "STEP_STARTED" | "STEP_FINISHED"
-  | "REASONING_START" | "REASONING_END"
-  | "REASONING_MESSAGE_START" | "REASONING_MESSAGE_CONTENT" | "REASONING_MESSAGE_END"
-  | "REASONING_MESSAGE_CHUNK" | "REASONING_ENCRYPTED_VALUE";
+  | "TEXT_MESSAGE_START"
+  | "TEXT_MESSAGE_CONTENT"
+  | "TEXT_MESSAGE_END"
+  | "TOOL_CALL_START"
+  | "TOOL_CALL_ARGS"
+  | "TOOL_CALL_END"
+  | "TOOL_CALL_RESULT"
+  | "STATE_SNAPSHOT"
+  | "STATE_DELTA"
+  | "MESSAGES_SNAPSHOT"
+  | "ACTIVITY_SNAPSHOT"
+  | "ACTIVITY_DELTA"
+  | "RAW"
+  | "CUSTOM"
+  | "RUN_STARTED"
+  | "RUN_FINISHED"
+  | "RUN_ERROR"
+  | "STEP_STARTED"
+  | "STEP_FINISHED"
+  | "REASONING_START"
+  | "REASONING_END"
+  | "REASONING_MESSAGE_START"
+  | "REASONING_MESSAGE_CONTENT"
+  | "REASONING_MESSAGE_END"
+  | "REASONING_MESSAGE_CHUNK"
+  | "REASONING_ENCRYPTED_VALUE";
 
 export type BaseAGUIEvent = {
   type: AGUIEventType;
@@ -321,8 +368,13 @@ export type BaseAGUIEvent = {
 
 // ============= Message union =============
 export type AGUIRole =
-  | "developer" | "system" | "assistant" | "user"
-  | "tool" | "activity" | "reasoning";
+  | "developer"
+  | "system"
+  | "assistant"
+  | "user"
+  | "tool"
+  | "activity"
+  | "reasoning";
 
 export type AGUIToolCall = {
   id: string;
@@ -336,13 +388,39 @@ export type AGUIInputContentSource =
 
 export type AGUIInputContent =
   | { type: "text"; text: string }
-  | { type: "image";    source: AGUIInputContentSource; metadata?: Record<string, unknown> }
-  | { type: "audio";    source: AGUIInputContentSource; metadata?: Record<string, unknown> }
-  | { type: "video";    source: AGUIInputContentSource; metadata?: Record<string, unknown> }
-  | { type: "document"; source: AGUIInputContentSource; metadata?: Record<string, unknown> };
+  | {
+      type: "image";
+      source: AGUIInputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "audio";
+      source: AGUIInputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "video";
+      source: AGUIInputContentSource;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: "document";
+      source: AGUIInputContentSource;
+      metadata?: Record<string, unknown>;
+    };
 
-export type AGUIDeveloperMessage = { id: string; role: "developer"; content: string; name?: string };
-export type AGUISystemMessage    = { id: string; role: "system";    content: string; name?: string };
+export type AGUIDeveloperMessage = {
+  id: string;
+  role: "developer";
+  content: string;
+  name?: string;
+};
+export type AGUISystemMessage = {
+  id: string;
+  role: "system";
+  content: string;
+  name?: string;
+};
 export type AGUIAssistantMessage = {
   id: string;
   role: "assistant";
@@ -372,7 +450,7 @@ export type AGUIReasoningMessage = {
 export type AGUIActivityMessage = {
   id: string;
   role: "activity";
-  content?: unknown;        // spec under-specified; keep open
+  content?: unknown; // spec under-specified; keep open
 };
 
 export type AGUIMessage =
@@ -385,37 +463,132 @@ export type AGUIMessage =
   | AGUIActivityMessage;
 
 // ============= Event variants =============
-export type AGUIRunStartedEvent  = BaseAGUIEvent & { type: "RUN_STARTED";  threadId: string; runId: string; parentRunId?: string; input?: unknown };
-export type AGUIRunFinishedEvent = BaseAGUIEvent & { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown };
-export type AGUIRunErrorEvent    = BaseAGUIEvent & { type: "RUN_ERROR";    message: string; code?: string; runId?: string };
+export type AGUIRunStartedEvent = BaseAGUIEvent & {
+  type: "RUN_STARTED";
+  threadId: string;
+  runId: string;
+  parentRunId?: string;
+  input?: unknown;
+};
+export type AGUIRunFinishedEvent = BaseAGUIEvent & {
+  type: "RUN_FINISHED";
+  threadId: string;
+  runId: string;
+  result?: unknown;
+};
+export type AGUIRunErrorEvent = BaseAGUIEvent & {
+  type: "RUN_ERROR";
+  message: string;
+  code?: string;
+  runId?: string;
+};
 
-export type AGUIStepStartedEvent  = BaseAGUIEvent & { type: "STEP_STARTED";  stepName: string };
-export type AGUIStepFinishedEvent = BaseAGUIEvent & { type: "STEP_FINISHED"; stepName: string };
+export type AGUIStepStartedEvent = BaseAGUIEvent & {
+  type: "STEP_STARTED";
+  stepName: string;
+};
+export type AGUIStepFinishedEvent = BaseAGUIEvent & {
+  type: "STEP_FINISHED";
+  stepName: string;
+};
 
-export type AGUITextMessageStartEvent   = BaseAGUIEvent & { type: "TEXT_MESSAGE_START";   messageId: string; role: "assistant" };
-export type AGUITextMessageContentEvent = BaseAGUIEvent & { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string };
-export type AGUITextMessageEndEvent     = BaseAGUIEvent & { type: "TEXT_MESSAGE_END";     messageId: string };
+export type AGUITextMessageStartEvent = BaseAGUIEvent & {
+  type: "TEXT_MESSAGE_START";
+  messageId: string;
+  role: "assistant";
+};
+export type AGUITextMessageContentEvent = BaseAGUIEvent & {
+  type: "TEXT_MESSAGE_CONTENT";
+  messageId: string;
+  delta: string;
+};
+export type AGUITextMessageEndEvent = BaseAGUIEvent & {
+  type: "TEXT_MESSAGE_END";
+  messageId: string;
+};
 
-export type AGUIToolCallStartEvent  = BaseAGUIEvent & { type: "TOOL_CALL_START";  toolCallId: string; toolCallName: string; parentMessageId?: string };
-export type AGUIToolCallArgsEvent   = BaseAGUIEvent & { type: "TOOL_CALL_ARGS";   toolCallId: string; delta: string };
-export type AGUIToolCallEndEvent    = BaseAGUIEvent & { type: "TOOL_CALL_END";    toolCallId: string };
-export type AGUIToolCallResultEvent = BaseAGUIEvent & { type: "TOOL_CALL_RESULT"; messageId: string; toolCallId: string; content: string; role?: "tool" };
+export type AGUIToolCallStartEvent = BaseAGUIEvent & {
+  type: "TOOL_CALL_START";
+  toolCallId: string;
+  toolCallName: string;
+  parentMessageId?: string;
+};
+export type AGUIToolCallArgsEvent = BaseAGUIEvent & {
+  type: "TOOL_CALL_ARGS";
+  toolCallId: string;
+  delta: string;
+};
+export type AGUIToolCallEndEvent = BaseAGUIEvent & {
+  type: "TOOL_CALL_END";
+  toolCallId: string;
+};
+export type AGUIToolCallResultEvent = BaseAGUIEvent & {
+  type: "TOOL_CALL_RESULT";
+  messageId: string;
+  toolCallId: string;
+  content: string;
+  role?: "tool";
+};
 
-export type AGUIStateSnapshotEvent    = BaseAGUIEvent & { type: "STATE_SNAPSHOT";    snapshot: unknown };
-export type AGUIStateDeltaEvent       = BaseAGUIEvent & { type: "STATE_DELTA";       delta: JSONPatchOp[] };
-export type AGUIMessagesSnapshotEvent = BaseAGUIEvent & { type: "MESSAGES_SNAPSHOT"; messages: AGUIMessage[] };
-export type AGUIActivitySnapshotEvent = BaseAGUIEvent & { type: "ACTIVITY_SNAPSHOT"; activity: unknown };
-export type AGUIActivityDeltaEvent    = BaseAGUIEvent & { type: "ACTIVITY_DELTA";    delta: JSONPatchOp[] };
+export type AGUIStateSnapshotEvent = BaseAGUIEvent & {
+  type: "STATE_SNAPSHOT";
+  snapshot: unknown;
+};
+export type AGUIStateDeltaEvent = BaseAGUIEvent & {
+  type: "STATE_DELTA";
+  delta: JSONPatchOp[];
+};
+export type AGUIMessagesSnapshotEvent = BaseAGUIEvent & {
+  type: "MESSAGES_SNAPSHOT";
+  messages: AGUIMessage[];
+};
+export type AGUIActivitySnapshotEvent = BaseAGUIEvent & {
+  type: "ACTIVITY_SNAPSHOT";
+  activity: unknown;
+};
+export type AGUIActivityDeltaEvent = BaseAGUIEvent & {
+  type: "ACTIVITY_DELTA";
+  delta: JSONPatchOp[];
+};
 
-export type AGUIRawEvent    = BaseAGUIEvent & { type: "RAW"; source?: string; event?: unknown };
-export type AGUICustomEvent = BaseAGUIEvent & { type: "CUSTOM"; name: string; value: unknown };
+export type AGUIRawEvent = BaseAGUIEvent & {
+  type: "RAW";
+  source?: string;
+  event?: unknown;
+};
+export type AGUICustomEvent = BaseAGUIEvent & {
+  type: "CUSTOM";
+  name: string;
+  value: unknown;
+};
 
-export type AGUIReasoningStartEvent          = BaseAGUIEvent & { type: "REASONING_START"; messageId: string };
-export type AGUIReasoningEndEvent            = BaseAGUIEvent & { type: "REASONING_END"; messageId: string };
-export type AGUIReasoningMessageStartEvent   = BaseAGUIEvent & { type: "REASONING_MESSAGE_START";   messageId: string; role: "reasoning" };
-export type AGUIReasoningMessageContentEvent = BaseAGUIEvent & { type: "REASONING_MESSAGE_CONTENT"; messageId: string; delta: string };
-export type AGUIReasoningMessageEndEvent     = BaseAGUIEvent & { type: "REASONING_MESSAGE_END";     messageId: string };
-export type AGUIReasoningMessageChunkEvent   = BaseAGUIEvent & { type: "REASONING_MESSAGE_CHUNK";   messageId?: string; delta?: string };
+export type AGUIReasoningStartEvent = BaseAGUIEvent & {
+  type: "REASONING_START";
+  messageId: string;
+};
+export type AGUIReasoningEndEvent = BaseAGUIEvent & {
+  type: "REASONING_END";
+  messageId: string;
+};
+export type AGUIReasoningMessageStartEvent = BaseAGUIEvent & {
+  type: "REASONING_MESSAGE_START";
+  messageId: string;
+  role: "reasoning";
+};
+export type AGUIReasoningMessageContentEvent = BaseAGUIEvent & {
+  type: "REASONING_MESSAGE_CONTENT";
+  messageId: string;
+  delta: string;
+};
+export type AGUIReasoningMessageEndEvent = BaseAGUIEvent & {
+  type: "REASONING_MESSAGE_END";
+  messageId: string;
+};
+export type AGUIReasoningMessageChunkEvent = BaseAGUIEvent & {
+  type: "REASONING_MESSAGE_CHUNK";
+  messageId?: string;
+  delta?: string;
+};
 export type AGUIReasoningEncryptedValueEvent = BaseAGUIEvent & {
   type: "REASONING_ENCRYPTED_VALUE";
   subtype: "tool-call" | "message";
@@ -432,16 +605,32 @@ export type JSONPatchOp =
   | { op: "test"; path: string; value: unknown };
 
 export type AGUIEvent =
-  | AGUIRunStartedEvent | AGUIRunFinishedEvent | AGUIRunErrorEvent
-  | AGUIStepStartedEvent | AGUIStepFinishedEvent
-  | AGUITextMessageStartEvent | AGUITextMessageContentEvent | AGUITextMessageEndEvent
-  | AGUIToolCallStartEvent | AGUIToolCallArgsEvent | AGUIToolCallEndEvent | AGUIToolCallResultEvent
-  | AGUIStateSnapshotEvent | AGUIStateDeltaEvent | AGUIMessagesSnapshotEvent
-  | AGUIActivitySnapshotEvent | AGUIActivityDeltaEvent
-  | AGUIRawEvent | AGUICustomEvent
-  | AGUIReasoningStartEvent | AGUIReasoningEndEvent
-  | AGUIReasoningMessageStartEvent | AGUIReasoningMessageContentEvent | AGUIReasoningMessageEndEvent
-  | AGUIReasoningMessageChunkEvent | AGUIReasoningEncryptedValueEvent;
+  | AGUIRunStartedEvent
+  | AGUIRunFinishedEvent
+  | AGUIRunErrorEvent
+  | AGUIStepStartedEvent
+  | AGUIStepFinishedEvent
+  | AGUITextMessageStartEvent
+  | AGUITextMessageContentEvent
+  | AGUITextMessageEndEvent
+  | AGUIToolCallStartEvent
+  | AGUIToolCallArgsEvent
+  | AGUIToolCallEndEvent
+  | AGUIToolCallResultEvent
+  | AGUIStateSnapshotEvent
+  | AGUIStateDeltaEvent
+  | AGUIMessagesSnapshotEvent
+  | AGUIActivitySnapshotEvent
+  | AGUIActivityDeltaEvent
+  | AGUIRawEvent
+  | AGUICustomEvent
+  | AGUIReasoningStartEvent
+  | AGUIReasoningEndEvent
+  | AGUIReasoningMessageStartEvent
+  | AGUIReasoningMessageContentEvent
+  | AGUIReasoningMessageEndEvent
+  | AGUIReasoningMessageChunkEvent
+  | AGUIReasoningEncryptedValueEvent;
 
 // ============= Cloudflare extensions (CUSTOM event payloads) =============
 // Namespace: "cf.agents.*"
@@ -470,23 +659,24 @@ export type CFToolApprovalDecisionValue = {
 
 #### AG-UI → UIMessage (load-time / Vercel-adapter direction)
 
-The persisted AG-UI `Message` list contains one `AssistantMessage` *plus* zero
+The persisted AG-UI `Message` list contains one `AssistantMessage` _plus_ zero
 or more `ToolMessage`s per assistant turn. A `UIMessage` collapses these into
 a single message with a heterogeneous `parts` array. The projection has to
 **fold** consecutive `assistant` + `tool` messages.
 
-| AG-UI input | UIMessage output | Notes / loss |
-|---|---|---|
-| `UserMessage{content:string}` | `{role:"user", parts:[{type:"text", text}]}` | Lossless |
-| `UserMessage{content:InputContent[]}` | `{role:"user", parts:[...mapped]}` where `text`→`text` part, `image`→`file` part with `mediaType`+`url`, `audio`/`video`/`document` likewise | `data:` source → `file` with data URL; `metadata` field has no UIMessage slot — drop or attach to `providerMetadata` |
-| `SystemMessage` | `{role:"system", parts:[{type:"text", text}]}` | Lossless |
-| `DeveloperMessage` | `{role:"system", parts:[{type:"text", text}]}` | UIMessage has no `developer` role; collapse to `system` with `metadata.aguiRole="developer"` to round-trip |
-| `AssistantMessage{content,toolCalls?}` (folded with following ToolMessages) | `{role:"assistant", parts:[{type:"text",text:content,state:"done"}, ...{type:`tool-${name}`,toolCallId,toolName,state,input,output}]}` | Tool part `state`: `output-available` if matching `ToolMessage` exists, else `input-available`. `arguments` (JSON string in AG-UI) → `input` (parsed object) |
-| `ToolMessage` | folded into the preceding assistant's `tool-*` part as `state:"output-available", output: JSON.parse(content)` | If a `ToolMessage` arrives without a preceding assistant turn, project as a standalone tool-only assistant message with one part. The AG-UI shape allows this; UIMessage doesn't really. |
-| `ReasoningMessage{content}` | append `{type:"reasoning", text:content, state:"done"}` to the next assistant turn's parts | If no following assistant, attach to a new assistant-shaped UIMessage (lossy: standalone reasoning rendered as assistant) |
-| `ActivityMessage` | `{type:"data-cf.activity", data:{...}}` part on next assistant | Lossy (no UIMessage equivalent) |
+| AG-UI input                                                                 | UIMessage output                                                                                                                             | Notes / loss                                                                                                                                                                             |
+| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UserMessage{content:string}`                                               | `{role:"user", parts:[{type:"text", text}]}`                                                                                                 | Lossless                                                                                                                                                                                 |
+| `UserMessage{content:InputContent[]}`                                       | `{role:"user", parts:[...mapped]}` where `text`→`text` part, `image`→`file` part with `mediaType`+`url`, `audio`/`video`/`document` likewise | `data:` source → `file` with data URL; `metadata` field has no UIMessage slot — drop or attach to `providerMetadata`                                                                     |
+| `SystemMessage`                                                             | `{role:"system", parts:[{type:"text", text}]}`                                                                                               | Lossless                                                                                                                                                                                 |
+| `DeveloperMessage`                                                          | `{role:"system", parts:[{type:"text", text}]}`                                                                                               | UIMessage has no `developer` role; collapse to `system` with `metadata.aguiRole="developer"` to round-trip                                                                               |
+| `AssistantMessage{content,toolCalls?}` (folded with following ToolMessages) | `{role:"assistant", parts:[{type:"text",text:content,state:"done"}, ...{type:`tool-${name}`,toolCallId,toolName,state,input,output}]}`       | Tool part `state`: `output-available` if matching `ToolMessage` exists, else `input-available`. `arguments` (JSON string in AG-UI) → `input` (parsed object)                             |
+| `ToolMessage`                                                               | folded into the preceding assistant's `tool-*` part as `state:"output-available", output: JSON.parse(content)`                               | If a `ToolMessage` arrives without a preceding assistant turn, project as a standalone tool-only assistant message with one part. The AG-UI shape allows this; UIMessage doesn't really. |
+| `ReasoningMessage{content}`                                                 | append `{type:"reasoning", text:content, state:"done"}` to the next assistant turn's parts                                                   | If no following assistant, attach to a new assistant-shaped UIMessage (lossy: standalone reasoning rendered as assistant)                                                                |
+| `ActivityMessage`                                                           | `{type:"data-cf.activity", data:{...}}` part on next assistant                                                                               | Lossy (no UIMessage equivalent)                                                                                                                                                          |
 
 **Loss summary (AG-UI → UIMessage):**
+
 - `developer` role collapses to `system`.
 - `ToolCall.id` is preserved as `toolCallId`; `ToolCall.type` ("function") is
   dropped (UIMessage assumes function).
@@ -498,20 +688,21 @@ a single message with a heterogeneous `parts` array. The projection has to
 
 #### UIMessage → AG-UI (write-time / migration direction)
 
-| UIMessage input | AG-UI output |
-|---|---|
-| `{role:"user", parts}` where parts is one text | `UserMessage{content:string}` |
-| `{role:"user", parts}` with file/text mix | `UserMessage{content: InputContent[]}` (text → `text`, file → `image`/`audio`/`video`/`document` based on `mediaType`) |
-| `{role:"system", parts:[text]}` (with `metadata.aguiRole="developer"`) | `DeveloperMessage` |
-| `{role:"system", parts:[text]}` (otherwise) | `SystemMessage` |
-| `{role:"assistant", parts}` | One `AssistantMessage{content?, toolCalls?}` plus one `ToolMessage` per `tool-*` part in terminal state. `content` = concat all `text` parts' `text`. Each `tool-*` part in `output-available` → `ToolMessage{content: JSON.stringify(output), toolCallId}`. Tools still in `input-streaming` / `input-available` → only as a `ToolCall` on the assistant (no result message yet) |
-| `reasoning` part on assistant | Separate `ReasoningMessage{content:text}` *before* the assistant in the AG-UI list |
-| `data-*` parts (cf-namespaced) | If `type === "data-cf.activity"` → `ActivityMessage`; otherwise drop or carry as `metadata.dataParts` |
+| UIMessage input                                                        | AG-UI output                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{role:"user", parts}` where parts is one text                         | `UserMessage{content:string}`                                                                                                                                                                                                                                                                                                                                                     |
+| `{role:"user", parts}` with file/text mix                              | `UserMessage{content: InputContent[]}` (text → `text`, file → `image`/`audio`/`video`/`document` based on `mediaType`)                                                                                                                                                                                                                                                            |
+| `{role:"system", parts:[text]}` (with `metadata.aguiRole="developer"`) | `DeveloperMessage`                                                                                                                                                                                                                                                                                                                                                                |
+| `{role:"system", parts:[text]}` (otherwise)                            | `SystemMessage`                                                                                                                                                                                                                                                                                                                                                                   |
+| `{role:"assistant", parts}`                                            | One `AssistantMessage{content?, toolCalls?}` plus one `ToolMessage` per `tool-*` part in terminal state. `content` = concat all `text` parts' `text`. Each `tool-*` part in `output-available` → `ToolMessage{content: JSON.stringify(output), toolCallId}`. Tools still in `input-streaming` / `input-available` → only as a `ToolCall` on the assistant (no result message yet) |
+| `reasoning` part on assistant                                          | Separate `ReasoningMessage{content:text}` _before_ the assistant in the AG-UI list                                                                                                                                                                                                                                                                                                |
+| `data-*` parts (cf-namespaced)                                         | If `type === "data-cf.activity"` → `ActivityMessage`; otherwise drop or carry as `metadata.dataParts`                                                                                                                                                                                                                                                                             |
 
 **Loss summary (UIMessage → AG-UI):**
-- Tool part *intermediate* `state` (`input-streaming`, `approval-requested`,
+
+- Tool part _intermediate_ `state` (`input-streaming`, `approval-requested`,
   `output-denied`, `output-error`) has no representation in the persisted
-  `AGUIMessage`. State lives in the *event stream*; only terminal information
+  `AGUIMessage`. State lives in the _event stream_; only terminal information
   survives in storage. To round-trip an in-flight tool we either persist the
   AG-UI event log alongside the messages (rejected — bloat) or emit a
   CUSTOM `cf.agents.tool_state` event when persisting non-terminal tools.
@@ -526,61 +717,61 @@ a single message with a heterogeneous `parts` array. The projection has to
 
 #### AG-UI Event → UIMessageChunk (Vercel-adapter projection)
 
-| AG-UI event | UIMessageChunk | Lossy? |
-|---|---|---|
-| `RUN_STARTED` | `{type:"start", messageId: <derive from upcoming TEXT_MESSAGE_START>}` | Lossy: `threadId/runId` dropped; messageId arrives later — adapter must buffer |
-| `RUN_FINISHED` | `{type:"finish", finishReason:"stop"}` (or pull from `result`) | Lossy: `runId`, `result.usage` if absent in our shape |
-| `RUN_ERROR` | `{type:"error", errorText: message}` *(if Vercel exposes; otherwise terminate stream with an error)* | Lossy: `code`, `runId` |
-| `STEP_STARTED` | `{type:"start-step"}` | Lossy: `stepName` |
-| `STEP_FINISHED` | (no equivalent) | **Drop** |
-| `TEXT_MESSAGE_START` | `{type:"text-start", id:messageId}` *(Vercel uses chunk `id` for the text part; messageId may be set via `start` chunk)* | Need to also emit a leading `{type:"start", messageId}` if not already |
-| `TEXT_MESSAGE_CONTENT` | `{type:"text-delta", delta}` | Lossless |
-| `TEXT_MESSAGE_END` | `{type:"text-end"}` | Lossless |
-| `TOOL_CALL_START` | `{type:"tool-input-start", toolCallId, toolName: toolCallName}` | Lossless |
-| `TOOL_CALL_ARGS` | `{type:"tool-input-delta", toolCallId, inputTextDelta: delta}` | Lossless (Vercel buffers JSON fragments the same way) |
-| `TOOL_CALL_END` | `{type:"tool-input-available", toolCallId, toolName, input: JSON.parse(buffered args)}` | Adapter must buffer args until END and parse |
-| `TOOL_CALL_RESULT` | `{type:"tool-output-available", toolCallId, output: JSON.parse(content)}` | Lossy on parse failure → emit `tool-output-error` |
-| `STATE_SNAPSHOT` | `{type:"data-cf.state", id:"snapshot", data:snapshot}` | Lossy (data-part repurposed) |
-| `STATE_DELTA` | `{type:"data-cf.state-delta", data:delta}` *(transient)* | Lossy |
-| `MESSAGES_SNAPSHOT` | (no UIMessageChunk equivalent — replay primitive) | **Drop or expand to chunks** |
-| `ACTIVITY_SNAPSHOT / ACTIVITY_DELTA` | `data-cf.activity` parts | Lossy |
-| `RAW` | `data-cf.raw` part *(transient)* | Lossy |
-| `CUSTOM` (name = `cf.agents.tool_approval.request`) | `{type:"tool-approval-request", toolCallId, approvalId}` | Lossless |
-| `CUSTOM` (name = `cf.agents.tool_approval.decision`) | `{type:"tool-output-available"}` *if approved* or `{type:"tool-output-denied"}` *if not* | Lossy (`reason` dropped) |
-| `CUSTOM` (other) | `data-${name}` part | Lossy |
-| `REASONING_MESSAGE_START` | `{type:"reasoning-start"}` | Lossless |
-| `REASONING_MESSAGE_CONTENT` | `{type:"reasoning-delta", delta}` | Lossless |
-| `REASONING_MESSAGE_END` | `{type:"reasoning-end"}` | Lossless |
-| `REASONING_MESSAGE_CHUNK` | expand → `reasoning-start` (first) → `reasoning-delta` → ... → `reasoning-end` (on next msgId or stream end) | Lossless after expansion |
-| `REASONING_START / REASONING_END` | block markers; if no UIMessage equivalent, drop | Lossy |
-| `REASONING_ENCRYPTED_VALUE` | attach to last reasoning part's `providerMetadata.aguiEncryptedValue` | Lossy if no carrier |
+| AG-UI event                                          | UIMessageChunk                                                                                                           | Lossy?                                                                         |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| `RUN_STARTED`                                        | `{type:"start", messageId: <derive from upcoming TEXT_MESSAGE_START>}`                                                   | Lossy: `threadId/runId` dropped; messageId arrives later — adapter must buffer |
+| `RUN_FINISHED`                                       | `{type:"finish", finishReason:"stop"}` (or pull from `result`)                                                           | Lossy: `runId`, `result.usage` if absent in our shape                          |
+| `RUN_ERROR`                                          | `{type:"error", errorText: message}` _(if Vercel exposes; otherwise terminate stream with an error)_                     | Lossy: `code`, `runId`                                                         |
+| `STEP_STARTED`                                       | `{type:"start-step"}`                                                                                                    | Lossy: `stepName`                                                              |
+| `STEP_FINISHED`                                      | (no equivalent)                                                                                                          | **Drop**                                                                       |
+| `TEXT_MESSAGE_START`                                 | `{type:"text-start", id:messageId}` _(Vercel uses chunk `id` for the text part; messageId may be set via `start` chunk)_ | Need to also emit a leading `{type:"start", messageId}` if not already         |
+| `TEXT_MESSAGE_CONTENT`                               | `{type:"text-delta", delta}`                                                                                             | Lossless                                                                       |
+| `TEXT_MESSAGE_END`                                   | `{type:"text-end"}`                                                                                                      | Lossless                                                                       |
+| `TOOL_CALL_START`                                    | `{type:"tool-input-start", toolCallId, toolName: toolCallName}`                                                          | Lossless                                                                       |
+| `TOOL_CALL_ARGS`                                     | `{type:"tool-input-delta", toolCallId, inputTextDelta: delta}`                                                           | Lossless (Vercel buffers JSON fragments the same way)                          |
+| `TOOL_CALL_END`                                      | `{type:"tool-input-available", toolCallId, toolName, input: JSON.parse(buffered args)}`                                  | Adapter must buffer args until END and parse                                   |
+| `TOOL_CALL_RESULT`                                   | `{type:"tool-output-available", toolCallId, output: JSON.parse(content)}`                                                | Lossy on parse failure → emit `tool-output-error`                              |
+| `STATE_SNAPSHOT`                                     | `{type:"data-cf.state", id:"snapshot", data:snapshot}`                                                                   | Lossy (data-part repurposed)                                                   |
+| `STATE_DELTA`                                        | `{type:"data-cf.state-delta", data:delta}` _(transient)_                                                                 | Lossy                                                                          |
+| `MESSAGES_SNAPSHOT`                                  | (no UIMessageChunk equivalent — replay primitive)                                                                        | **Drop or expand to chunks**                                                   |
+| `ACTIVITY_SNAPSHOT / ACTIVITY_DELTA`                 | `data-cf.activity` parts                                                                                                 | Lossy                                                                          |
+| `RAW`                                                | `data-cf.raw` part _(transient)_                                                                                         | Lossy                                                                          |
+| `CUSTOM` (name = `cf.agents.tool_approval.request`)  | `{type:"tool-approval-request", toolCallId, approvalId}`                                                                 | Lossless                                                                       |
+| `CUSTOM` (name = `cf.agents.tool_approval.decision`) | `{type:"tool-output-available"}` _if approved_ or `{type:"tool-output-denied"}` _if not_                                 | Lossy (`reason` dropped)                                                       |
+| `CUSTOM` (other)                                     | `data-${name}` part                                                                                                      | Lossy                                                                          |
+| `REASONING_MESSAGE_START`                            | `{type:"reasoning-start"}`                                                                                               | Lossless                                                                       |
+| `REASONING_MESSAGE_CONTENT`                          | `{type:"reasoning-delta", delta}`                                                                                        | Lossless                                                                       |
+| `REASONING_MESSAGE_END`                              | `{type:"reasoning-end"}`                                                                                                 | Lossless                                                                       |
+| `REASONING_MESSAGE_CHUNK`                            | expand → `reasoning-start` (first) → `reasoning-delta` → ... → `reasoning-end` (on next msgId or stream end)             | Lossless after expansion                                                       |
+| `REASONING_START / REASONING_END`                    | block markers; if no UIMessage equivalent, drop                                                                          | Lossy                                                                          |
+| `REASONING_ENCRYPTED_VALUE`                          | attach to last reasoning part's `providerMetadata.aguiEncryptedValue`                                                    | Lossy if no carrier                                                            |
 
 #### UIMessageChunk → AG-UI Event (Vercel-adapter ingest, e.g. wrapping `streamText().toUIMessageStream()`)
 
-| UIMessageChunk | AG-UI event(s) | Lossy? |
-|---|---|---|
-| `{type:"start", messageId, messageMetadata}` | `RUN_STARTED{threadId,runId}` + buffer `messageId` | Lossy: `messageMetadata` → no event; carry as `CUSTOM cf.agents.message_metadata` |
-| `{type:"start-step"}` / `step-start` | `STEP_STARTED{stepName:"step"}` | Lossy: stepName synthesized |
-| `{type:"text-start"}` | `TEXT_MESSAGE_START{messageId, role:"assistant"}` | Lossless |
-| `{type:"text-delta", delta}` | `TEXT_MESSAGE_CONTENT{messageId, delta}` | Lossless |
-| `{type:"text-end"}` | `TEXT_MESSAGE_END{messageId}` | Lossless |
-| `{type:"reasoning-start"}` | `REASONING_MESSAGE_START{messageId:rid, role:"reasoning"}` | Lossless |
-| `{type:"reasoning-delta", delta, providerMetadata?}` | `REASONING_MESSAGE_CONTENT{messageId:rid, delta}` (+ optional `REASONING_ENCRYPTED_VALUE` if metadata contains signature) | Lossy: providerMetadata partially captured |
-| `{type:"reasoning-end"}` | `REASONING_MESSAGE_END{messageId:rid}` | Lossless |
-| `{type:"tool-input-start", toolCallId, toolName}` | `TOOL_CALL_START{toolCallId, toolCallName}` | Lossless |
-| `{type:"tool-input-delta", inputTextDelta}` | `TOOL_CALL_ARGS{toolCallId, delta}` | Lossless |
-| `{type:"tool-input-available", input}` | `TOOL_CALL_END{toolCallId}` (args buffer should already match `JSON.stringify(input)`) | Lossy: `input` re-serialization may differ byte-for-byte |
-| `{type:"tool-input-error"}` | `TOOL_CALL_END` + `TOOL_CALL_RESULT{content: JSON.stringify({error}), role:"tool"}` (or `CUSTOM cf.agents.tool_error`) | Lossy |
-| `{type:"tool-output-available", output, preliminary?}` | `TOOL_CALL_RESULT{messageId, toolCallId, content: JSON.stringify(output), role:"tool"}` | Lossy: `preliminary` flag must go via `CUSTOM` |
-| `{type:"tool-output-error", errorText}` | `TOOL_CALL_RESULT{...content: JSON.stringify({error:errorText})}` *or* a `CUSTOM cf.agents.tool_error` | Lossy |
-| `{type:"tool-approval-request", toolCallId, approvalId}` | `CUSTOM{name:"cf.agents.tool_approval.request", value:{toolCallId,approvalId,...}}` | Lossless via extension |
-| `{type:"tool-output-denied"}` | `CUSTOM{name:"cf.agents.tool_approval.decision", value:{approved:false,...}}` | Lossless |
-| `{type:"file", mediaType, url}` | (no AG-UI assistant-file event — embed via `CUSTOM cf.agents.file`) | Lossy |
-| `{type:"source-url"}` / `source-document` | `CUSTOM cf.agents.source` | Lossy |
-| `{type:"data-${name}", data, transient?}` | `CUSTOM{name:"data.${name}", value:data}` or `RAW` | Lossy |
-| `{type:"finish", finishReason, messageMetadata}` | `RUN_FINISHED{threadId,runId,result:{finishReason}}` | Lossy: messageMetadata via CUSTOM |
-| `{type:"message-metadata"}` | `CUSTOM cf.agents.message_metadata` | Lossy |
-| `{type:"error", errorText}` | `RUN_ERROR{message:errorText}` | Lossless (modulo `code`) |
+| UIMessageChunk                                           | AG-UI event(s)                                                                                                            | Lossy?                                                                            |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `{type:"start", messageId, messageMetadata}`             | `RUN_STARTED{threadId,runId}` + buffer `messageId`                                                                        | Lossy: `messageMetadata` → no event; carry as `CUSTOM cf.agents.message_metadata` |
+| `{type:"start-step"}` / `step-start`                     | `STEP_STARTED{stepName:"step"}`                                                                                           | Lossy: stepName synthesized                                                       |
+| `{type:"text-start"}`                                    | `TEXT_MESSAGE_START{messageId, role:"assistant"}`                                                                         | Lossless                                                                          |
+| `{type:"text-delta", delta}`                             | `TEXT_MESSAGE_CONTENT{messageId, delta}`                                                                                  | Lossless                                                                          |
+| `{type:"text-end"}`                                      | `TEXT_MESSAGE_END{messageId}`                                                                                             | Lossless                                                                          |
+| `{type:"reasoning-start"}`                               | `REASONING_MESSAGE_START{messageId:rid, role:"reasoning"}`                                                                | Lossless                                                                          |
+| `{type:"reasoning-delta", delta, providerMetadata?}`     | `REASONING_MESSAGE_CONTENT{messageId:rid, delta}` (+ optional `REASONING_ENCRYPTED_VALUE` if metadata contains signature) | Lossy: providerMetadata partially captured                                        |
+| `{type:"reasoning-end"}`                                 | `REASONING_MESSAGE_END{messageId:rid}`                                                                                    | Lossless                                                                          |
+| `{type:"tool-input-start", toolCallId, toolName}`        | `TOOL_CALL_START{toolCallId, toolCallName}`                                                                               | Lossless                                                                          |
+| `{type:"tool-input-delta", inputTextDelta}`              | `TOOL_CALL_ARGS{toolCallId, delta}`                                                                                       | Lossless                                                                          |
+| `{type:"tool-input-available", input}`                   | `TOOL_CALL_END{toolCallId}` (args buffer should already match `JSON.stringify(input)`)                                    | Lossy: `input` re-serialization may differ byte-for-byte                          |
+| `{type:"tool-input-error"}`                              | `TOOL_CALL_END` + `TOOL_CALL_RESULT{content: JSON.stringify({error}), role:"tool"}` (or `CUSTOM cf.agents.tool_error`)    | Lossy                                                                             |
+| `{type:"tool-output-available", output, preliminary?}`   | `TOOL_CALL_RESULT{messageId, toolCallId, content: JSON.stringify(output), role:"tool"}`                                   | Lossy: `preliminary` flag must go via `CUSTOM`                                    |
+| `{type:"tool-output-error", errorText}`                  | `TOOL_CALL_RESULT{...content: JSON.stringify({error:errorText})}` _or_ a `CUSTOM cf.agents.tool_error`                    | Lossy                                                                             |
+| `{type:"tool-approval-request", toolCallId, approvalId}` | `CUSTOM{name:"cf.agents.tool_approval.request", value:{toolCallId,approvalId,...}}`                                       | Lossless via extension                                                            |
+| `{type:"tool-output-denied"}`                            | `CUSTOM{name:"cf.agents.tool_approval.decision", value:{approved:false,...}}`                                             | Lossless                                                                          |
+| `{type:"file", mediaType, url}`                          | (no AG-UI assistant-file event — embed via `CUSTOM cf.agents.file`)                                                       | Lossy                                                                             |
+| `{type:"source-url"}` / `source-document`                | `CUSTOM cf.agents.source`                                                                                                 | Lossy                                                                             |
+| `{type:"data-${name}", data, transient?}`                | `CUSTOM{name:"data.${name}", value:data}` or `RAW`                                                                        | Lossy                                                                             |
+| `{type:"finish", finishReason, messageMetadata}`         | `RUN_FINISHED{threadId,runId,result:{finishReason}}`                                                                      | Lossy: messageMetadata via CUSTOM                                                 |
+| `{type:"message-metadata"}`                              | `CUSTOM cf.agents.message_metadata`                                                                                       | Lossy                                                                             |
+| `{type:"error", errorText}`                              | `RUN_ERROR{message:errorText}`                                                                                            | Lossless (modulo `code`)                                                          |
 
 ### 3. `applyEventToSnapshot` analogue
 
@@ -601,7 +792,10 @@ export type SnapshotState = {
   // index for in-progress streams
   textByMsgId: Map<string, AGUIAssistantMessage>;
   reasoningByMsgId: Map<string, AGUIReasoningMessage>;
-  toolArgsBuffer: Map<string, { msg: AGUIAssistantMessage; toolName: string; buf: string }>;
+  toolArgsBuffer: Map<
+    string,
+    { msg: AGUIAssistantMessage; toolName: string; buf: string }
+  >;
 };
 
 export function applyEventToSnapshot(
@@ -657,7 +851,7 @@ type CFToolApprovalExpiredEvent = AGUICustomEvent & {
 ```
 
 Persisted state: an `AssistantMessage` whose `ToolCall` is awaiting approval
-carries no special marker (state lives in events). On *replay* we re-emit the
+carries no special marker (state lives in events). On _replay_ we re-emit the
 request event from the resumable-stream chunk log; the snapshot prefix tells
 clients which calls are in `pending-approval` so they can render the modal
 immediately without waiting.
@@ -681,18 +875,18 @@ order. Format-neutral — needs no changes for the protocol swap.
 
 ### Three options for AG-UI
 
-| Strategy | Pros | Cons |
-|---|---|---|
-| A. Replay raw event log (current) | Lossless; clients reconstruct exact same state; minimal change | Bytes-heavy on long runs; client does full reduction; can re-trigger reasoning/tool-args animations clients may not want |
-| B. Snapshot-only replay (`MESSAGES_SNAPSHOT` then live tail) | Compact; clients skip per-delta work | Loses in-flight sub-message state (current tool args buffer, current text delta); clients miss the *visual* "currently typing" affordance; STATE/CUSTOM events lost between snapshot timestamp and reconnect |
-| **C. Hybrid (recommended)** | Compact for the *settled* prefix; preserves live tail; lets clients render approval prompts immediately | Slightly more replay-side logic |
+| Strategy                                                     | Pros                                                                                                    | Cons                                                                                                                                                                                                         |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. Replay raw event log (current)                            | Lossless; clients reconstruct exact same state; minimal change                                          | Bytes-heavy on long runs; client does full reduction; can re-trigger reasoning/tool-args animations clients may not want                                                                                     |
+| B. Snapshot-only replay (`MESSAGES_SNAPSHOT` then live tail) | Compact; clients skip per-delta work                                                                    | Loses in-flight sub-message state (current tool args buffer, current text delta); clients miss the _visual_ "currently typing" affordance; STATE/CUSTOM events lost between snapshot timestamp and reconnect |
+| **C. Hybrid (recommended)**                                  | Compact for the _settled_ prefix; preserves live tail; lets clients render approval prompts immediately | Slightly more replay-side logic                                                                                                                                                                              |
 
 **Recommended (C):** On reconnect, the agent emits
 
 1. `RUN_STARTED{threadId, runId}` (synthetic, mirrors current run)
 2. `MESSAGES_SNAPSHOT{messages: <persisted-so-far>}` (the settled prefix)
 3. **Replay** every chunk after the last "settled" watermark — i.e. events
-   that arrived *after* the last `TEXT_MESSAGE_END` / `TOOL_CALL_RESULT` for
+   that arrived _after_ the last `TEXT_MESSAGE_END` / `TOOL_CALL_RESULT` for
    each in-flight stream. The settled watermark is computed by walking the
    chunk log backwards.
 4. Live tail continues normally.
@@ -720,18 +914,19 @@ input-streaming → input-available → approval-requested → approval-responde
 AG-UI's tool lifecycle is event-driven (state lives in the stream, not the
 message), with terminal output stored as a `ToolMessage`. Mapping:
 
-| Internal state | AG-UI representation |
-|---|---|
-| `input-streaming` | Between `TOOL_CALL_START` and `TOOL_CALL_END`; arguments accumulated via `TOOL_CALL_ARGS` deltas |
-| `input-available` | After `TOOL_CALL_END` (arguments are now valid JSON); persisted on the `AssistantMessage.toolCalls` |
-| `approval-requested` | `CUSTOM cf.agents.tool_approval.request` emitted; no AG-UI primitive |
+| Internal state                  | AG-UI representation                                                                                                                                           |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input-streaming`               | Between `TOOL_CALL_START` and `TOOL_CALL_END`; arguments accumulated via `TOOL_CALL_ARGS` deltas                                                               |
+| `input-available`               | After `TOOL_CALL_END` (arguments are now valid JSON); persisted on the `AssistantMessage.toolCalls`                                                            |
+| `approval-requested`            | `CUSTOM cf.agents.tool_approval.request` emitted; no AG-UI primitive                                                                                           |
 | `approval-responded` (approved) | `CUSTOM cf.agents.tool_approval.decision{approved:true}` followed by tool execution; no separate state in AG-UI, just a brief window before `TOOL_CALL_RESULT` |
-| `output-available` | `TOOL_CALL_RESULT{messageId,toolCallId,content:JSON.stringify(output)}` + `ToolMessage` persisted |
-| `output-error` | `TOOL_CALL_RESULT{content:JSON.stringify({error})}` OR `ToolMessage{content,error}` — recommend the latter to use AG-UI's native `error` field |
-| `output-denied` | `CUSTOM cf.agents.tool_approval.decision{approved:false}` — no `ToolMessage` written |
-| `preliminary:true` output | `CUSTOM cf.agents.tool_preliminary_output{toolCallId,output}` between approval and final RESULT |
+| `output-available`              | `TOOL_CALL_RESULT{messageId,toolCallId,content:JSON.stringify(output)}` + `ToolMessage` persisted                                                              |
+| `output-error`                  | `TOOL_CALL_RESULT{content:JSON.stringify({error})}` OR `ToolMessage{content,error}` — recommend the latter to use AG-UI's native `error` field                 |
+| `output-denied`                 | `CUSTOM cf.agents.tool_approval.decision{approved:false}` — no `ToolMessage` written                                                                           |
+| `preliminary:true` output       | `CUSTOM cf.agents.tool_preliminary_output{toolCallId,output}` between approval and final RESULT                                                                |
 
 Gaps:
+
 - **Approval** — solved via CUSTOM namespace above.
 - **Preliminary results** (the `preliminary` flag in current tool parts) —
   solved via CUSTOM `cf.agents.tool_preliminary_output`.
@@ -746,7 +941,7 @@ collapsed: with AG-UI as canonical, "state" is no longer a field on the
 persisted message; it's a derived property of (toolCalls present? matching
 ToolMessage present? pending approval CUSTOM event seen?).
 
-**Recommendation:** keep the state machine *in memory* during a run for the
+**Recommendation:** keep the state machine _in memory_ during a run for the
 agent's own scheduling logic, but **don't persist `state`** on the message.
 Derive from (toolCalls, toolMessages, approval CUSTOM events) on load.
 
@@ -809,7 +1004,7 @@ No protocol change required. Adapters (Vercel `ToolSet`, TanStack
    we persist them at all (privacy implications) or strip and let the next
    turn re-derive? Today we strip in `sanitize.ts`.
 6. **`MESSAGES_SNAPSHOT` granularity on broadcast.** Do we send snapshots on
-   broadcast to *all* connected clients (cheap on reconnect, expensive
+   broadcast to _all_ connected clients (cheap on reconnect, expensive
    bandwidth on each message change) or only on reconnect? Recommend: only
    on reconnect; broadcast remains delta-only.
 7. **CI type-equality test.** Are we OK adding `@ag-ui/core` as a
@@ -825,4 +1020,3 @@ No protocol change required. Adapters (Vercel `ToolSet`, TanStack
 10. **Vendor sync cadence.** With C (hybrid), how do we keep the vendored
     types in sync? Pin a script that diffs against `@ag-ui/core@latest` on a
     nightly schedule, or accept manual sync at each AG-UI minor release?
-

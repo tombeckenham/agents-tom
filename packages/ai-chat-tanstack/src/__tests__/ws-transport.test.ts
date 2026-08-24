@@ -11,95 +11,14 @@ import type { AGUIEvent } from "agents/chat/agui-types";
 import { describe, expect, it } from "vitest";
 import { MessageType } from "../types";
 import { WebSocketChatTransport } from "../ws-chat-transport";
-
-function createMockAgent() {
-  const sent: string[] = [];
-  const listeners = new Map<string, Set<(event: MessageEvent) => void>>();
-  const dispatch = (type: string, data: unknown) => {
-    const event = { data } as MessageEvent;
-    for (const listener of listeners.get(type) ?? []) listener(event);
-  };
-  return {
-    sent,
-    dispatchMessage(payload: string) {
-      dispatch("message", payload);
-    },
-    dispatchClose() {
-      dispatch("close", undefined);
-    },
-    send(data: string) {
-      sent.push(data);
-    },
-    addEventListener(type: string, listener: (event: MessageEvent) => void) {
-      const set = listeners.get(type) ?? new Set();
-      set.add(listener);
-      listeners.set(type, set);
-    },
-    removeEventListener(type: string, listener: (event: MessageEvent) => void) {
-      listeners.get(type)?.delete(listener);
-    }
-  };
-}
-
-function emitAGUIFrame(
-  agent: ReturnType<typeof createMockAgent>,
-  requestId: string,
-  event: AGUIEvent
-) {
-  agent.dispatchMessage(
-    JSON.stringify({
-      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-      id: requestId,
-      body: JSON.stringify(event),
-      done: false
-    })
-  );
-}
-
-function emitDone(
-  agent: ReturnType<typeof createMockAgent>,
-  requestId: string
-) {
-  agent.dispatchMessage(
-    JSON.stringify({
-      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-      id: requestId,
-      body: "",
-      done: true
-    })
-  );
-}
-
-function emitError(
-  agent: ReturnType<typeof createMockAgent>,
-  requestId: string,
-  message: string
-) {
-  agent.dispatchMessage(
-    JSON.stringify({
-      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-      id: requestId,
-      body: message,
-      error: true,
-      done: false
-    })
-  );
-}
-
-async function drain(iterable: AsyncIterable<AGUIEvent>): Promise<AGUIEvent[]> {
-  const out: AGUIEvent[] = [];
-  for await (const event of iterable) out.push(event);
-  return out;
-}
-
-async function waitForSend(agent: ReturnType<typeof createMockAgent>) {
-  // prepareBody is async; the request frame lands on a microtask. Yield
-  // a few times so the request id is observable in `agent.sent`.
-  for (let i = 0; i < 5 && agent.sent.length === 0; i++) {
-    await Promise.resolve();
-    await new Promise((r) => setTimeout(r, 0));
-  }
-}
+import {
+  createMockAgent,
+  drain,
+  emitAGUIFrame,
+  emitDone,
+  emitError,
+  waitForSend
+} from "./test-helpers";
 
 describe("WebSocketChatTransport — streamFactory (identity adapter)", () => {
   it("passes AG-UI events through to the async iterable unchanged", async () => {

@@ -18,13 +18,26 @@
       {
         "class_name": "CancellableTanstackAgent",
         "name": "CancellableTanstackAgent"
+      },
+      {
+        "class_name": "SlowTanstackAgent",
+        "name": "SlowTanstackAgent"
+      },
+      {
+        "class_name": "ErroringTanstackAgent",
+        "name": "ErroringTanstackAgent"
       }
     ]
   },
   "main": "worker.ts",
   "migrations": [
     {
-      "new_sqlite_classes": ["TestTanstackAgent", "CancellableTanstackAgent"],
+      "new_sqlite_classes": [
+        "TestTanstackAgent",
+        "CancellableTanstackAgent",
+        "SlowTanstackAgent",
+        "ErroringTanstackAgent"
+      ],
       "tag": "v1"
     }
   ]

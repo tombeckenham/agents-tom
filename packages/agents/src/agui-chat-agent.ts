@@ -37,10 +37,7 @@ import {
   createInitialSnapshot,
   type SnapshotState
 } from "./chat/agui-message-builder";
-import {
-  autoTransformAGUIMessages,
-  isPersistedAGUIMessage
-} from "./chat/agui-migration";
+import { autoTransformAGUIMessages } from "./chat/agui-migration";
 import { reconcileMessages } from "./chat/agui-message-reconciler";
 import {
   byteLength as aguiByteLength,
@@ -49,10 +46,7 @@ import {
   ROW_MAX_BYTES,
   sanitizeAGUIMessage
 } from "./chat/agui-sanitize";
-import {
-  type AGUIChunkAction,
-  AGUIStreamAccumulator
-} from "./chat/agui-stream-accumulator";
+import { AGUIStreamAccumulator } from "./chat/agui-stream-accumulator";
 import {
   type AGUIEvent,
   type AGUIMessage,
@@ -204,7 +198,6 @@ export type AGUIOnFinishCallback = (result: unknown) => void | Promise<void>;
 
 type ChatRequestTrigger = "submit-message" | "regenerate-message";
 
-const TIMED_OUT = Symbol("timed-out");
 const decoder = new TextDecoder();
 
 function sendIfOpen(connection: Connection, message: string): boolean {

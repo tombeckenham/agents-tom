@@ -58,9 +58,47 @@ export class CancellableTanstackAgent extends AGUIChatAgent {
   }
 }
 
+export class SlowTanstackAgent extends AGUIChatAgent {
+  // Long-running stream (~1s) so a second connection can join and resume
+  // while the run is still live.
+  async onChatMessage(
+    _onFinish: (result: unknown) => void | Promise<void>,
+    options?: { abortSignal?: AbortSignal }
+  ) {
+    const events: AGUIEvent[] = [
+      { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+      { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
+      ...Array.from({ length: 15 }, (_, i) => ({
+        type: "TEXT_MESSAGE_CONTENT" as const,
+        messageId: "m1",
+        delta: `chunk${i} `
+      })),
+      { type: "TEXT_MESSAGE_END", messageId: "m1" },
+      { type: "RUN_FINISHED", threadId: "t1", runId: "r1" }
+    ];
+    return toAGUIResponse(yieldEventsSlow(events, 60, options?.abortSignal));
+  }
+}
+
+export class ErroringTanstackAgent extends AGUIChatAgent {
+  // Streams one event then errors mid-body: the server broadcasts an
+  // error frame only for failures while consuming the returned Response
+  // (an onChatMessage throw surfaces via onError, not on the wire).
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(): Promise<Response> {
+    async function* failing(): AsyncIterable<AGUIEvent> {
+      yield { type: "RUN_STARTED", threadId: "t1", runId: "r1" };
+      throw new Error("agent exploded");
+    }
+    return toAGUIResponse(failing());
+  }
+}
+
 type Env = {
   TestTanstackAgent: DurableObjectNamespace<TestTanstackAgent>;
   CancellableTanstackAgent: DurableObjectNamespace<CancellableTanstackAgent>;
+  SlowTanstackAgent: DurableObjectNamespace<SlowTanstackAgent>;
+  ErroringTanstackAgent: DurableObjectNamespace<ErroringTanstackAgent>;
 };
 
 export default {
