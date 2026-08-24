@@ -423,16 +423,16 @@ importers:
         version: link:../../packages/ai-chat-tanstack
       '@cloudflare/tanstack-ai':
         specifier: ^0.2.0
-        version: 0.2.0(@aws-sdk/credential-provider-node@3.972.57)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)
+        version: 0.2.0(@aws-sdk/credential-provider-node@3.972.57)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
       '@tanstack/ai':
-        specifier: 0.42.0
-        version: 0.42.0(@opentelemetry/api@1.9.1)
+        specifier: 0.48.0
+        version: 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-client':
-        specifier: 0.22.1
-        version: 0.22.1(@opentelemetry/api@1.9.1)
+        specifier: 0.26.0
+        version: 0.26.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-react':
-        specifier: 0.18.1
-        version: 0.18.1(@opentelemetry/api@1.9.1)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(@types/react@19.2.17)(react@19.2.8)
+        specifier: 0.21.3
+        version: 0.21.3(@opentelemetry/api@1.9.1)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(@types/react@19.2.17)(react@19.2.8)(zod@4.4.3)
       agents:
         specifier: '*'
         version: link:../../packages/agents
@@ -4161,14 +4161,14 @@ importers:
         version: 5.1.16
     devDependencies:
       '@tanstack/ai':
-        specifier: 0.42.0
-        version: 0.42.0(@opentelemetry/api@1.9.1)
+        specifier: 0.48.0
+        version: 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-client':
-        specifier: 0.22.1
-        version: 0.22.1(@opentelemetry/api@1.9.1)
+        specifier: 0.26.0
+        version: 0.26.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-react':
-        specifier: 0.18.1
-        version: 0.18.1(@opentelemetry/api@1.9.1)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(@types/react@19.2.17)(react@19.2.8)
+        specifier: 0.21.3
+        version: 0.21.3(@opentelemetry/api@1.9.1)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(@types/react@19.2.17)(react@19.2.8)(zod@4.4.3)
       '@types/react':
         specifier: ^19.2.17
         version: 19.2.17
@@ -4607,6 +4607,14 @@ packages:
 
   '@ag-ui/core@0.0.52':
     resolution: {integrity: sha512-Xo0bUaNV56EqylzcrAuhUkQX7et7+SZIrqZZtEByGwEq/I1EHny6ZMkWHLkKR7UNi0FJZwJyhKYmKJS3B2SEgA==}
+
+  '@ag-ui/core@0.1.1-canary.beta.0':
+    resolution: {integrity: sha512-zcP3RH5p3HJTZ0kyQxNOL1blnVFTDpaShitR7UMS/thwFdl48V6CAG+WQBcYEu/dfa8mKonRez88N0Ok+nEI+w==}
+    peerDependencies:
+      zod: ^3.25.18 || ^4.0.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
 
   '@ai-sdk/anthropic@3.0.85':
     resolution: {integrity: sha512-fNeDB644l5wbRNQU0FnI+F7UTtOenMnPtACfMPUJaS2zJfuBlseEa1TMg+otHkETZgaJB+6Na51NQEv0+m7czw==}
@@ -7549,8 +7557,11 @@ packages:
   '@tanstack/ai-client@0.19.0':
     resolution: {integrity: sha512-TjbV1LgOfNKewdWtHGH0mhMYWyTenwGA5Pl3VZs2ZVePIANKjw85VKoRNSvkJgKBJMSiSUR5uLcSJkFCXXI93A==}
 
-  '@tanstack/ai-client@0.22.1':
-    resolution: {integrity: sha512-+v/elGbZveKSgAYaCkS/9V+Ii12RZvm9WQ+ifvJlN5bVwAf5jakxLvh4j1e/tEkPuPiwYdPJmVUYQXK/Rfm5Aw==}
+  '@tanstack/ai-client@0.26.0':
+    resolution: {integrity: sha512-FCDA1Pi9XcT8KmvyExpoebZ3LbyECHGb+ORT6JUgmo9ANyODTtuzCmqLRZof8pWiT2zOuSi9yc+fsWTHOhckaw==}
+
+  '@tanstack/ai-event-client@0.10.0':
+    resolution: {integrity: sha512-grvlmM0z4rMLvjwPKBfT4/sL4D97yqocSzyaTvUa+2wZmXESCf/uR/7ZAldOKBasEx6qO5EJ31hdKDEDjnrnDg==}
 
   '@tanstack/ai-event-client@0.6.8':
     resolution: {integrity: sha512-h7/HLz9u2LF9ba6uKFMnSZkFlkzQONJ5u3Hi+4qGxpsHyvcGRtW6v186jaFLoklndhEwyC49ytkC4eafi7Qq8w==}
@@ -7588,11 +7599,11 @@ packages:
       '@mcp-ui/client':
         optional: true
 
-  '@tanstack/ai-react@0.18.1':
-    resolution: {integrity: sha512-Xk44ZgzcjHwVrOFgYEJse1bHkauSyxWEpS41e7tThvewsT295k0FR5tbHXG36n5N7r3OA/PtIjtq9nqIHG8Sag==}
+  '@tanstack/ai-react@0.21.3':
+    resolution: {integrity: sha512-zfd3IIKfaZXGvuKstQjjkbXRcw1P9s8HGQ7PauS8yxuqDpQm9hGM9udXQeFwAkjBCde9tGSm4W+NTzheBepZ8Q==}
     peerDependencies:
       '@mcp-ui/client': ^7
-      '@tanstack/ai': ^0.42.0
+      '@tanstack/ai': ^0.48.0
       '@types/react': '>=18.0.0'
       react: '>=18.0.0'
     peerDependenciesMeta:
@@ -7601,6 +7612,9 @@ packages:
 
   '@tanstack/ai-utils@0.3.1':
     resolution: {integrity: sha512-fgbjd5DohL3k5rTWr/KInauLVYMiHVm0cnmTsNrzL3cr4wWhEld5vmFSrjiwUWACAuONjZa+uBXuS+ZSO8fwDQ==}
+
+  '@tanstack/ai-utils@0.4.0':
+    resolution: {integrity: sha512-xqvAgPJkIuGk1m+jZKyb7vBTQIaBmUD9EVzlPkDWWMp80n69uwL0TnBZCVk+OwL9goTQiFy648dnBfLsiJgl6A==}
 
   '@tanstack/ai@0.38.0':
     resolution: {integrity: sha512-fAX8pmaLXRx8jB8v4CyYqCxCAagvHzvmU7l4J89XkKlzuun69F/pumcKFUOGxZyQswiz1+pzfmNwscv7K8AJmA==}
@@ -7611,8 +7625,8 @@ packages:
       '@opentelemetry/api':
         optional: true
 
-  '@tanstack/ai@0.42.0':
-    resolution: {integrity: sha512-OyUA1tl6Oj93jjdyDofMb53tf3GhHgLWJ376h/5qjdwtUG1YOr6134khd1Aq2lfIZbmj2HR+y3XqD9UMXSjk1A==}
+  '@tanstack/ai@0.48.0':
+    resolution: {integrity: sha512-G1IzJ7QZ66fzYiSMFW3pWKXc+3vVkQv2yYNN+gC6fkdh+eECJCQHaxsHQKl0JFkWg/dNFhrIqF4v4OztnIZ4dw==}
     engines: {node: '>=18'}
     peerDependencies:
       '@opentelemetry/api': '>=1.9.0'
@@ -12260,6 +12274,10 @@ snapshots:
     dependencies:
       zod: 3.25.76
 
+  '@ag-ui/core@0.1.1-canary.beta.0(zod@4.4.3)':
+    optionalDependencies:
+      zod: 4.4.3
+
   '@ai-sdk/anthropic@3.0.85(zod@4.4.3)':
     dependencies:
       '@ai-sdk/provider': 3.0.10
@@ -13528,19 +13546,19 @@ snapshots:
       - ws
       - zod
 
-  '@cloudflare/tanstack-ai@0.2.0(@aws-sdk/credential-provider-node@3.972.57)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)':
+  '@cloudflare/tanstack-ai@0.2.0(@aws-sdk/credential-provider-node@3.972.57)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       openai: 6.45.0(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(ws@8.21.3)(zod@4.4.3)
     optionalDependencies:
       '@anthropic-ai/sdk': 0.106.0(zod@4.4.3)
       '@google/genai': 2.10.0(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))
       '@openrouter/sdk': 0.13.21
-      '@tanstack/ai-anthropic': 0.15.11(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(zod@4.4.3)
-      '@tanstack/ai-gemini': 0.18.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))
-      '@tanstack/ai-grok': 0.14.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)
-      '@tanstack/ai-openai': 0.15.9(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)
-      '@tanstack/ai-openrouter': 0.15.4(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))
+      '@tanstack/ai-anthropic': 0.15.11(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(zod@4.4.3)
+      '@tanstack/ai-gemini': 0.18.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))
+      '@tanstack/ai-grok': 0.14.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
+      '@tanstack/ai-openai': 0.15.9(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
+      '@tanstack/ai-openrouter': 0.15.4(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))
     transitivePeerDependencies:
       - '@aws-sdk/credential-provider-node'
       - '@modelcontextprotocol/sdk'
@@ -15428,10 +15446,10 @@ snapshots:
       zod: 4.4.3
     optional: true
 
-  '@tanstack/ai-anthropic@0.15.11(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(zod@4.4.3)':
+  '@tanstack/ai-anthropic@0.15.11(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(zod@4.4.3)':
     dependencies:
       '@anthropic-ai/sdk': 0.97.1(zod@4.4.3)
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
       zod: 4.4.3
     optional: true
@@ -15444,13 +15462,18 @@ snapshots:
     transitivePeerDependencies:
       - '@opentelemetry/api'
 
-  '@tanstack/ai-client@0.22.1(@opentelemetry/api@1.9.1)':
+  '@tanstack/ai-client@0.26.0(@opentelemetry/api@1.9.1)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
-      '@tanstack/ai-event-client': 0.6.8
-      '@tanstack/ai-utils': 0.3.1
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
+      '@tanstack/ai-event-client': 0.10.0
+      '@tanstack/ai-utils': 0.4.0
     transitivePeerDependencies:
       - '@opentelemetry/api'
+      - zod
+
+  '@tanstack/ai-event-client@0.10.0':
+    dependencies:
+      '@tanstack/devtools-event-client': 0.4.4
 
   '@tanstack/ai-event-client@0.6.8':
     dependencies:
@@ -15469,10 +15492,10 @@ snapshots:
       - utf-8-validate
     optional: true
 
-  '@tanstack/ai-gemini@0.18.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))':
+  '@tanstack/ai-gemini@0.18.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))':
     dependencies:
       '@google/genai': 2.10.0(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
       partial-json: 0.1.7
     transitivePeerDependencies:
@@ -15496,11 +15519,11 @@ snapshots:
       - ws
     optional: true
 
-  '@tanstack/ai-grok@0.14.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)':
+  '@tanstack/ai-grok@0.14.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
-      '@tanstack/openai-base': 0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)
+      '@tanstack/openai-base': 0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
       openai: 6.45.0(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(ws@8.21.3)(zod@4.4.3)
       zod: 4.4.3
     transitivePeerDependencies:
@@ -15524,11 +15547,11 @@ snapshots:
       - ws
     optional: true
 
-  '@tanstack/ai-openai@0.15.9(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)':
+  '@tanstack/ai-openai@0.15.9(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
-      '@tanstack/openai-base': 0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)
+      '@tanstack/openai-base': 0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
       openai: 6.45.0(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(ws@8.21.3)(zod@4.4.3)
       zod: 4.4.3
     transitivePeerDependencies:
@@ -15545,10 +15568,10 @@ snapshots:
       '@tanstack/ai-utils': 0.3.1
     optional: true
 
-  '@tanstack/ai-openrouter@0.15.4(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))':
+  '@tanstack/ai-openrouter@0.15.4(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))':
     dependencies:
       '@openrouter/sdk': 0.12.35
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
     optional: true
 
@@ -15561,16 +15584,19 @@ snapshots:
     transitivePeerDependencies:
       - '@opentelemetry/api'
 
-  '@tanstack/ai-react@0.18.1(@opentelemetry/api@1.9.1)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(@types/react@19.2.17)(react@19.2.8)':
+  '@tanstack/ai-react@0.21.3(@opentelemetry/api@1.9.1)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(@types/react@19.2.17)(react@19.2.8)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
-      '@tanstack/ai-client': 0.22.1(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
+      '@tanstack/ai-client': 0.26.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@types/react': 19.2.17
       react: 19.2.8
     transitivePeerDependencies:
       - '@opentelemetry/api'
+      - zod
 
   '@tanstack/ai-utils@0.3.1': {}
+
+  '@tanstack/ai-utils@0.4.0': {}
 
   '@tanstack/ai@0.38.0(@opentelemetry/api@1.9.1)':
     dependencies:
@@ -15582,15 +15608,17 @@ snapshots:
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
 
-  '@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1)':
+  '@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)':
     dependencies:
-      '@ag-ui/core': 0.0.52
+      '@ag-ui/core': 0.1.1-canary.beta.0(zod@4.4.3)
       '@standard-schema/spec': 1.1.0
-      '@tanstack/ai-event-client': 0.6.8
-      '@tanstack/ai-utils': 0.3.1
+      '@tanstack/ai-event-client': 0.10.0
+      '@tanstack/ai-utils': 0.4.0
       partial-json: 0.1.7
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
+    transitivePeerDependencies:
+      - zod
 
   '@tanstack/devtools-event-client@0.4.4': {}
 
@@ -15607,9 +15635,9 @@ snapshots:
       - zod
     optional: true
 
-  '@tanstack/openai-base@0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.42.0(@opentelemetry/api@1.9.1))(ws@8.21.3)(zod@4.4.3)':
+  '@tanstack/openai-base@0.9.5(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(@tanstack/ai@0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@tanstack/ai': 0.42.0(@opentelemetry/api@1.9.1)
+      '@tanstack/ai': 0.48.0(@opentelemetry/api@1.9.1)(zod@4.4.3)
       '@tanstack/ai-utils': 0.3.1
       openai: 6.45.0(@aws-sdk/credential-provider-node@3.972.57)(@smithy/signature-v4@5.6.12)(ws@8.21.3)(zod@4.4.3)
     transitivePeerDependencies:

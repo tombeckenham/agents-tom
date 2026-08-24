@@ -51,7 +51,15 @@ export {
 // TanStack's `ChatTransport` is an exclusive union — supplying `connection`
 // requires `fetcher` to be absent. This adapter always drives the WebSocket
 // connection itself, so `fetcher` is omitted from the public surface too.
-export type UseAgentChatOptions = Omit<
+// The omit must distribute over the union: `UseChatOptions` pairs
+// `persistence: true | ChatClientPersistence` with a required `threadId`,
+// and a plain `Omit` collapses that pairing away (see
+// `ChatPersistenceOptions` in `@tanstack/ai-client`).
+type DistributedOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+export type UseAgentChatOptions = DistributedOmit<
   UseChatOptions,
   "connection" | "fetcher"
 > & {
