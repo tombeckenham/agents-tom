@@ -2690,8 +2690,6 @@ importers:
         specifier: ^4.115.0
         version: 4.115.0(@cloudflare/workers-types@5.20260729.1)
 
-  examples/think-react-router: {}
-
   examples/think-submissions:
     dependencies:
       '@cloudflare/kumo':
@@ -2749,8 +2747,6 @@ importers:
       wrangler:
         specifier: ^4.115.0
         version: 4.115.0(@cloudflare/workers-types@5.20260729.1)
-
-  examples/think-tanstack-start: {}
 
   examples/think-workflows:
     dependencies:
@@ -4232,8 +4228,6 @@ importers:
       zod:
         specifier: ^4.4.3
         version: 4.4.3
-
-  packages/create-think: {}
 
   packages/hono-agents:
     devDependencies:

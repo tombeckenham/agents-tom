@@ -16,6 +16,7 @@
       { "name": "ToolCallAguiAgent", "class_name": "ToolCallAguiAgent" },
       { "name": "SlowAguiAgent", "class_name": "SlowAguiAgent" },
       { "name": "PlaintextAguiAgent", "class_name": "PlaintextAguiAgent" },
+      { "name": "PreThrowAguiAgent", "class_name": "PreThrowAguiAgent" },
       { "name": "ErrorStreamAguiAgent", "class_name": "ErrorStreamAguiAgent" },
       { "name": "ApprovalAguiAgent", "class_name": "ApprovalAguiAgent" },
       {
@@ -33,6 +34,7 @@
         "ToolCallAguiAgent",
         "SlowAguiAgent",
         "PlaintextAguiAgent",
+        "PreThrowAguiAgent",
         "ErrorStreamAguiAgent",
         "ApprovalAguiAgent",
         "MaxPersistedAguiAgent",

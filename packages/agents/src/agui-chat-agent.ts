@@ -694,7 +694,7 @@ export class AGUIChatAgent<
             async () => {
               const chatTurnBody = async () => {
                 try {
-                  const response = await this.onChatMessage(
+                  const response = await this._invokeChatHandler(
                     async (_finishResult) => {},
                     {
                       requestId: chatMessageId,
@@ -1429,6 +1429,35 @@ export class AGUIChatAgent<
     }
   }
 
+  /**
+   * Invoke `onChatMessage` and, if it throws BEFORE producing a `Response`,
+   * broadcast a terminal `error: true, done: true` frame for the request.
+   * Mid-stream failures are handled inside `_reply`; a pre-Response throw
+   * never reaches `_reply`, so without this frame clients awaiting the
+   * request id would hang forever. The error is rethrown so `onError` /
+   * turn bookkeeping behave exactly as before.
+   */
+  private async _invokeChatHandler(
+    onFinish: AGUIOnFinishCallback,
+    options: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    try {
+      return await this.onChatMessage(onFinish, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this._broadcastChatMessage({
+        body: message,
+        done: true,
+        error: true,
+        id: options.requestId,
+        type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+        ...(options.continuation && { continuation: true })
+      });
+      this._emit("message:error", { error: message });
+      throw error;
+    }
+  }
+
   protected resetTurnState(): void {
     this._mergeQueuedUserStartIndexByEpoch.delete(this._turnQueue.generation);
     this._turnQueue.reset();
@@ -1602,7 +1631,7 @@ export class AGUIChatAgent<
               async () => {
                 const autoBody = async () => {
                   try {
-                    const response = await this.onChatMessage(
+                    const response = await this._invokeChatHandler(
                       async (_finishResult) => {},
                       {
                         requestId,
@@ -2226,7 +2255,7 @@ export class AGUIChatAgent<
           );
           try {
             const programmaticBody = async () => {
-              const response = await this.onChatMessage(() => {}, {
+              const response = await this._invokeChatHandler(() => {}, {
                 requestId,
                 abortSignal,
                 clientTools,
@@ -2298,7 +2327,7 @@ export class AGUIChatAgent<
                   options?.signal
                 );
                 try {
-                  const response = await this.onChatMessage(() => {}, {
+                  const response = await this._invokeChatHandler(() => {}, {
                     requestId,
                     abortSignal,
                     clientTools,

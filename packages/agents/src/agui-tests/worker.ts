@@ -144,6 +144,14 @@ export class PlaintextAguiAgent extends AGUIChatAgent<Env> {
   }
 }
 
+/** Throws before producing a Response — the pre-stream error path. */
+export class PreThrowAguiAgent extends AGUIChatAgent<Env> {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(): Promise<Response | undefined> {
+    throw new Error("boom before response");
+  }
+}
+
 /** SSE body that errors mid-stream after one event. */
 export class ErrorStreamAguiAgent extends AGUIChatAgent<Env> {
   // eslint-disable-next-line @typescript-eslint/require-await
@@ -238,6 +246,7 @@ export type Env = {
   ToolCallAguiAgent: DurableObjectNamespace<ToolCallAguiAgent>;
   SlowAguiAgent: DurableObjectNamespace<SlowAguiAgent>;
   PlaintextAguiAgent: DurableObjectNamespace<PlaintextAguiAgent>;
+  PreThrowAguiAgent: DurableObjectNamespace<PreThrowAguiAgent>;
   ErrorStreamAguiAgent: DurableObjectNamespace<ErrorStreamAguiAgent>;
   ApprovalAguiAgent: DurableObjectNamespace<ApprovalAguiAgent>;
   MaxPersistedAguiAgent: DurableObjectNamespace<MaxPersistedAguiAgent>;
