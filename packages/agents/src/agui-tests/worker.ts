@@ -142,6 +142,38 @@ export class SlowAguiAgent extends AGUIChatAgent<Env> {
   }
 }
 
+/**
+ * Holds `onChatMessage` for `responseDelayMs` before returning a Response, so a
+ * turn spends a controllable window accepted-but-not-yet-streaming (#1784).
+ * Records every request id that entered the handler so tests can synchronize on
+ * that window instead of sleeping.
+ */
+export class PreStreamAguiAgent extends AGUIChatAgent<Env> {
+  private _startedRequestIds: string[] = [];
+
+  async onChatMessage(
+    _onFinish: (result: unknown) => void | Promise<void>,
+    options?: OnChatMessageOptions
+  ) {
+    if (options?.requestId) this._startedRequestIds.push(options.requestId);
+    const delayMs = (options?.body as { responseDelayMs?: number } | undefined)
+      ?.responseDelayMs;
+    if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return sseResponse(
+      textRunEvents(`assistant-${options?.requestId ?? "x"}`, ["ok"])
+    );
+  }
+
+  getStartedRequestIds(): string[] {
+    return [...this._startedRequestIds];
+  }
+}
+
+/** Same pre-stream delay knob under the `latest` supersede policy. */
+export class PreStreamLatestAguiAgent extends PreStreamAguiAgent {
+  messageConcurrency = "latest" as const;
+}
+
 /** Returns a plaintext (non-SSE) Response — must be wrapped in a synthetic run. */
 export class PlaintextAguiAgent extends AGUIChatAgent<Env> {
   // eslint-disable-next-line @typescript-eslint/require-await
@@ -858,6 +890,8 @@ export type Env = {
   MaxPersistedAguiAgent: DurableObjectNamespace<MaxPersistedAguiAgent>;
   SaveMessagesAguiAgent: DurableObjectNamespace<SaveMessagesAguiAgent>;
   RecoveryAguiAgent: DurableObjectNamespace<RecoveryAguiAgent>;
+  PreStreamAguiAgent: DurableObjectNamespace<PreStreamAguiAgent>;
+  PreStreamLatestAguiAgent: DurableObjectNamespace<PreStreamLatestAguiAgent>;
 };
 
 export default {

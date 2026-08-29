@@ -27,7 +27,12 @@
         "name": "SaveMessagesAguiAgent",
         "class_name": "SaveMessagesAguiAgent"
       },
-      { "name": "RecoveryAguiAgent", "class_name": "RecoveryAguiAgent" }
+      { "name": "RecoveryAguiAgent", "class_name": "RecoveryAguiAgent" },
+      { "name": "PreStreamAguiAgent", "class_name": "PreStreamAguiAgent" },
+      {
+        "name": "PreStreamLatestAguiAgent",
+        "class_name": "PreStreamLatestAguiAgent"
+      }
     ]
   },
   "migrations": [
@@ -43,7 +48,9 @@
         "ApprovalAguiAgent",
         "MaxPersistedAguiAgent",
         "SaveMessagesAguiAgent",
-        "RecoveryAguiAgent"
+        "RecoveryAguiAgent",
+        "PreStreamAguiAgent",
+        "PreStreamLatestAguiAgent"
       ]
     }
   ]
