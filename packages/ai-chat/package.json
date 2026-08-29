@@ -74,7 +74,7 @@
   "scripts": {
     "build": "tsx ./scripts/build.ts",
     "test": "vitest --run",
-    "test:react": "vitest --project react",
+    "test:react": "vitest --project react --project react-agui",
     "test:workers": "vitest --project workers",
     "test:conformance": "vitest --run -c src/conformance/vitest.config.ts",
     "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts",

@@ -119,7 +119,10 @@ describe("EventToChunkProjector — tool args buffering", () => {
       { type: "TOOL_CALL_ARGS", toolCallId: "tc1", delta: 'x":1}' },
       { type: "TOOL_CALL_END", toolCallId: "tc1" }
     ]);
+    // A tool-first run has no message id to carry, so the projector opens the
+    // assistant message with a bare `start` (see MESSAGE_OPENING_CHUNK_TYPES).
     expect(chunks).toEqual([
+      { type: "start" },
       { type: "tool-input-start", toolCallId: "tc1", toolName: "search" },
       { type: "tool-input-delta", toolCallId: "tc1", inputTextDelta: '{"' },
       {
@@ -146,6 +149,7 @@ describe("EventToChunkProjector — tool args buffering", () => {
       }
     ]);
     expect(chunks).toEqual([
+      { type: "start" },
       {
         type: "tool-output-available",
         toolCallId: "tc1",
@@ -164,6 +168,7 @@ describe("EventToChunkProjector — tool args buffering", () => {
       }
     ]);
     expect(chunks).toEqual([
+      { type: "start" },
       { type: "tool-output-available", toolCallId: "tc1", output: "literal" }
     ]);
   });
@@ -184,6 +189,7 @@ describe("EventToChunkProjector — tool approval round-trip", () => {
       }
     ]);
     expect(chunks).toEqual([
+      { type: "start" },
       { type: "tool-approval-request", toolCallId: "tc1", approvalId: "ap1" }
     ]);
   });
@@ -196,7 +202,10 @@ describe("EventToChunkProjector — tool approval round-trip", () => {
         value: { toolCallId: "tc1", approvalId: "ap1", approved: false }
       }
     ]);
-    expect(chunks).toEqual([{ type: "tool-output-denied", toolCallId: "tc1" }]);
+    expect(chunks).toEqual([
+      { type: "start" },
+      { type: "tool-output-denied", toolCallId: "tc1" }
+    ]);
   });
 
   it("CUSTOM tool_approval.decision approved:true → no chunks (handled out-of-band by TOOL_CALL_RESULT)", () => {

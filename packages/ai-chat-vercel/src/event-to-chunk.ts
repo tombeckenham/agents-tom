@@ -32,6 +32,25 @@ import {
 } from "agents/chat/agui-types";
 import type { UIMessageChunk } from "ai";
 
+/**
+ * Chunks that belong to the assistant message and therefore need one open.
+ * `TEXT_MESSAGE_START` / `REASONING_MESSAGE_START` emit the leading `start`
+ * themselves (they carry the message id); these are the tool-call paths,
+ * which AG-UI keys by `toolCallId` and never by message id. Run-level chunks
+ * (`finish`, `start-step`, state/data pass-throughs) are deliberately absent —
+ * they must not conjure an empty assistant message.
+ */
+const MESSAGE_OPENING_CHUNK_TYPES = new Set([
+  "tool-input-start",
+  "tool-input-delta",
+  "tool-input-available",
+  "tool-input-error",
+  "tool-output-available",
+  "tool-output-error",
+  "tool-output-denied",
+  "tool-approval-request"
+]);
+
 type ToolBuffer = {
   toolName: string;
   args: string;
@@ -53,6 +72,21 @@ export class EventToChunkProjector {
 
   /** Project a single AG-UI event into zero or more `UIMessageChunk`s. */
   project(event: AGUIEvent): UIMessageChunk[] {
+    const chunks = this.projectEvent(event);
+    if (this.leadingStartEmitted || chunks.length === 0) return chunks;
+
+    // The AI SDK opens the assistant message on `start`; without one the tool
+    // chunks that follow have nothing to attach to, so a run whose first
+    // content is a tool call would render nothing. AG-UI keys tool events by
+    // `toolCallId` and carries no message id for them — emit a bare `start`
+    // and let the AI SDK mint one.
+    if (!MESSAGE_OPENING_CHUNK_TYPES.has(chunks[0].type)) return chunks;
+
+    this.leadingStartEmitted = true;
+    return [{ type: "start" }, ...chunks];
+  }
+
+  private projectEvent(event: AGUIEvent): UIMessageChunk[] {
     switch (event.type) {
       case "RUN_STARTED":
         this.runStartedBuffered = true;

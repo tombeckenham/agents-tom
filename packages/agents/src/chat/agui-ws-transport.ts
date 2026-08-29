@@ -117,6 +117,15 @@ type EventStreamContext = {
 /** Server has 5s to answer a resume probe before the client gives up. */
 const RESUME_DECISION_TIMEOUT_MS = 5000;
 
+/**
+ * Extended backstop once the server says a turn is pending (`STREAM_PENDING`,
+ * #1784). The pre-stream window (queueing, MCP setup, model latency) can far
+ * exceed the short probe timeout, and the server guarantees a follow-up
+ * `STREAM_RESUMING` / `STREAM_RESUME_NONE` — so keep waiting, but still cap it
+ * so a dropped follow-up degrades to "no stream" instead of hanging forever.
+ */
+const RESUME_PENDING_TIMEOUT_MS = 60000;
+
 function abortError(): Error {
   const error = new Error("Aborted");
   error.name = "AbortError";
@@ -144,6 +153,17 @@ export class AGUIWebSocketTransport {
 
   private _resumeResolver: ((data: { id: string } | null) => void) | null =
     null;
+  /** Id of the in-flight resume probe; correlates `STREAM_RESUME_NONE`. */
+  private _probeId: string | null = null;
+  /** Keep-waiting hook for `STREAM_PENDING` (#1784). */
+  private _onStreamPending: (() => void) | null = null;
+  /** Retransmits the in-flight probe on a replacement socket. */
+  private _retryResumeProbe: (() => void) | null = null;
+  /**
+   * Local-only close of a resume/continuation stream owned by an obsolete
+   * hook generation. Unlike cancellation this never hangs up the server.
+   */
+  private _detachResumeStream: (() => boolean) | null = null;
   private _expectToolContinuation = false;
   private _abortToolContinuation: (() => boolean) | null = null;
   private _activeServerTurnId: string | null = null;
@@ -157,6 +177,17 @@ export class AGUIWebSocketTransport {
 
   setCancelOnClientAbort(value: boolean) {
     this.cancelOnClientAbort = value;
+  }
+
+  /**
+   * Point the transport at a replacement connection. A pending handshake
+   * belongs to the old socket generation and must settle before frames from
+   * the new one are consumed (#1914).
+   */
+  setAgent(agent: AgentConnection) {
+    if (this.agent === agent) return;
+    this.resetResumeState();
+    this.agent = agent;
   }
 
   /**
@@ -206,8 +237,56 @@ export class AGUIWebSocketTransport {
     return this.settleResume(data);
   }
 
-  handleStreamResumeNone(): boolean {
+  /**
+   * A `STREAM_RESUME_NONE` carrying a `probeId` only answers the probe that
+   * asked; an uncorrelated one (older frame, another connection's
+   * continuation) is not authoritative for ours (#1914).
+   */
+  handleStreamResumeNone(data: { probeId?: string } = {}): boolean {
+    if (data.probeId && this._probeId && data.probeId !== this._probeId) {
+      return false;
+    }
     return this.settleResume(null);
+  }
+
+  /**
+   * `STREAM_PENDING` (#1784): the server accepted a turn whose stream has not
+   * started yet. Extends the waiting probe's timeout. Returns whether a
+   * waiting path consumed it.
+   */
+  handleStreamPending(): boolean {
+    if (!this._onStreamPending) return false;
+    this._onStreamPending();
+    return true;
+  }
+
+  /**
+   * Retransmit the in-flight handshake on the latest socket. Recovers a
+   * request/reply lost with the previous WebSocket without starting a second
+   * resume operation.
+   */
+  retryPendingResume(): boolean {
+    if (!this._retryResumeProbe) return false;
+    this._retryResumeProbe();
+    return true;
+  }
+
+  /**
+   * Settle the current handshake without interpreting it as "server idle" —
+   * used when the owning hook/agent generation changes.
+   */
+  cancelPendingResume(): boolean {
+    return this.settleResume(null);
+  }
+
+  /**
+   * Invalidate all client-side resume state for an obsolete hook/agent
+   * generation, leaving the durable server turn running.
+   */
+  resetResumeState(): void {
+    this._expectToolContinuation = false;
+    this.cancelPendingResume();
+    this._detachResumeStream?.();
   }
 
   handleServerTurnCompleted(requestId: string) {
@@ -296,42 +375,89 @@ export class AGUIWebSocketTransport {
       return this._createToolContinuationStream();
     }
 
+    const probeId = nanoid(8);
     const decision = await new Promise<{ id: string } | null>((resolve) => {
-      const resolver = (data: { id: string } | null) => {
-        clearTimeout(timeout);
-        resolve(data);
-      };
-      const giveUp = () => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const done = (data: { id: string } | null) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
         if (this._resumeResolver === resolver) this._resumeResolver = null;
-        resolve(null);
+        this.clearProbeHooks(onPending, retry, probeId);
+        resolve(data);
       };
-      const timeout = setTimeout(giveUp, RESUME_DECISION_TIMEOUT_MS);
+      const armTimeout = (delay: number) => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => done(null), delay);
+      };
+      const resolver = (data: { id: string } | null) => done(data);
+      const onPending = () => {
+        if (!settled) armTimeout(RESUME_PENDING_TIMEOUT_MS);
+      };
+      // Re-arms this same probe on a replacement socket; a send that fails
+      // is left to the next open, with the timeout as the backstop.
+      const retry = () => {
+        if (settled) return;
+        armTimeout(RESUME_DECISION_TIMEOUT_MS);
+        this.sendResumeRequest(probeId);
+      };
+
       this._resumeResolver = resolver;
+      this._probeId = probeId;
+      this._onStreamPending = onPending;
+      this._retryResumeProbe = retry;
+
+      armTimeout(RESUME_DECISION_TIMEOUT_MS);
       // A dead socket answers now instead of after the full timeout.
-      if (!this.sendResumeRequest()) giveUp();
+      if (!this.sendResumeRequest(probeId)) done(null);
     });
 
     if (!decision) return null;
 
     const requestId = decision.id;
     this.activeRequestIds?.add(requestId);
+    let detach: (() => boolean) | null = null;
     // The ACK goes out from inside `setup`, i.e. after the listeners are
     // attached (no replayed frame slips past) and under its try/catch (a
     // send that throws tears the stream down instead of leaking it).
-    return this._createEventStream(requestId, (ctx) => {
-      ctx.markSent();
-      this.setActiveServerTurn(requestId, () => {
-        if (ctx.done) return false;
-        ctx.finish(abortError(), { keepRequestId: true });
-        return true;
-      });
-      try {
-        this.sendResumeAck(requestId);
-      } catch {
-        ctx.finish(null); // socket died: empty replay, nothing leaked
+    return this._createEventStream(
+      requestId,
+      (ctx) => {
+        ctx.markSent();
+        this.setActiveServerTurn(requestId, () => {
+          if (ctx.done) return false;
+          ctx.finish(abortError(), { keepRequestId: true });
+          return true;
+        });
+        detach = () => {
+          if (ctx.done) return false;
+          ctx.finish(null);
+          return true;
+        };
+        this._detachResumeStream = detach;
+        try {
+          this.sendResumeAck(requestId);
+        } catch {
+          ctx.finish(null); // socket died: empty replay, nothing leaked
+        }
+      },
+      () => {
+        if (this._detachResumeStream === detach)
+          this._detachResumeStream = null;
       }
-    });
+    );
+  }
+
+  /** Drop probe-scoped hooks, but only the ones this probe still owns. */
+  private clearProbeHooks(
+    onPending: () => void,
+    retry: () => void,
+    probeId: string
+  ) {
+    if (this._onStreamPending === onPending) this._onStreamPending = null;
+    if (this._retryResumeProbe === retry) this._retryResumeProbe = null;
+    if (this._probeId === probeId) this._probeId = null;
   }
 
   /**
@@ -342,13 +468,38 @@ export class AGUIWebSocketTransport {
   private _createToolContinuationStream(): AGUIEventStream {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let abort: (() => boolean) | null = null;
+    let detach: (() => boolean) | null = null;
     let resolve: ((data: { id: string } | null) => void) | null = null;
+    let onPending: (() => void) | null = null;
+    let retry: (() => void) | null = null;
+    const probeId = nanoid(8);
     return this._createEventStream(
       null,
       (ctx) => {
-        timeout = setTimeout(() => {
-          if (ctx.requestId === null) ctx.finish(null);
-        }, RESUME_DECISION_TIMEOUT_MS);
+        const armTimeout = (delay: number) => {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            if (ctx.requestId === null) ctx.finish(null);
+          }, delay);
+        };
+        armTimeout(RESUME_DECISION_TIMEOUT_MS);
+
+        onPending = () => {
+          if (ctx.requestId === null && !ctx.done) {
+            armTimeout(RESUME_PENDING_TIMEOUT_MS);
+          }
+        };
+        retry = () => {
+          if (ctx.done || ctx.requestId !== null) return;
+          armTimeout(RESUME_DECISION_TIMEOUT_MS);
+          this.sendResumeRequest(probeId);
+        };
+        detach = () => {
+          if (ctx.done) return false;
+          ctx.finish(null);
+          return true;
+        };
+        this._detachResumeStream = detach;
 
         abort = () => {
           if (ctx.done) return false;
@@ -374,9 +525,12 @@ export class AGUIWebSocketTransport {
           }
         };
         this._resumeResolver = resolve;
+        this._probeId = probeId;
+        this._onStreamPending = onPending;
+        this._retryResumeProbe = retry;
 
         // A dead socket ends the continuation now instead of at the timeout.
-        if (!this.sendResumeRequest()) ctx.finish(null);
+        if (!this.sendResumeRequest(probeId)) ctx.finish(null);
       },
       () => {
         clearTimeout(timeout);
@@ -385,7 +539,10 @@ export class AGUIWebSocketTransport {
         if (this._abortToolContinuation === abort) {
           this._abortToolContinuation = null;
         }
+        if (this._detachResumeStream === detach)
+          this._detachResumeStream = null;
         if (this._resumeResolver === resolve) this._resumeResolver = null;
+        if (onPending && retry) this.clearProbeHooks(onPending, retry, probeId);
       }
     );
   }
@@ -414,10 +571,13 @@ export class AGUIWebSocketTransport {
   }
 
   /** Returns false if the socket was already closed. */
-  private sendResumeRequest(): boolean {
+  private sendResumeRequest(probeId?: string): boolean {
     try {
       this.agent.send(
-        JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST })
+        JSON.stringify({
+          type: CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST,
+          ...(probeId ? { probeId } : {})
+        })
       );
       return true;
     } catch {
