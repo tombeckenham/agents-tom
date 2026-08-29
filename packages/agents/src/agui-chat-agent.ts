@@ -90,6 +90,7 @@ import {
 import {
   applyEventToSnapshot,
   createInitialSnapshot,
+  isReplayEvent,
   type SnapshotState
 } from "./chat/agui-message-builder";
 import { autoTransformAGUIMessages } from "./chat/agui-migration";
@@ -2557,7 +2558,12 @@ export class AGUIChatAgent<
     const liveAssistant = accumulator.messages.find(
       (m): m is AssistantMessage => m.role === "assistant"
     );
-    if (liveAssistant) this._streamingAssistantId = liveAssistant.id;
+    if (liveAssistant && this._streamingAssistantId !== liveAssistant.id) {
+      this._streamingAssistantId = liveAssistant.id;
+      // Backfill the metadata row (#1691): the assistant id is only known
+      // once the stream's first message-start event arrives.
+      this._resumableStream.setMessageId(streamId, liveAssistant.id);
+    }
 
     // Eagerly persist the assistant turn when an approval request lands so
     // a refresh between request and decision keeps the modal state.
@@ -2598,6 +2604,9 @@ export class AGUIChatAgent<
     const messageId =
       this._streamingAssistantId ??
       `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    // Record the id on the stream metadata (#1691) — the synthetic path never
+    // flows through _consumeSSELine's backfill.
+    this._resumableStream.setMessageId(streamId, messageId);
     await this._emitSynthetic(
       { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
       accumulator,
@@ -2730,14 +2739,22 @@ export class AGUIChatAgent<
   ): Promise<void> {
     // `streamedMessages` is the full snapshot the reducer produced for this
     // turn (assistant + tool messages, potentially seeded from the previous
-    // assistant turn on continuation). Merge into the persisted list by id.
-    const merged: AGUIMessage[] = [];
-    for (const m of this._aguiMessages) {
-      const replacement = streamedMessages.find((sm) => sm.id === m.id);
-      merged.push(replacement ?? m);
-    }
-    for (const sm of streamedMessages) {
-      if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
+    // assistant turn on continuation). Merge into the persisted list by id,
+    // preserving the snapshot's internal order: a reverse pass anchors on
+    // known ids and inserts new rows before the next known one, so e.g. a
+    // continuation's reasoning row lands BEFORE its assistant rather than
+    // being appended at the end.
+    const merged: AGUIMessage[] = [...this._aguiMessages];
+    let insertPos = merged.length;
+    for (let i = streamedMessages.length - 1; i >= 0; i--) {
+      const sm = streamedMessages[i];
+      const idx = merged.findIndex((m) => m.id === sm.id);
+      if (idx !== -1) {
+        merged[idx] = sm;
+        insertPos = idx;
+      } else {
+        merged.splice(insertPos, 0, sm);
+      }
     }
     // Adopt the merged list BEFORE persisting: the reconciler is
     // server-wins for assistants on an exact id match, so a continuation
@@ -2755,16 +2772,78 @@ export class AGUIChatAgent<
   protected async _persistOrphanedStream(streamId: string): Promise<void> {
     const chunks = this._resumableStream.getStreamChunks(streamId);
     if (!chunks.length) return;
-    const snapshot: SnapshotState = createInitialSnapshot();
+    // Seed with the persisted rows so an orphaned CONTINUATION (its events
+    // anchored on an existing assistant id) extends that message — tool
+    // calls and metadata intact — instead of rebuilding a bare replacement.
+    const snapshot: SnapshotState = createInitialSnapshot(
+      structuredClone(this._aguiMessages)
+    );
+    const seededCount = snapshot.messages.length;
+    let applied = false;
     for (const chunk of chunks) {
       try {
         const event = JSON.parse(chunk.body) as AGUIEvent;
-        applyEventToSnapshot(snapshot, event);
+        // An early persist (tool approval snapshot) may already hold this
+        // run's tool call/result — replaying it would duplicate the part.
+        if (
+          (event.type === "TOOL_CALL_START" ||
+            event.type === "TOOL_CALL_RESULT") &&
+          isReplayEvent(snapshot, event)
+        ) {
+          continue;
+        }
+        if (applyEventToSnapshot(snapshot, event)) applied = true;
       } catch {
         // skip malformed chunks
       }
     }
+    // Nothing replayed onto the snapshot: no new rows AND no event landed.
+    if (!applied && snapshot.messages.length === seededCount) return;
     if (snapshot.messages.length === 0) return;
+
+    // #1691: the events' ids are authoritative (live-path parity — the
+    // producer's id, or the anchored one chunk-to-event injected). The one
+    // exception is a legacy stream row with NO metadata message_id whose
+    // events opened a fresh generated id: pre-#1691 rows always continued
+    // the last assistant, so merge the replayed run onto it.
+    const seededIds = new Set(this._aguiMessages.map((m) => m.id));
+    const newAssistants = snapshot.messages.filter(
+      (m): m is AssistantMessage =>
+        m.role === "assistant" && !seededIds.has(m.id)
+    );
+    if (
+      newAssistants.length === 1 &&
+      this._resumableStream.getStreamMessageId(streamId) === null
+    ) {
+      const orphan = newAssistants[0];
+      const target = [...snapshot.messages]
+        .reverse()
+        .find(
+          (m): m is AssistantMessage =>
+            m.role === "assistant" && seededIds.has(m.id)
+        );
+      if (target && target !== orphan) {
+        target.content = (target.content ?? "") + (orphan.content ?? "");
+        if (orphan.toolCalls?.length) {
+          (target.toolCalls ??= []).push(...orphan.toolCalls);
+        }
+        if (orphan.extraParts?.length) {
+          (target.extraParts ??= []).push(...orphan.extraParts);
+        }
+        if (orphan.partial) target.partial = true;
+        if (orphan.metadata !== undefined) {
+          target.metadata =
+            typeof target.metadata === "object" &&
+            target.metadata !== null &&
+            typeof orphan.metadata === "object" &&
+            orphan.metadata !== null
+              ? { ...target.metadata, ...orphan.metadata }
+              : orphan.metadata;
+        }
+        snapshot.messages.splice(snapshot.messages.indexOf(orphan), 1);
+      }
+    }
+
     const merged: AGUIMessage[] = [];
     for (const m of this._aguiMessages) {
       const replacement = snapshot.messages.find((sm) => sm.id === m.id);
@@ -2773,6 +2852,9 @@ export class AGUIChatAgent<
     for (const sm of snapshot.messages) {
       if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
     }
+    // Adopt before persisting — the reconciler is server-wins on exact
+    // assistant id match (see `_persistStreamResult`).
+    this._aguiMessages = merged;
     // NOTE: progress is bumped at production time in `_storeStreamChunk`
     // (#1637), NOT here — a recovery/reconnect re-persist must not be
     // miscounted as new forward progress.
@@ -2789,13 +2871,14 @@ export class AGUIChatAgent<
   }
   protected _startStream(
     requestId: string,
-    options: { continuation?: boolean } = {}
+    options: { continuation?: boolean; messageId?: string } = {}
   ): string {
     // The continuation flag rides the durable stream metadata so REPLAYED
     // frames carry `continuation: true` too (#1733) — without it a
     // reconnecting client treats a replayed continuation as a fresh message.
     const streamId = this._resumableStream.start(requestId, {
-      continuation: options.continuation
+      continuation: options.continuation,
+      messageId: options.messageId
     });
     // Flush connections parked during this turn's pre-stream window (#1784)
     // into the normal STREAM_RESUMING path now that a stream exists. Safe for

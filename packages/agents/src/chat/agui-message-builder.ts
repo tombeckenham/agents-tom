@@ -420,7 +420,16 @@ function handleReasoningStart(
     content: "",
     partial: true
   };
-  state.messages.push(reasoning);
+  // AG-UI convention: reasoning precedes the assistant it relates to. When
+  // the run's assistant is already open (continuation seed, or reasoning
+  // arriving mid-turn), insert before it so the projection folds the
+  // reasoning onto that assistant instead of stranding it after.
+  const last = state.messages[state.messages.length - 1];
+  if (last && last.role === "assistant") {
+    state.messages.splice(state.messages.length - 1, 0, reasoning);
+  } else {
+    state.messages.push(reasoning);
+  }
   state.reasoningStreams.set(event.messageId, reasoning);
   return true;
 }
@@ -810,14 +819,23 @@ function attachExtraPart(state: SnapshotState, part: AssistantExtraPart): void {
   }
 }
 
-/** Attach message metadata to the current/next assistant. */
+/** Attach message metadata to the current/next assistant. Object metadata
+ * shallow-merges over what the assistant already carries — a continuation's
+ * stream metadata must extend, not erase, the seeded assistant's. */
 function attachMetadata(state: SnapshotState, metadata: unknown): void {
   const assistant = lastAssistant(state);
   if (assistant) {
-    assistant.metadata = metadata;
+    assistant.metadata =
+      isPlainObject(assistant.metadata) && isPlainObject(metadata)
+        ? { ...assistant.metadata, ...metadata }
+        : metadata;
   } else {
     state.pendingMetadata = metadata;
   }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Flush extras/metadata buffered before the first assistant existed. */

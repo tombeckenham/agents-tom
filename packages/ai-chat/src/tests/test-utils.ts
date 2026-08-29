@@ -44,7 +44,12 @@ function createFrameTranslator(): (raw: string) => string[] {
     } catch {
       return [raw];
     }
-    if (typeof (event as { type?: unknown }).type !== "string") return [raw];
+    const eventType = (event as { type?: unknown }).type;
+    // AG-UI event types are SCREAMING_SNAKE; anything else (already-legacy
+    // bodies seeded by fixtures) passes through untouched.
+    if (typeof eventType !== "string" || !/^[A-Z_]+$/.test(eventType)) {
+      return [raw];
+    }
     const key = String(frame.id ?? "");
     if (event.type === "RUN_STARTED" || !projectors.has(key)) {
       projectors.set(key, new EventToChunkProjector());

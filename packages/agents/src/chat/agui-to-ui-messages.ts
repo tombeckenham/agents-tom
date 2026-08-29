@@ -50,8 +50,21 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
   const partState = (partial: true | undefined) =>
     partial ? "streaming" : "done";
 
+  // The most recent assistant pushed to `ui` — a reasoning row with no
+  // FOLLOWING assistant (a continuation's reasoning persists after its
+  // assistant in table order) folds onto it as trailing parts.
+  let lastAssistant: UIMessage | null = null;
+
   const flushStandaloneReasoning = () => {
     for (const r of pendingReasoning) {
+      if (lastAssistant) {
+        lastAssistant.parts.push({
+          type: "reasoning",
+          text: r.text,
+          state: partState(r.partial)
+        });
+        continue;
+      }
       ui.push({
         id: r.id,
         role: "assistant",
@@ -68,6 +81,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
     switch (message.role) {
       case "user": {
         flushStandaloneReasoning();
+        lastAssistant = null;
         const parts = inputContentToParts(message.content);
         if (parts.length) {
           ui.push({
@@ -85,6 +99,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
       case "system":
       case "developer": {
         flushStandaloneReasoning();
+        lastAssistant = null;
         if (!message.content) break;
         // `aguiRole` markers let migrate restore the developer role.
         const metadata =
@@ -129,14 +144,16 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           });
         }
         if (parts.length) {
-          ui.push({
+          const assistant = {
             id: message.id,
             role: "assistant",
             parts,
             ...(message.metadata !== undefined && {
               metadata: message.metadata
             })
-          } as UIMessage);
+          } as UIMessage;
+          ui.push(assistant);
+          lastAssistant = assistant;
         }
         break;
       }

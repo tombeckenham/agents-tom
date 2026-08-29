@@ -70,12 +70,25 @@ export class ChunkToEventProjector {
   /** Project a single Vercel `UIMessageChunk` into zero or more `AGUIEvent`s. */
   project(chunk: UIMessageChunk): AGUIEvent[] {
     switch (chunk.type) {
-      case "start":
+      case "start": {
         // `RUN_STARTED` has no message id, so remember the one the Vercel
         // `start` carries and hand it to tool calls as `parentMessageId` —
         // the only id source a tool-first turn has. See `toolCallStart`.
         if (chunk.messageId != null) this.runMessageId = chunk.messageId;
-        return this.emitRunStarted();
+        const events = this.emitRunStarted();
+        // A `start` can carry messageMetadata (the AI SDK writes it onto the
+        // message); forward it so the reducer attaches it to the assistant.
+        const startMetadata = (chunk as { messageMetadata?: unknown })
+          .messageMetadata;
+        if (startMetadata !== undefined) {
+          events.push({
+            type: "CUSTOM",
+            name: "cf.agents.message_metadata",
+            value: startMetadata
+          });
+        }
+        return events;
+      }
 
       case "start-step":
         return [{ type: "STEP_STARTED", stepName: "step" }];
@@ -85,7 +98,7 @@ export class ChunkToEventProjector {
 
       case "text-start": {
         const events = this.emitRunStarted();
-        const messageId = this.textMessageId(chunk.id);
+        const messageId = this.textMessageId(chunk.id ?? "__text");
         this.currentTextId = messageId;
         events.push({
           type: "TEXT_MESSAGE_START",
@@ -99,7 +112,7 @@ export class ChunkToEventProjector {
         return [
           {
             type: "TEXT_MESSAGE_CONTENT",
-            messageId: this.textMessageId(chunk.id),
+            messageId: this.textMessageId(chunk.id ?? "__text"),
             delta: chunk.delta
           }
         ];
@@ -107,32 +120,40 @@ export class ChunkToEventProjector {
       case "text-end":
         this.currentTextId = null;
         return [
-          { type: "TEXT_MESSAGE_END", messageId: this.textMessageId(chunk.id) }
+          { type: "TEXT_MESSAGE_END", messageId: this.textMessageId(chunk.id ?? "__text") }
         ];
 
       case "reasoning-start": {
         const events = this.emitRunStarted();
-        this.currentReasoningId = chunk.id;
+        // Some producers omit the part id; AG-UI requires one — synthesize.
+        const reasoningId = chunk.id ?? nanoid();
+        this.currentReasoningId = reasoningId;
         events.push({
           type: "REASONING_MESSAGE_START",
-          messageId: chunk.id,
+          messageId: reasoningId,
           role: "reasoning"
         });
         return events;
       }
 
-      case "reasoning-delta":
+      case "reasoning-delta": {
+        const reasoningId = chunk.id ?? this.currentReasoningId;
+        if (reasoningId == null) return [];
         return [
           {
             type: "REASONING_MESSAGE_CONTENT",
-            messageId: chunk.id,
+            messageId: reasoningId,
             delta: chunk.delta
           }
         ];
+      }
 
-      case "reasoning-end":
+      case "reasoning-end": {
+        const reasoningId = chunk.id ?? this.currentReasoningId;
         this.currentReasoningId = null;
-        return [{ type: "REASONING_MESSAGE_END", messageId: chunk.id }];
+        if (reasoningId == null) return [];
+        return [{ type: "REASONING_MESSAGE_END", messageId: reasoningId }];
+      }
 
       case "tool-input-start": {
         const events = this.emitRunStarted();

@@ -4,11 +4,11 @@ import { describe, it, expect } from "vitest";
 import type { UIMessage as ChatMessage } from "ai";
 import { convertToModelMessages } from "ai";
 import {
-import { wrapLegacyWireWS } from "./test-utils";
   applyChunkToParts,
   type MessageParts,
   type StreamChunkData
 } from "agents/chat";
+import { wrapLegacyWireWS } from "./test-utils";
 
 describe("Client-side tool duplicate message prevention", () => {
   it("merges tool output into existing message by toolCallId", async () => {

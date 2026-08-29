@@ -27,6 +27,71 @@ import type {
   ChatRecoveryOptions
 } from "../";
 import { ResumableStream, toUIMessages } from "agents/chat";
+import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+
+/**
+ * Stateful translator: legacy AI SDK chunk bodies (often without part ids)
+ * → the AG-UI event bodies the engine stores. One instance per seeded
+ * stream; no flush, so an interrupted seed never gains a RUN_FINISHED it
+ * never had.
+ */
+type SeedTranslator = (body: string) => string[];
+
+function createSeedTranslator(anchorMessageId?: string): SeedTranslator {
+  // Anchoring mirrors the live path: the server-side chunk-to-event
+  // projection injects the allocated/seed assistant id when the producer's
+  // start chunk carries none.
+  const projector = new ChunkToEventProjector(
+    anchorMessageId !== undefined ? { messageId: anchorMessageId } : undefined
+  );
+  let counter = 0;
+  let currentTextId: string | undefined;
+  let currentReasoningId: string | undefined;
+  return (body) => {
+    let chunk: Record<string, unknown>;
+    try {
+      chunk = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return [body];
+    }
+    const type = chunk.type as string;
+    if (typeof type !== "string" || type === type.toUpperCase()) {
+      // Already an AG-UI event (or unknown) — store verbatim.
+      return [body];
+    }
+    if ((type === "text-start" || type === "reasoning-start") && !chunk.id) {
+      const id = `seed-part-${counter++}`;
+      if (type === "text-start") currentTextId = id;
+      else currentReasoningId = id;
+      chunk.id = id;
+    } else if ((type === "text-delta" || type === "text-end") && !chunk.id) {
+      chunk.id = currentTextId;
+    } else if (
+      (type === "reasoning-delta" || type === "reasoning-end") &&
+      !chunk.id
+    ) {
+      chunk.id = currentReasoningId;
+    }
+    const events = projector.project(chunk as never);
+    // Unknown/opaque bodies (storage-mechanics tests store `{"type":"text"}`
+    // payloads) keep their original bytes.
+    if (events.length === 0) return [body];
+    return events.map((event) => JSON.stringify(event));
+  };
+}
+
+/** One-shot translation for a whole seeded chunk list. */
+function toAGUISeedBodies(
+  chunks: Array<{ body: string; index: number }>,
+  anchorMessageId?: string
+): string[] {
+  const translate = createSeedTranslator(anchorMessageId);
+  const out: string[] = [];
+  for (const { body } of [...chunks].sort((a, b) => a.index - b.index)) {
+    out.push(...translate(body));
+  }
+  return out;
+}
 
 // Type helper for tool call parts - extracts from ChatMessage parts
 type TestToolCallPart = Extract<
@@ -463,12 +528,17 @@ export class TestChatAgent extends AIChatAgent<Env> {
 
   isChatTurnActiveForTest(): boolean {
     return (
-      this as unknown as { isChatTurnActive(): boolean }
-    ).isChatTurnActive();
+      this as unknown as { _turnQueue: { isActive: boolean } }
+    )._turnQueue.isActive;
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   getChatMessageCallCountForTest(): number {
@@ -693,8 +763,23 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return this._startStream(requestId, options);
   }
 
+  // Legacy chunk bodies handed by the tests are translated to the AG-UI
+  // events the engine stores; one stateful translator per stream.
+  private _seedTranslators = new Map<string, SeedTranslator>();
+
+  private _translateSeed(streamId: string, body: string): string[] {
+    let translate = this._seedTranslators.get(streamId);
+    if (!translate) {
+      translate = createSeedTranslator();
+      this._seedTranslators.set(streamId, translate);
+    }
+    return translate(body);
+  }
+
   async testStoreStreamChunk(streamId: string, body: string): Promise<void> {
-    await this._storeStreamChunk(streamId, body);
+    for (const eventBody of this._translateSeed(streamId, body)) {
+      await this._storeStreamChunk(streamId, eventBody);
+    }
   }
 
   async testBroadcastLiveChunk(
@@ -702,21 +787,23 @@ export class TestChatAgent extends AIChatAgent<Env> {
     streamId: string,
     body: string
   ): Promise<void> {
-    await this._storeStreamChunk(streamId, body);
-    const message: OutgoingMessage = {
-      body,
-      done: false,
-      id: requestId,
-      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
-    };
-    (
+    const broadcast = (
       this as unknown as {
         _broadcastChatMessage: (
           msg: OutgoingMessage,
           exclude?: string[]
         ) => void;
       }
-    )._broadcastChatMessage(message);
+    )._broadcastChatMessage.bind(this);
+    for (const eventBody of this._translateSeed(streamId, body)) {
+      await this._storeStreamChunk(streamId, eventBody);
+      broadcast({
+        body: eventBody,
+        done: false,
+        id: requestId,
+        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+      });
+    }
   }
 
   testFlushChunkBuffer(): void {
@@ -1131,12 +1218,17 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
 
   isChatTurnActiveForTest(): boolean {
     return (
-      this as unknown as { isChatTurnActive(): boolean }
-    ).isChatTurnActive();
+      this as unknown as { _turnQueue: { isActive: boolean } }
+    )._turnQueue.isActive;
   }
 
   async waitForIdleForTest(): Promise<boolean> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
     return true;
   }
 
@@ -1172,9 +1264,15 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
   }
 
   abortActiveTurnForTest(): boolean {
-    return (
-      this as unknown as { abortActiveTurn(): boolean }
-    ).abortActiveTurn();
+    // Engine shape: abort the active stream's request via the registry.
+    const internals = this as unknown as {
+      _activeRequestId: string | null;
+      _abortRegistry: { cancel(id: string): void };
+    };
+    const requestId = internals._activeRequestId;
+    if (!requestId) return false;
+    internals._abortRegistry.cancel(requestId);
+    return true;
   }
 
   resetTurnStateForTest(): void {
@@ -1500,7 +1598,12 @@ export class ResponseAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   getPersistedMessages(): ChatMessage[] {
@@ -1638,7 +1741,12 @@ export class ResponseSaveMessagesAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   getPersistedMessages(): ChatMessage[] {
@@ -1970,25 +2078,32 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
 
     const start = await read();
     const streamId = self._resumableStream.start("req-progress-immunity");
-    await self._storeStreamChunk(
-      streamId,
-      JSON.stringify({ type: "text-start", id: "t" })
-    );
+    // Post-cutover the engine stores AG-UI events; milestones credit progress.
     await self._storeStreamChunk(
       streamId,
       JSON.stringify({
-        type: "tool-input-available",
-        toolCallId: "tc1",
-        toolName: "x",
-        input: {}
+        type: "TEXT_MESSAGE_START",
+        messageId: "t",
+        role: "assistant"
       })
     );
     await self._storeStreamChunk(
       streamId,
       JSON.stringify({
-        type: "tool-output-available",
+        type: "TOOL_CALL_START",
         toolCallId: "tc1",
-        output: { ok: true }
+        toolCallName: "x",
+        parentMessageId: "t"
+      })
+    );
+    await self._storeStreamChunk(
+      streamId,
+      JSON.stringify({
+        type: "TOOL_CALL_RESULT",
+        messageId: "tool-tc1",
+        toolCallId: "tc1",
+        content: "{\"ok\":true}",
+        role: "tool"
       })
     );
     const afterFlush = await read();
@@ -2790,7 +2905,12 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   async triggerInterruptedStreamCheck(): Promise<void> {
@@ -2881,11 +3001,14 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       insert into cf_ai_chat_stream_metadata (id, request_id, status, created_at, message_id)
       values (${streamId}, ${requestId}, 'streaming', ${createdAt}, ${messageId})
     `;
-    for (const chunk of chunks) {
-      const id = `chunk-${streamId}-${chunk.index}`;
+    // Seeds predate the cutover and carry AI SDK chunk bodies; the engine
+    // stores AG-UI events — translate at insertion.
+    const bodies = toAGUISeedBodies(chunks, metadata?.messageId);
+    for (let index = 0; index < bodies.length; index++) {
+      const id = `chunk-${streamId}-${index}`;
       this.sql`
         insert into cf_ai_chat_stream_chunks (id, stream_id, body, chunk_index, created_at)
-        values (${id}, ${streamId}, ${chunk.body}, ${chunk.index}, ${createdAt})
+        values (${id}, ${streamId}, ${bodies[index]}, ${index}, ${createdAt})
       `;
     }
     this._resumableStream.restore();
@@ -3031,7 +3154,12 @@ export class NonChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 }
 
@@ -3089,7 +3217,12 @@ export class RecoveryThrowingAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 }
 

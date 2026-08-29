@@ -941,25 +941,29 @@ describe("Resumable Streaming", () => {
         1000
       );
 
+      // Post-cutover the stored stream opens with a `start` carrying the
+      // run's generated assistant id, and part ids are opaque — assert
+      // shape/order, not exact id bytes.
       const responseMessages = messages.filter(isUseChatResponseMessage);
-      expect(responseMessages[0]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-start","id":"t1"}',
-          done: false,
-          replay: true
-        })
-      );
-      expect(responseMessages[1]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-delta","id":"t1","delta":"hello after ack"}',
-          done: false,
-          replay: true
-        })
-      );
+      const bodies = responseMessages.map((m) =>
+        typeof m.body === "string" && m.body ? JSON.parse(m.body) : m.body
+      ) as Array<{ type?: string; delta?: string }>;
+      expect(bodies[0]?.type).toBe("start");
+      expect(bodies[1]?.type).toBe("text-start");
+      expect(bodies[2]).toMatchObject({
+        type: "text-delta",
+        delta: "hello after ack"
+      });
+      for (const frame of responseMessages.slice(0, 3)) {
+        expect(frame).toEqual(
+          expect.objectContaining({
+            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+            id: requestId,
+            done: false,
+            replay: true
+          })
+        );
+      }
       expect(responseMessages.at(-1)).toEqual(
         expect.objectContaining({
           type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
@@ -1421,10 +1425,15 @@ describe("Resumable Streaming", () => {
         }
       ]);
 
-      // Start a continuation stream whose start chunk has NO messageId
-      // (stripped by #1229 server-side logic).
+      // Post-cutover a continuation stream is anchored server-side on the
+      // seed assistant id (chunk-to-event injects it; the #1229 provider-id
+      // strip is upstream of that), so the stored stream opens with the
+      // existing assistant's id.
       const streamId = await agentStub.testStartStream("req-cont-orphan");
-      await agentStub.testStoreStreamChunk(streamId, '{"type":"start"}');
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"start","messageId":"assistant-cont"}'
+      );
       await agentStub.testStoreStreamChunk(
         streamId,
         '{"type":"text-start","id":"t-cont"}'
@@ -2319,7 +2328,10 @@ describe("Resumable Streaming", () => {
       );
 
       const frames = replayFrames();
-      expect(frames.length).toBeGreaterThanOrEqual(3);
+      // Post-cutover RUN_STARTED has no chunk projection, so the replay is
+      // one frame shorter than the legacy wire; the contract under test is
+      // the continuation flag, not the frame count.
+      expect(frames.length).toBeGreaterThanOrEqual(2);
       for (const frame of frames) {
         expect(frame.continuation).toBe(true);
       }
