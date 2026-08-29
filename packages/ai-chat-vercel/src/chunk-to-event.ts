@@ -31,6 +31,11 @@ export class ChunkToEventProjector {
   private readonly threadId: string;
   private readonly runId: string;
   private runStarted = false;
+  // Assistant message id from the Vercel `start` chunk; carried onto tool
+  // calls as `parentMessageId` since AG-UI keeps no run-level message id.
+  private runMessageId: string | null = null;
+  // Vercel text part id -> the AG-UI message id it maps to.
+  private textPartMessageIds = new Map<string, string>();
   private runFinished = false;
   // Vercel `text-*` and `reasoning-*` chunks carry an `id`; AG-UI's
   // `messageId` is the same identifier. Tracked here so we can reuse it
@@ -58,6 +63,10 @@ export class ChunkToEventProjector {
   project(chunk: UIMessageChunk): AGUIEvent[] {
     switch (chunk.type) {
       case "start":
+        // `RUN_STARTED` has no message id, so remember the one the Vercel
+        // `start` carries and hand it to tool calls as `parentMessageId` —
+        // the only id source a tool-first turn has. See `toolCallStart`.
+        if (chunk.messageId != null) this.runMessageId = chunk.messageId;
         return this.emitRunStarted();
 
       case "start-step":
@@ -68,10 +77,11 @@ export class ChunkToEventProjector {
 
       case "text-start": {
         const events = this.emitRunStarted();
-        this.currentTextId = chunk.id;
+        const messageId = this.textMessageId(chunk.id);
+        this.currentTextId = messageId;
         events.push({
           type: "TEXT_MESSAGE_START",
-          messageId: chunk.id,
+          messageId,
           role: "assistant"
         });
         return events;
@@ -81,14 +91,16 @@ export class ChunkToEventProjector {
         return [
           {
             type: "TEXT_MESSAGE_CONTENT",
-            messageId: chunk.id,
+            messageId: this.textMessageId(chunk.id),
             delta: chunk.delta
           }
         ];
 
       case "text-end":
         this.currentTextId = null;
-        return [{ type: "TEXT_MESSAGE_END", messageId: chunk.id }];
+        return [
+          { type: "TEXT_MESSAGE_END", messageId: this.textMessageId(chunk.id) }
+        ];
 
       case "reasoning-start": {
         const events = this.emitRunStarted();
@@ -117,11 +129,7 @@ export class ChunkToEventProjector {
       case "tool-input-start": {
         const events = this.emitRunStarted();
         this.toolNamesById.set(chunk.toolCallId, chunk.toolName);
-        events.push({
-          type: "TOOL_CALL_START",
-          toolCallId: chunk.toolCallId,
-          toolCallName: chunk.toolName
-        });
+        events.push(this.toolCallStart(chunk.toolCallId, chunk.toolName));
         return events;
       }
 
@@ -143,11 +151,7 @@ export class ChunkToEventProjector {
         const events = this.emitRunStarted();
         if (!this.toolNamesById.has(chunk.toolCallId)) {
           this.toolNamesById.set(chunk.toolCallId, chunk.toolName);
-          events.push({
-            type: "TOOL_CALL_START",
-            toolCallId: chunk.toolCallId,
-            toolCallName: chunk.toolName
-          });
+          events.push(this.toolCallStart(chunk.toolCallId, chunk.toolName));
         }
         if (!this.argsEmitted.has(chunk.toolCallId)) {
           this.argsEmitted.add(chunk.toolCallId);
@@ -305,6 +309,42 @@ export class ChunkToEventProjector {
   flush(): AGUIEvent[] {
     if (this.runFinished || !this.runStarted) return [];
     return this.emitRunFinished("stop");
+  }
+
+  /**
+   * `parentMessageId` is what lets a consumer attribute a tool call to its
+   * assistant message — the reducer in `agui-message-builder` invents an id
+   * without it, and the client projection has no other id for a turn whose
+   * first content is a tool call.
+   */
+  /**
+   * AG-UI keys a text message by the ASSISTANT message id; Vercel's
+   * `text-start.id` is a *part* id, and the `start` chunk carries the real
+   * message id. Mapping the part id straight through renamed the assistant on
+   * every round trip, so the run's first text part adopts the run message id.
+   * Later parts keep their own ids — remapping them all onto one id would
+   * change how multi-part turns reduce.
+   */
+  private textMessageId(partId: string): string {
+    const known = this.textPartMessageIds.get(partId);
+    if (known) return known;
+    const messageId =
+      this.runMessageId != null && this.textPartMessageIds.size === 0
+        ? this.runMessageId
+        : partId;
+    this.textPartMessageIds.set(partId, messageId);
+    return messageId;
+  }
+
+  private toolCallStart(toolCallId: string, toolCallName: string): AGUIEvent {
+    return {
+      type: "TOOL_CALL_START",
+      toolCallId,
+      toolCallName,
+      ...(this.runMessageId != null
+        ? { parentMessageId: this.runMessageId }
+        : {})
+    };
   }
 
   private emitRunStarted(): AGUIEvent[] {

@@ -31,7 +31,11 @@ export default defineConfig({
     testNamePattern:
       /^(?!.*does not remove a completed hydrated assistant when resume belongs to a different message).*$/,
     retry: 3,
-    include: [path.join(testsDir, "use-agent-chat.test.tsx")],
+    include: [
+      path.join(testsDir, "use-agent-chat.test.tsx"),
+      // AG-UI-wire-specific frames, driving the hook directly (no shim).
+      path.join(testsDir, "use-agent-chat-agui.test.tsx")
+    ],
     browser: {
       enabled: true,
       instances: [

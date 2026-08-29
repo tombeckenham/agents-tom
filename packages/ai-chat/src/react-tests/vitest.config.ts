@@ -13,6 +13,8 @@ export default defineConfig({
     // Retry flaky browser/Playwright runs before failing.
     retry: 3,
     include: [path.join(testsDir, "**/*.test.{ts,tsx}")],
+    // AG-UI-wire-specific; belongs to the `react-agui` project only.
+    exclude: [path.join(testsDir, "use-agent-chat-agui.test.tsx")],
     browser: {
       enabled: true,
       instances: [

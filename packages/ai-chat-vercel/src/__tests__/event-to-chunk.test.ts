@@ -223,7 +223,12 @@ describe("EventToChunkProjector — tool approval round-trip", () => {
     const chunks = project([
       { type: "CUSTOM", name: "myapp.special", value: { foo: 1 } }
     ]);
-    expect(chunks).toEqual([{ type: "data-myapp.special", data: { foo: 1 } }]);
+    // A non-transient data chunk pushes a part in the AI SDK, so it opens the
+    // assistant message and gets the leading `start` (see `opensMessage`).
+    expect(chunks).toEqual([
+      { type: "start" },
+      { type: "data-myapp.special", data: { foo: 1 } }
+    ]);
   });
 });
 
@@ -232,7 +237,8 @@ describe("EventToChunkProjector — STATE/ACTIVITY/RAW pass-through to data chun
     const chunks = project([
       { type: "STATE_SNAPSHOT", snapshot: { counter: 1 } }
     ]);
-    expect(chunks[0]).toMatchObject({
+    expect(chunks[0]).toEqual({ type: "start" });
+    expect(chunks[1]).toMatchObject({
       type: "data-cf.state",
       id: "snapshot",
       data: { counter: 1 }

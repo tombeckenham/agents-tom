@@ -38,7 +38,11 @@ import {
   type BroadcastStreamState,
   type OutgoingMessage
 } from "agents/chat";
-import type { AGUIEvent, AGUIMessage } from "agents/chat/agui-types";
+import type {
+  AGUIEvent,
+  AGUIMessage,
+  ToolMessage
+} from "agents/chat/agui-types";
 import { EventToChunkProjector } from "@cloudflare/ai-chat-vercel";
 import { WebSocketChatTransport } from "@cloudflare/ai-chat-vercel/react";
 import {
@@ -161,8 +165,13 @@ function prependMissingHydratedMessages<ChatMessage extends UIMessage>(
  */
 class FrameProjectors {
   private projectors = new Map<string, EventToChunkProjector>();
+  /** Runs whose projector threw. Their remaining frames are not projected. */
+  private failed = new Set<string>();
+
+  constructor(private onError: (error: Error) => void) {}
 
   project(requestId: string, body: string | undefined): UIMessageChunk[] {
+    if (this.failed.has(requestId)) return [];
     if (!body?.trim()) return [];
     let event: AGUIEvent;
     try {
@@ -185,17 +194,28 @@ class FrameProjectors {
     try {
       return projector.project(event);
     } catch (projectionError) {
-      console.warn("[useAgentChat] AG-UI projection failed:", projectionError);
+      // A throw leaves the projector mid-event, so every later frame for this
+      // run would render as silent truncation. Fail the run and surface it,
+      // matching how the transport path errors a turn it cannot project.
+      this.failed.add(requestId);
+      this.projectors.delete(requestId);
+      this.onError(
+        projectionError instanceof Error
+          ? projectionError
+          : new Error(String(projectionError))
+      );
       return [];
     }
   }
 
   release(requestId: string) {
     this.projectors.delete(requestId);
+    this.failed.delete(requestId);
   }
 
   clear() {
     this.projectors.clear();
+    this.failed.clear();
   }
 }
 
@@ -210,7 +230,83 @@ function toChatMessages<ChatMessage extends UIMessage>(
   if (messages.every((message) => "parts" in message)) {
     return [...(messages as readonly ChatMessage[])];
   }
-  return toUIMessages(messages as readonly AGUIMessage[]) as ChatMessage[];
+  const projected = toUIMessages(
+    messages as readonly AGUIMessage[]
+  ) as ChatMessage[];
+  if (projected.length < messages.length) {
+    // Rows with no `UIMessage` counterpart (`activity`, an orphan `tool` row)
+    // are dropped by design — the documented lossy edge of the reverse
+    // projection. They cannot be carried through: a raw AG-UI row in this
+    // list would not render and would be written back as-is.
+    //
+    // HAZARD: with `syncMessagesToServer` (default), a later `setMessages`
+    // echoes this shorter list back as CF_AGENT_CHAT_MESSAGES and persists
+    // the deletion. Hosts that store activity rows should pass
+    // `syncMessagesToServer: false` (server-authoritative, as the option's
+    // docs describe).
+    console.warn(
+      `[useAgentChat] ${messages.length - projected.length} AG-UI row(s) have no UIMessage counterpart and were dropped; ` +
+        "with syncMessagesToServer they can be persisted away."
+    );
+  }
+  return projected;
+}
+
+/** An AG-UI `role:"tool"` row, as `CF_AGENT_MESSAGE_UPDATED` carries it. */
+function isAGUIToolRow(message: unknown): message is ToolMessage {
+  return (
+    !!message &&
+    typeof message === "object" &&
+    (message as { role?: unknown }).role === "tool" &&
+    typeof (message as { toolCallId?: unknown }).toolCallId === "string"
+  );
+}
+
+/**
+ * Apply a tool result / approval decision onto the tool part already in the
+ * transcript. Mirrors `toUIMessages`' `case "tool"`, which is unreachable for
+ * a standalone row, and is exported for the test that drives this frame.
+ */
+export function applyToolRowUpdate<ChatMessage extends UIMessage>(
+  prevMessages: ChatMessage[],
+  row: ToolMessage
+): ChatMessage[] {
+  const messageIdx = prevMessages.findIndex((message) =>
+    message.parts.some(
+      (part) =>
+        "toolCallId" in part &&
+        (part as { toolCallId: string }).toolCallId === row.toolCallId
+    )
+  );
+  // Never append: an unknown tool call arrives via the stream or
+  // CF_AGENT_CHAT_MESSAGES; appending here duplicates it (#1094).
+  if (messageIdx < 0) return prevMessages;
+
+  const message = prevMessages[messageIdx];
+  const parts = message.parts.map((part) => {
+    if (
+      !("toolCallId" in part) ||
+      (part as { toolCallId: string }).toolCallId !== row.toolCallId
+    ) {
+      return part;
+    }
+    return row.error
+      ? { ...part, state: "output-error", errorText: row.error }
+      : { ...part, state: "output-available", output: parseToolContent(row) };
+  }) as ChatMessage["parts"];
+
+  const next = [...prevMessages];
+  next[messageIdx] = { ...message, parts };
+  return next;
+}
+
+/** Tool output travels as a JSON string; non-JSON stays a raw string. */
+function parseToolContent(row: ToolMessage): unknown {
+  try {
+    return JSON.parse(row.content);
+  } catch {
+    return row.content;
+  }
 }
 
 /** The leading `{ type: "start", messageId }` chunk of a projected run. */
@@ -302,6 +398,10 @@ export function useAgentChat<
   onToolCallRef.current = onToolCall;
   const onDataRef = useRef(onData);
   onDataRef.current = onData;
+  // `onError` stays in `rest` (it belongs to `useChat`); the observer path
+  // reports projection failures through the same callback.
+  const onErrorRef = useRef(options.onError);
+  onErrorRef.current = options.onError;
 
   const rawHttpUrl = agent.getHttpUrl();
   const agentUrl = rawHttpUrl ? new URL(rawHttpUrl) : null;
@@ -447,7 +547,10 @@ export function useAgentChat<
   const fallbackAckedResumeRequestIdsRef = useRef<Set<string>>(new Set());
   const frameProjectorsRef = useRef<FrameProjectors>(null as never);
   if (frameProjectorsRef.current === null) {
-    frameProjectorsRef.current = new FrameProjectors();
+    frameProjectorsRef.current = new FrameProjectors((error) => {
+      console.error("[useAgentChat] AG-UI projection failed:", error);
+      onErrorRef.current?.(error);
+    });
   }
 
   // Singleton transport: its resume resolver and the hook's
@@ -537,6 +640,11 @@ export function useAgentChat<
     resumeOperationRef.current = null;
   }, []);
 
+  // #1620: a durable turn is being recovered — "working, not frozen",
+  // distinct from active streaming. Declared here so the resume gate below
+  // can retire the hint when a recovery never materializes.
+  const [isRecovering, setIsRecovering] = useState(false);
+
   const resumeStream = useCallback(
     (...args: Parameters<typeof rawResumeStream>): Promise<void> => {
       const active = resumeOperationRef.current;
@@ -549,18 +657,32 @@ export function useAgentChat<
       // Publish ownership before invoking, but invoke synchronously so
       // StrictMode cleanup can always cancel the resolver it creates.
       resumeOperationRef.current = operation;
-      operation.promise = rawResumeStream(...args).finally(() => {
-        if (
-          resumeOperationRef.current !== operation ||
-          resumeGenerationRef.current !== operation.generation
-        ) {
-          return;
+      try {
+        operation.promise = rawResumeStream(...args).finally(() => {
+          if (
+            resumeOperationRef.current !== operation ||
+            resumeGenerationRef.current !== operation.generation
+          ) {
+            return;
+          }
+          resumeOperationRef.current = null;
+          // The resume settled without a live stream: whatever the server
+          // said was recovering never arrived (a give-up on the #1784
+          // pending backstop looks exactly like this). Retire the hint
+          // instead of leaving a permanent "recovering…" spinner.
+          if (statusRef.current !== "streaming") setIsRecovering(false);
+          // An open event suppressed while this operation ran is
+          // edge-triggered; retry it now rather than losing it.
+          reconnectProbeRunnerRef.current?.();
+        });
+      } catch (error) {
+        // A synchronous throw would leave the gate held forever, wedging
+        // every later resume entry point behind a promise that never settles.
+        if (resumeOperationRef.current === operation) {
+          resumeOperationRef.current = null;
         }
-        resumeOperationRef.current = null;
-        // An open event suppressed while this operation ran is edge-triggered;
-        // retry it now rather than losing it.
-        reconnectProbeRunnerRef.current?.();
-      });
+        return Promise.reject(error);
+      }
       return operation.promise;
     },
     [rawResumeStream]
@@ -1189,9 +1311,6 @@ export function useAgentChat<
   const streamStateRef = useRef<BroadcastStreamState>({ status: "idle" });
 
   const [isServerStreaming, setIsServerStreaming] = useState(false);
-  // #1620: a durable turn is being recovered — "working, not frozen", distinct
-  // from active streaming.
-  const [isRecovering, setIsRecovering] = useState(false);
 
   useEffect(() => {
     const localResponseIds = localResponseMessageIdsRef.current;
@@ -1249,6 +1368,14 @@ export function useAgentChat<
 
         case MessageType.CF_AGENT_MESSAGE_UPDATED:
           setMessages((prevMessages: ChatMessage[]) => {
+            // On the AG-UI wire this frame is a standalone `role:"tool"` row.
+            // It has no `UIMessage` of its own — `toUIMessages` attaches a tool
+            // result to the part its issuing assistant opened, and drops an
+            // orphan row — so fold it onto the transcript by `toolCallId`.
+            if (isAGUIToolRow(data.message)) {
+              return applyToolRowUpdate(prevMessages, data.message);
+            }
+
             const updatedMessage = toChatMessages<ChatMessage>([
               data.message
             ])[0];
@@ -1520,6 +1647,9 @@ export function useAgentChat<
               messageId: nanoid(),
               chunkData: steps[i],
               done: isLast ? data.done : false,
+              // Always false here: an error frame breaks out above. Passed
+              // explicitly so this stays correct if that guard ever moves.
+              error: isLast ? data.error : false,
               replay: data.replay,
               replayComplete: isLast ? data.replayComplete : false,
               continuation: data.continuation,
@@ -1634,6 +1764,12 @@ export function useAgentChat<
       protectedStreamingAssistantRef.current = null;
       localResponseIds.clear();
       frameProjectors.clear();
+      // A launch scheduled just before unmount would otherwise fire against
+      // a torn-down socket and an obsolete Chat generation.
+      if (continuationLaunchTimerRef.current) {
+        clearTimeout(continuationLaunchTimerRef.current);
+        continuationLaunchTimerRef.current = null;
+      }
 
       // Invalidate both sides of an old agent/Chat generation. The transport
       // settles identity-safely; the token stops its late AI SDK finalizer

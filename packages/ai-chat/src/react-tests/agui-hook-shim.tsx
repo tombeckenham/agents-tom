@@ -15,6 +15,7 @@
 
 import type { UIMessage, UIMessageChunk } from "ai";
 import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+import { autoTransformAGUIMessages } from "agents/chat";
 import {
   useAgentChat as useAGUIAgentChat,
   type UseAgentChatOptions
@@ -36,6 +37,7 @@ type ResponseFrame = {
 };
 
 const RESPONSE = "cf_agent_use_chat_response";
+const CHAT_MESSAGES = "cf_agent_chat_messages";
 
 /**
  * Chunk frame → zero or more AG-UI frames. Stateful per request id, mirroring
@@ -43,7 +45,6 @@ const RESPONSE = "cf_agent_use_chat_response";
  */
 function createFrameCodec() {
   const projectors = new Map<string, ChunkToEventProjector>();
-  const runMessageIds = new Map<string, string>();
 
   return function translate(raw: string): string[] {
     let frame: ResponseFrame;
@@ -52,6 +53,23 @@ function createFrameCodec() {
     } catch {
       return [raw];
     }
+    // The transcript frames carry `UIMessage` rows; a real AG-UI host sends
+    // AG-UI rows, so translate them too — otherwise `toChatMessages`' shortcut
+    // for already-projected rows hides its projection path from the suite.
+    if (frame.type === CHAT_MESSAGES) {
+      const messages = (frame as unknown as { messages?: unknown }).messages;
+      if (!Array.isArray(messages)) return [raw];
+      return [
+        JSON.stringify({
+          ...frame,
+          messages: autoTransformAGUIMessages(messages as UIMessage[])
+        })
+      ];
+    }
+    // Anything that is not a response frame is envelope-only and identical on
+    // both wires. `cf_agent_message_updated` is deliberately not translated:
+    // a real host sends a standalone AG-UI `role:"tool"` row, which the test
+    // for that frame dispatches directly.
     if (frame.type !== RESPONSE || typeof frame.id !== "string") return [raw];
     // Error bodies are diagnostics, not chunks — both wires pass them through.
     if (frame.error) return [raw];
@@ -63,7 +81,9 @@ function createFrameCodec() {
     try {
       chunk = JSON.parse(body) as UIMessageChunk;
     } catch {
-      return [raw];
+      throw new Error(
+        `[agui-shim] response body is not a UIMessageChunk: ${body}`
+      );
     }
 
     const requestId = frame.id;
@@ -71,35 +91,22 @@ function createFrameCodec() {
     if (!projector || chunk.type === "start") {
       projector = new ChunkToEventProjector();
       projectors.set(requestId, projector);
-      const messageId = (chunk as { messageId?: unknown }).messageId;
-      if (typeof messageId === "string")
-        runMessageIds.set(requestId, messageId);
-    }
-
-    // AG-UI has no run-level message id: the assistant id IS the text /
-    // reasoning message id. A real server therefore emits its persisted
-    // assistant id on TEXT_MESSAGE_START; pin the suite's synthetic part ids
-    // to the run's `start.messageId` so the same identity reaches the hook.
-    const runMessageId = runMessageIds.get(requestId);
-    if (
-      runMessageId &&
-      (chunk.type.startsWith("text-") || chunk.type.startsWith("reasoning-"))
-    ) {
-      chunk = { ...chunk, id: runMessageId } as UIMessageChunk;
     }
 
     const events = projector.project(chunk);
-    if (events.length === 0) {
-      // Nothing goes on the wire for this chunk (e.g. a buffered `start`);
-      // a terminal frame still has to land.
-      return frame.done || frame.replayComplete
-        ? [JSON.stringify({ ...frame, body: "" })]
-        : [];
-    }
+    // Terminal bookkeeping runs before the zero-event early return, or a
+    // finished turn leaks its projector.
+    if (frame.done || frame.replayComplete) projectors.delete(requestId);
 
-    if (frame.done || frame.replayComplete) {
-      projectors.delete(requestId);
-      runMessageIds.delete(requestId);
+    if (events.length === 0) {
+      // A chunk with no AG-UI counterpart must not silently vanish; only a
+      // terminal frame legitimately carries nothing.
+      if (!frame.done && !frame.replayComplete) {
+        throw new Error(
+          `[agui-shim] chunk projected to no AG-UI events: ${body}`
+        );
+      }
+      return [JSON.stringify({ ...frame, body: "" })];
     }
 
     return events.map((event, index) => {

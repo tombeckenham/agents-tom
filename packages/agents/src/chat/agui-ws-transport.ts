@@ -151,10 +151,18 @@ export class AGUIWebSocketTransport {
   private activeRequestIds?: Set<string>;
   private cancelOnClientAbort: boolean;
 
-  private _resumeResolver: ((data: { id: string } | null) => void) | null =
-    null;
-  /** Id of the in-flight resume probe; correlates `STREAM_RESUME_NONE`. */
-  private _probeId: string | null = null;
+  /**
+   * The outstanding resume handshake, if any. `probeId` travels with the
+   * resolver rather than in a separate field so an uncorrelated
+   * `STREAM_RESUME_NONE` can never settle a handshake it does not name
+   * (#1914). `isProbe` distinguishes a reconnect probe from a tool
+   * continuation, which owns the slot for its whole life.
+   */
+  private _resumeHandshake: {
+    probeId: string;
+    isProbe: boolean;
+    resolve: (data: { id: string } | null) => void;
+  } | null = null;
   /** Keep-waiting hook for `STREAM_PENDING` (#1784). */
   private _onStreamPending: (() => void) | null = null;
   /** Retransmits the in-flight probe on a replacement socket. */
@@ -230,7 +238,7 @@ export class AGUIWebSocketTransport {
   }
 
   isAwaitingResume(): boolean {
-    return this._resumeResolver !== null;
+    return this._resumeHandshake !== null;
   }
 
   handleStreamResuming(data: { id: string }): boolean {
@@ -238,14 +246,14 @@ export class AGUIWebSocketTransport {
   }
 
   /**
-   * A `STREAM_RESUME_NONE` carrying a `probeId` only answers the probe that
-   * asked; an uncorrelated one (older frame, another connection's
+   * A `STREAM_RESUME_NONE` carrying a `probeId` only answers the handshake
+   * that asked; an uncorrelated one (older frame, another connection's
    * continuation) is not authoritative for ours (#1914).
    */
   handleStreamResumeNone(data: { probeId?: string } = {}): boolean {
-    if (data.probeId && this._probeId && data.probeId !== this._probeId) {
-      return false;
-    }
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    if (data.probeId && data.probeId !== handshake.probeId) return false;
     return this.settleResume(null);
   }
 
@@ -375,6 +383,13 @@ export class AGUIWebSocketTransport {
       return this._createToolContinuationStream();
     }
 
+    // One probe at a time (legacy `reconnectToStream` semantics): a second
+    // concurrent caller would overwrite callbacks the first one owns. A tool
+    // continuation legitimately holds the slot for its whole life, and a
+    // probe is allowed to take it over from one — that hand-off is what
+    // `isProbe` distinguishes.
+    if (this._resumeHandshake?.isProbe) return null;
+
     const probeId = nanoid(8);
     const decision = await new Promise<{ id: string } | null>((resolve) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -383,15 +398,29 @@ export class AGUIWebSocketTransport {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        if (this._resumeResolver === resolver) this._resumeResolver = null;
-        this.clearProbeHooks(onPending, retry, probeId);
+        if (this._resumeHandshake === handshake) this._resumeHandshake = null;
+        this.clearProbeHooks(onPending, retry);
         resolve(data);
       };
       const armTimeout = (delay: number) => {
         clearTimeout(timeout);
-        timeout = setTimeout(() => done(null), delay);
+        timeout = setTimeout(() => {
+          if (delay === RESUME_PENDING_TIMEOUT_MS) {
+            // The server promised a follow-up after STREAM_PENDING and never
+            // sent one. Resolving "no stream" is the safe outcome, but it is
+            // a server-side fault worth seeing.
+            console.warn(
+              "[agents/chat] resume probe gave up waiting for a pending turn"
+            );
+          }
+          done(null);
+        }, delay);
       };
-      const resolver = (data: { id: string } | null) => done(data);
+      const handshake = {
+        probeId,
+        isProbe: true,
+        resolve: (data: { id: string } | null) => done(data)
+      };
       const onPending = () => {
         if (!settled) armTimeout(RESUME_PENDING_TIMEOUT_MS);
       };
@@ -403,8 +432,7 @@ export class AGUIWebSocketTransport {
         this.sendResumeRequest(probeId);
       };
 
-      this._resumeResolver = resolver;
-      this._probeId = probeId;
+      this._resumeHandshake = handshake;
       this._onStreamPending = onPending;
       this._retryResumeProbe = retry;
 
@@ -450,14 +478,9 @@ export class AGUIWebSocketTransport {
   }
 
   /** Drop probe-scoped hooks, but only the ones this probe still owns. */
-  private clearProbeHooks(
-    onPending: () => void,
-    retry: () => void,
-    probeId: string
-  ) {
+  private clearProbeHooks(onPending: () => void, retry: () => void) {
     if (this._onStreamPending === onPending) this._onStreamPending = null;
     if (this._retryResumeProbe === retry) this._retryResumeProbe = null;
-    if (this._probeId === probeId) this._probeId = null;
   }
 
   /**
@@ -469,7 +492,11 @@ export class AGUIWebSocketTransport {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let abort: (() => boolean) | null = null;
     let detach: (() => boolean) | null = null;
-    let resolve: ((data: { id: string } | null) => void) | null = null;
+    let handshake: {
+      probeId: string;
+      isProbe: boolean;
+      resolve: (data: { id: string } | null) => void;
+    } | null = null;
     let onPending: (() => void) | null = null;
     let retry: (() => void) | null = null;
     const probeId = nanoid(8);
@@ -510,22 +537,30 @@ export class AGUIWebSocketTransport {
         };
         this._abortToolContinuation = abort;
 
-        resolve = (decision) => {
-          clearTimeout(timeout);
-          if (decision === null) {
-            ctx.finish(null);
-            return;
-          }
-          ctx.adoptRequestId(decision.id);
-          this.activeRequestIds?.add(decision.id);
-          try {
-            this.sendResumeAck(decision.id);
-          } catch {
-            ctx.finish(null);
+        handshake = {
+          probeId,
+          isProbe: false,
+          resolve: (decision) => {
+            clearTimeout(timeout);
+            if (decision === null) {
+              ctx.finish(null);
+              return;
+            }
+            // The handshake is over once the id is adopted: leaving the
+            // probe hooks armed makes `retryPendingResume()` report a
+            // retransmit it will not perform, and the hook then skips its
+            // own reconnect probe. Mirrors legacy `clearOwnedHandshake`.
+            if (onPending && retry) this.clearProbeHooks(onPending, retry);
+            ctx.adoptRequestId(decision.id);
+            this.activeRequestIds?.add(decision.id);
+            try {
+              this.sendResumeAck(decision.id);
+            } catch {
+              ctx.finish(null);
+            }
           }
         };
-        this._resumeResolver = resolve;
-        this._probeId = probeId;
+        this._resumeHandshake = handshake;
         this._onStreamPending = onPending;
         this._retryResumeProbe = retry;
 
@@ -541,8 +576,8 @@ export class AGUIWebSocketTransport {
         }
         if (this._detachResumeStream === detach)
           this._detachResumeStream = null;
-        if (this._resumeResolver === resolve) this._resumeResolver = null;
-        if (onPending && retry) this.clearProbeHooks(onPending, retry, probeId);
+        if (this._resumeHandshake === handshake) this._resumeHandshake = null;
+        if (onPending && retry) this.clearProbeHooks(onPending, retry);
       }
     );
   }
@@ -563,10 +598,10 @@ export class AGUIWebSocketTransport {
   }
 
   private settleResume(data: { id: string } | null): boolean {
-    const resolver = this._resumeResolver;
-    if (!resolver) return false;
-    this._resumeResolver = null;
-    resolver(data);
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    this._resumeHandshake = null;
+    handshake.resolve(data);
     return true;
   }
 
