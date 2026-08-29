@@ -90,10 +90,14 @@ export function isPersistedAGUIMessage(value: unknown): boolean {
  * `{ id: string, role: string, parts: unknown[] }`. Matches the
  * existing `isUIMessage` guard in `ai-chat-v5-migration.ts`.
  */
+const LEGACY_UI_ROLES = new Set(["user", "assistant", "system"]);
+
 export function isLegacyUIMessage(value: unknown): boolean {
   if (!isObject(value)) return false;
   if (typeof value.id !== "string" || value.id.length === 0) return false;
-  if (typeof value.role !== "string") return false;
+  if (typeof value.role !== "string" || !LEGACY_UI_ROLES.has(value.role)) {
+    return false;
+  }
   if (!Array.isArray(value.parts)) return false;
   return true;
 }

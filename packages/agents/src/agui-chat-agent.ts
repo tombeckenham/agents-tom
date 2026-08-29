@@ -93,7 +93,12 @@ import {
   isReplayEvent,
   type SnapshotState
 } from "./chat/agui-message-builder";
-import { autoTransformAGUIMessages } from "./chat/agui-migration";
+import {
+  autoTransformAGUIMessages,
+  isCleanAGUIMessage,
+  isLegacyUIMessage,
+  isPersistedAGUIMessage
+} from "./chat/agui-migration";
 import { reconcileMessages } from "./chat/agui-message-reconciler";
 import {
   byteLength as aguiByteLength,
@@ -748,9 +753,15 @@ export class AGUIChatAgent<
         const url = new URL(request.url);
         if (url.pathname.split("/").pop() === "get-messages") {
           // Structural validation on read (legacy parity): unrecognized rows
-          // are skipped rather than served; legacy UIMessage rows migrate.
+          // are skipped; recognized rows are served verbatim (including the
+          // `_v` marker) — consumers run the migration themselves.
           return Response.json(
-            autoTransformAGUIMessages(this._loadMessagesFromDb())
+            this._loadMessagesFromDb().filter(
+              (row) =>
+                isPersistedAGUIMessage(row) ||
+                isLegacyUIMessage(row) ||
+                isCleanAGUIMessage(row)
+            )
           );
         }
         return _onRequest(request);

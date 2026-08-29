@@ -75,7 +75,7 @@ export function wrapLegacyWireWS(ws: WebSocket): WebSocket {
     (event: MessageEvent) => void
   >();
   return new Proxy(ws, {
-    get(target, prop, receiver) {
+    get(target, prop) {
       if (prop === "addEventListener") {
         return (type: string, listener: (event: MessageEvent) => void) => {
           if (type !== "message") {
