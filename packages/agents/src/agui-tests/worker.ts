@@ -54,6 +54,39 @@ function sseResponse(
   });
 }
 
+/**
+ * An SSE response that streams a partial assistant turn and then HANGS — the
+ * stream never closes and never emits another event. Exercises the
+ * `chatStreamStallTimeoutMs` inactivity watchdog (#1626): the gap after the
+ * last delta trips the watchdog, which aborts the turn into bounded recovery.
+ */
+function hangingSSEResponse(messageId: string): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const events: AGUIEvent[] = [
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+        { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
+        {
+          type: "TEXT_MESSAGE_CONTENT",
+          messageId,
+          delta: "partial before stall"
+        }
+      ];
+      for (const event of events) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+        );
+      }
+      // Intentionally never enqueue more or close: a hung provider.
+    },
+    cancel() {}
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream" }
+  });
+}
+
 function textRunEvents(messageId: string, deltas: string[]): AGUIEvent[] {
   return [
     { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
@@ -301,6 +334,9 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   private _emitStreamError: string | null = null;
   private _emitStreamErrorAfterChunks = 0;
   private _forceStableTimeout = false;
+  /** Number of upcoming turns whose model stream hangs (see
+   *  {@link hangingSSEResponse}) before reverting to the normal response. */
+  private _hangTurnsRemaining = 0;
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async onChatMessage(
@@ -325,6 +361,13 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
           error: e instanceof Error ? e.message : String(e)
         };
       }
+    }
+
+    if (this._hangTurnsRemaining > 0) {
+      this._hangTurnsRemaining--;
+      return hangingSSEResponse(
+        `assistant-hang-${this.onChatMessageCallCount}`
+      );
     }
 
     if (this._emitStreamError) {
@@ -819,6 +862,34 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   async driveSuccessfulTurnForTest(): Promise<SaveMessagesResult["status"]> {
     const result = await this.saveMessages([
       { id: `u-${crypto.randomUUID()}`, role: "user", content: "hello" }
+    ]);
+    return result.status;
+  }
+
+  /** Configure the live-stream inactivity watchdog (#1626). */
+  setChatStreamStallTimeoutForTest(ms: number): void {
+    this.chatStreamStallTimeoutMs = ms;
+  }
+
+  /**
+   * Drive a turn whose model stream hangs after a partial, with a short stall
+   * timeout configured, so the inactivity watchdog fires and routes the turn
+   * into bounded recovery. `hangTurns` controls how many turns hang (1 = only
+   * the first attempt hangs, so a scheduled continuation would complete).
+   * Returns the server-side turn status (`"aborted"` once the stall is routed).
+   */
+  async driveStallingTurnForTest(options?: {
+    timeoutMs?: number;
+    hangTurns?: number;
+  }): Promise<SaveMessagesResult["status"]> {
+    this.chatStreamStallTimeoutMs = options?.timeoutMs ?? 50;
+    this._hangTurnsRemaining = options?.hangTurns ?? 1;
+    const result = await this.saveMessages([
+      {
+        id: `u-${crypto.randomUUID()}`,
+        role: "user",
+        content: "tell me a long story"
+      }
     ]);
     return result.status;
   }

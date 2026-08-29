@@ -119,6 +119,10 @@ import {
 import { ResumableStream } from "./chat/resumable-stream";
 import { ResumeHandshake } from "./chat/resume-handshake";
 import {
+  ChatStreamStalledError,
+  iterateWithStallWatchdog
+} from "./chat/stall-watchdog";
+import {
   type SubmitConcurrencyDecision,
   SubmitConcurrencyController
 } from "./chat/submit-concurrency";
@@ -412,6 +416,23 @@ export class AGUIChatAgent<
    * value safely receives the defaults. See {@link ChatRecoveryConfig}.
    */
   chatRecovery: ChatRecoveryConfig = true;
+
+  /**
+   * Inactivity watchdog for the live model/transport stream, in milliseconds.
+   * If more than this many ms elapse between stream chunks, the turn is aborted
+   * and routed into bounded recovery (the same continuation machinery as a
+   * deploy or eviction interruption, #1626) rather than parking forever on a
+   * hung provider.
+   *
+   * Default `0` disables the watchdog (opt-in), matching `AIChatAgent` and
+   * `@cloudflare/think`. A value such as `60_000` is a reasonable starting
+   * point; tune it above your slowest legitimate inter-chunk gap. The watchdog
+   * measures the GAP between chunks, not total turn duration, so a steadily
+   * streaming turn never trips it regardless of overall length.
+   *
+   * Assign as a class field or in the constructor, like {@link chatRecovery}.
+   */
+  chatStreamStallTimeoutMs = 0;
 
   /** Stable request id for the whole recovery continuation chain, when one is active. */
   private _activeChatRecoveryRootRequestId: string | undefined;
@@ -1902,6 +1923,11 @@ export class AGUIChatAgent<
         const streamCompleted = { value: false };
         let streamResult: StreamResultStatus = { status: "completed" };
         let earlyPersistedAssistantId: string | null = null;
+        // Set when a stall watchdog abort was routed into bounded recovery
+        // (#1626): a continuation (or terminal exhaustion) now owns the turn,
+        // so the terminal error frame and the success `message:response` emit
+        // are both skipped.
+        let stallRouted = false;
 
         try {
           if (isSSEResponse(response)) {
@@ -1929,22 +1955,62 @@ export class AGUIChatAgent<
           }
           streamCompleted.value = true;
         } catch (error) {
-          // Mid-stream failure resolves (not rethrows) with `status: "error"`
-          // so callers (continueLastTurn, saveMessages, recovery) observe the
-          // terminal outcome — mirrors the legacy `AIChatAgent._reply`.
-          const errorMessage =
-            error instanceof Error ? error.message : String(error);
-          streamResult = { status: "error", error: errorMessage };
-          this._markStreamError(streamId);
-          this._broadcastChatMessage({
-            body: errorMessage,
-            done: true,
-            error: true,
-            id,
-            type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
-            ...(continuation && { continuation: true })
-          });
-          this._emit("message:error", { error: errorMessage });
+          // A stall watchdog abort (#1626) is a recoverable interruption, not a
+          // terminal error: the partial is persisted below (the same path a
+          // normal turn uses, so the continuation re-anchors onto it via
+          // `targetAssistantId`) and the turn routes into bounded recovery.
+          if (
+            error instanceof ChatStreamStalledError &&
+            !streamCompleted.value
+          ) {
+            const outcome = await this._routeStallToBoundedRecovery({
+              requestId: id,
+              streamId,
+              partialMessages: accumulator.messages,
+              targetAssistantId: accumulator.messages
+                .filter((m): m is AssistantMessage => m.role === "assistant")
+                .at(-1)?.id
+            });
+            if (outcome === "scheduled") {
+              // Recovering: close the stream cleanly (no terminal error frame);
+              // the scheduled continuation drives the turn to completion.
+              this._completeStream(streamId);
+              this._broadcastChatMessage({
+                body: "",
+                done: true,
+                id,
+                type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+                ...(continuation && { continuation: true })
+              });
+            } else {
+              // Budget spent: `_routeStallToBoundedRecovery` already delivered
+              // terminal UX (terminalMessage + done/error frame + onExhausted),
+              // identical to deploy-recovery exhaustion.
+              this._markStreamError(streamId);
+            }
+            // `aborted` (not `error`) so this attempt does not terminalize the
+            // turn for callers (continueLastTurn / saveMessages / recovery).
+            streamResult = { status: "aborted" };
+            streamCompleted.value = true;
+            stallRouted = true;
+          } else {
+            // Mid-stream failure resolves (not rethrows) with `status: "error"`
+            // so callers (continueLastTurn, saveMessages, recovery) observe the
+            // terminal outcome — mirrors the legacy `AIChatAgent._reply`.
+            const errorMessage =
+              error instanceof Error ? error.message : String(error);
+            streamResult = { status: "error", error: errorMessage };
+            this._markStreamError(streamId);
+            this._broadcastChatMessage({
+              body: errorMessage,
+              done: true,
+              error: true,
+              id,
+              type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+              ...(continuation && { continuation: true })
+            });
+            this._emit("message:error", { error: errorMessage });
+          }
         } finally {
           reader.releaseLock();
           this._streamingMessages = null;
@@ -1953,7 +2019,9 @@ export class AGUIChatAgent<
           this._approvalPersistedAssistantId = null;
           if (chatMessageId) {
             this._abortRegistry.remove(chatMessageId);
-            if (streamCompleted.value) this._emit("message:response");
+            if (streamCompleted.value && !stallRouted) {
+              this._emit("message:response");
+            }
           }
         }
 
@@ -2004,6 +2072,49 @@ export class AGUIChatAgent<
     return this.messages.slice(lastAssistantIdx).map((m) => structuredClone(m));
   }
 
+  /**
+   * Wrap `reader.read()` in the shared inactivity watchdog when
+   * {@link chatStreamStallTimeoutMs} is armed. A stream that parks between
+   * chunks (hung provider/transport) has its reader cancelled and the pull
+   * rejects with {@link ChatStreamStalledError}, which `_reply` routes into
+   * bounded recovery (#1626). A `0` timeout (the default) returns the raw
+   * `reader.read()` path untouched.
+   */
+  private _guardedPull(
+    reader: ReadableStreamDefaultReader<Uint8Array>
+  ): () => Promise<ReadableStreamReadResult<Uint8Array>> {
+    const timeoutMs = this.chatStreamStallTimeoutMs;
+    if (!(timeoutMs > 0)) return () => reader.read();
+
+    const byteSource: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<Uint8Array>> {
+            const { done, value } = await reader.read();
+            return done || value === undefined
+              ? { done: true, value: undefined }
+              : { done: false, value };
+          },
+          async return(): Promise<IteratorResult<Uint8Array>> {
+            await reader.cancel().catch(() => {});
+            return { done: true, value: undefined };
+          }
+        };
+      }
+    };
+    const guarded = iterateWithStallWatchdog(byteSource, timeoutMs, () => {
+      // Unblock the abandoned `reader.read()` so the pipeline unwinds; the
+      // thrown `ChatStreamStalledError` carries the recovery decision.
+      reader.cancel().catch(() => {});
+    })[Symbol.asyncIterator]();
+    return async () => {
+      const next = await guarded.next();
+      return next.done
+        ? { done: true, value: undefined }
+        : { done: false, value: next.value };
+    };
+  }
+
   private async _streamSSEReply(
     id: string,
     streamId: string,
@@ -2022,12 +2133,14 @@ export class AGUIChatAgent<
       );
     }
 
+    const pull = this._guardedPull(reader);
+
     let buffer = "";
     while (true) {
       if (abortSignal?.aborted) break;
       let readResult: ReadableStreamReadResult<Uint8Array>;
       try {
-        readResult = await reader.read();
+        readResult = await pull();
       } catch (readError) {
         if (abortSignal?.aborted) break;
         throw readError;
@@ -3169,6 +3282,68 @@ export class AGUIChatAgent<
     if ("lastClientTools" in data || "lastBody" in data) {
       this._persistRequestContext();
     }
+  }
+
+  /**
+   * Route a live stream stall (the {@link chatStreamStallTimeoutMs} watchdog
+   * fired) into the same bounded-recovery machinery a deploy/eviction
+   * interruption uses (#1626): open or reuse the incident under the turn's
+   * recovery identity, deliver terminal UX if the budget is spent, otherwise
+   * schedule a `_chatRecoveryContinue`. Mirrors
+   * `AIChatAgent._routeStallToBoundedRecovery`.
+   *
+   * Returns `"exhausted"` when the budget was spent (terminal UX already
+   * delivered), or `"scheduled"` when a continuation was queued.
+   */
+  private async _routeStallToBoundedRecovery(input: {
+    requestId: string;
+    streamId: string;
+    partialMessages: readonly AGUIMessage[];
+    targetAssistantId?: string;
+  }): Promise<"scheduled" | "exhausted"> {
+    const recoveryRootRequestId =
+      this._activeChatRecoveryRootRequestId ?? input.requestId;
+    const latestUserMessageId =
+      [...this.messages].reverse().find((m) => m.role === "user")?.id ?? null;
+    const { incident, config, exhausted } =
+      await this._beginChatRecoveryIncident({
+        requestId: input.requestId,
+        recoveryRootRequestId,
+        latestUserMessageId,
+        recoveryKind: "continue"
+      });
+    if (exhausted) {
+      // Budget spent: deliver the SAME terminal UX as deploy-recovery
+      // exhaustion instead of letting the raw stall error leak out.
+      // `firstSeenAt` is the closest available turn-start proxy here.
+      const partialText = input.partialMessages
+        .filter((m) => m.role === "assistant" && typeof m.content === "string")
+        .map((m) => (m as AssistantMessage).content as string)
+        .join("");
+      await this._exhaustChatRecovery(
+        incident,
+        config,
+        { text: partialText, parts: [...input.partialMessages] },
+        input.streamId,
+        incident.firstSeenAt
+      );
+      return "exhausted";
+    }
+    await this._chatRecoveryEngine().scheduleRecovery({
+      incident,
+      recoveryKind: "continue",
+      callback: "_chatRecoveryContinue",
+      data: {
+        ...(input.targetAssistantId
+          ? { targetAssistantId: input.targetAssistantId }
+          : {}),
+        originalRequestId: recoveryRootRequestId,
+        incidentId: incident.incidentId,
+        lastBody: this._lastBody ?? null,
+        lastClientTools: this._lastClientTools ?? null
+      }
+    });
+    return "scheduled";
   }
 
   /**
