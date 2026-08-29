@@ -179,6 +179,30 @@ describe("auto-continuation barrier (AG-UI)", () => {
     ws.close(1000);
   });
 
+  it("never continues for an approval that did not opt in", async () => {
+    // The approval mirror of the result case above. Approvals take a separate
+    // path into the barrier (`_handleToolApproval` / the decision ledger), so a
+    // missing `autoContinue` guard there would fire an unrequested turn — and
+    // for an approval that turn is the one that EXECUTES the tool.
+    const room = `approval-no-optin-${crypto.randomUUID()}`;
+    const stub = await getTestAgent(room);
+    await stub.persistParallelToolCallsForTest("assistant-batch", [
+      "call_approve_only"
+    ]);
+
+    const ws = await connectChatWS(`/agents/auto-continue-agui-agent/${room}`);
+    sendToolApproval(ws, "call_approve_only");
+    await sleep(400);
+
+    expect(await stub.getStartedRequestIds()).toHaveLength(0);
+    expect(await stub.getContinuationStateForTest()).toMatchObject({
+      hasPending: false,
+      hasDeferred: false,
+      armed: false
+    });
+    ws.close(1000);
+  });
+
   it("holds the barrier while a turn streams, then fires one coalesced continuation", async () => {
     const room = `coalesce-${crypto.randomUUID()}`;
     const stub = await getTestAgent(room);
@@ -283,6 +307,23 @@ describe("auto-continuation barrier (AG-UI)", () => {
       hasPending: false,
       hasDeferred: false
     });
+
+    // …and the transcript those three turns leave behind is clean. A defer that
+    // re-applied the result instead of rescheduling it, or a continuation that
+    // re-ran the batch, shows up here as a duplicated row — invisible to the
+    // barrier-state assertions above but corrupting for the next turn's prompt.
+    const persisted = await stub.getPersistedMessages();
+    const ids = persisted.map((m) => m.id);
+    expect(new Set(ids).size, `duplicate ids in ${JSON.stringify(ids)}`).toBe(
+      ids.length
+    );
+    expect(
+      persisted
+        .filter((m) => m.role === "tool")
+        .map((m) => (m as { toolCallId: string }).toolCallId)
+        .sort()
+    ).toEqual(["call_one", "call_two"]);
+
     ws.close(1000);
   });
 

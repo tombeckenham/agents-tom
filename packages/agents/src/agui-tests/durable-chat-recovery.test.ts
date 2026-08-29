@@ -2,9 +2,31 @@
  * Durable chat recovery — incident budgets, stable-state give-up, the
  * "recovering…" status (#1620), and the durable terminal record (#1645).
  * Port of `packages/ai-chat/src/tests/durable-chat-recovery.test.ts` on the
- * AG-UI shape. (Terminal replay over the resume handshake, the stall
- * watchdog, and the agent-tool N9 crediting live with their own subsystems
- * and are not ported here.)
+ * AG-UI shape.
+ *
+ * The legacy file has 64 legs; 36 are ported here. What is NOT, and why:
+ * - Terminal replay to a reconnecting client (#1645 / #1575) — moved wholesale
+ *   to `resume-handshake.test.ts`, which owns that wiring.
+ * - The stall-watchdog block (#1626) — moved to `stall-watchdog.test.ts`.
+ * - The #1691 orphan-merge matrix (which assistant message a recovered partial
+ *   merges into: new turn vs continuation, missing provider id, legacy rows) —
+ *   NOT PORTED, and not covered elsewhere for AG-UI. It is the largest
+ *   remaining gap in this file.
+ * - Alarm/give-up transients (#1730 deferred terminal write, superseded
+ *   isolate, storage failure during seal) — these moved into the shared,
+ *   host-agnostic engine and are unit-tested in
+ *   `chat/__tests__/recovery-engine.test.ts`; re-driving them per host would
+ *   test the same code twice.
+ * - Incident-scoring legs (#1628 compaction, sub-agent N9 crediting, the
+ *   work-budget wall clock) — likewise owned by
+ *   `chat/__tests__/recovery-incident.test.ts` and, for the AG-UI chunk
+ *   vocabulary, `chat/__tests__/agui-recovery-codec.test.ts`.
+ * - Assertions written against `UIMessage` parts (`input-streaming` /
+ *   `output-available` tool-part states, `persist: false` part skipping,
+ *   `_getPartialStreamText` part shapes) — not portable as written: AG-UI
+ *   models those states as separate `ToolMessage` rows. The AG-UI equivalents
+ *   live in `tool-call-persistence.test.ts` and
+ *   `chat/__tests__/repair-transcript.test.ts`.
  */
 
 import { env } from "cloudflare:workers";
@@ -13,7 +35,7 @@ import { getAgentByName } from "../index";
 import type { AGUIMessage } from "../chat/agui-types";
 import type { ChatRecoveryConfig } from "../chat/lifecycle";
 import { CHAT_MESSAGE_TYPES } from "../chat/protocol";
-import { connectChatWS } from "./test-utils";
+import { connectChatWS, recordFrames } from "./test-utils";
 
 /** RPC surface of `RecoveryAguiAgent` (complex types don't survive stub typing). */
 interface RecoveryStub {
@@ -64,6 +86,13 @@ interface RecoveryStub {
   >;
   getScheduleCountForCallback(callback: string): Promise<number>;
   waitForIdleForTest(): Promise<void>;
+  continueLastTurnForTest(
+    body?: Record<string, unknown>
+  ): Promise<{ requestId: string; status: string }>;
+  continueLastTurnSupersededForTest(): Promise<{
+    requestId: string;
+    status: string;
+  }>;
   persistMessages(messages: AGUIMessage[]): Promise<void>;
   insertInterruptedStream(
     streamId: string,
@@ -145,6 +174,33 @@ async function getTestAgent(room: string): Promise<RecoveryStub> {
     env.RecoveryAguiAgent,
     room
   )) as unknown as RecoveryStub;
+}
+
+/**
+ * Reconnect a fresh client to `room` and run the standard resume probe.
+ * Returns the `STREAM_RESUME_NONE` reason, or `"resuming"` if the server
+ * offered a stream instead — which, once the terminal record is gone, would
+ * mean a stale terminal is still queued for replay (#1645).
+ */
+async function probeResumeReason(room: string): Promise<string> {
+  const ws = await connectChatWS(`/agents/recovery-agui-agent/${room}`);
+  const rec = recordFrames(ws);
+  ws.send(
+    JSON.stringify({
+      type: CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST,
+      probeId: "probe-after-clear"
+    })
+  );
+  const frame = await rec.waitFor(
+    (f) =>
+      f.probeId === "probe-after-clear" &&
+      (f.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE ||
+        f.type === CHAT_MESSAGE_TYPES.STREAM_RESUMING)
+  );
+  ws.close(1000);
+  return frame.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE
+    ? (frame.reason ?? "")
+    : "resuming";
 }
 
 function makeChunks(
@@ -1053,7 +1109,8 @@ describe("onChatRecovery (AG-UI)", () => {
   });
 
   it("records a durable terminal on exhaustion, cleared by a later successful server-side turn (#1645)", async () => {
-    const stub = await getTestAgent(`terminal-cleared-${crypto.randomUUID()}`);
+    const room = `terminal-cleared-${crypto.randomUUID()}`;
+    const stub = await getTestAgent(room);
     const TERMINAL = "Recovery exhausted — the assistant could not finish.";
 
     await stub.enableExhaustedCaptureForTest(6, TERMINAL);
@@ -1083,6 +1140,11 @@ describe("onChatRecovery (AG-UI)", () => {
     await stub.setForceStableTimeoutForTest(false);
     expect(await stub.driveSuccessfulTurnForTest()).toBe("completed");
     expect(await stub.getPendingChatTerminalForTest()).toBeNull();
+
+    // The record being gone from storage is only half the contract: a client
+    // reconnecting now must get a plain "nothing to resume", not the resume
+    // handshake that would replay the superseded terminal as a live error.
+    expect(await probeResumeReason(room)).toBe("idle");
   });
 
   it("clears the terminal record when a later server-side turn is aborted (#1645)", async () => {
@@ -1158,5 +1220,48 @@ describe("onChatRecovery (AG-UI)", () => {
     ws.close(1000);
 
     expect(await stub.getPendingChatTerminalForTest()).toBeNull();
+
+    // …and a client reconnecting AFTER the clear must be told there is nothing
+    // to resume, not handed the terminal that was just dropped.
+    expect(await probeResumeReason(room)).toBe("idle");
+  });
+
+  // `continueLastTurn` re-enters inference against the existing transcript, so
+  // both of its guards exist to stop it re-running a turn that no longer makes
+  // sense. Neither is reachable from the wire — the barrier only calls it when
+  // its own preconditions hold — so they are driven directly.
+  describe("continueLastTurn guards", () => {
+    it("skips when there is no assistant message to continue from", async () => {
+      const stub = await getTestAgent(
+        `cont-noassistant-${crypto.randomUUID()}`
+      );
+
+      // Only a user message: there is no partial assistant turn to extend, and
+      // continuing would silently turn into "answer this again".
+      await stub.persistMessages([
+        { id: "u1", role: "user", content: "hello" }
+      ]);
+
+      expect(await stub.continueLastTurnForTest()).toEqual({
+        requestId: "",
+        status: "skipped"
+      });
+      expect(await stub.getOnChatMessageCallCount()).toBe(0);
+    });
+
+    it("skips when the turn-queue generation moved on before it ran", async () => {
+      const stub = await getTestAgent(`cont-superseded-${crypto.randomUUID()}`);
+      await stub.persistMessages([
+        { id: "u1", role: "user", content: "hello" },
+        { id: "a1", role: "assistant", content: "partial" }
+      ]);
+
+      // A reset (chat clear, a new user submit under `latest`) between enqueue
+      // and dequeue invalidates the epoch the continuation captured.
+      const result = await stub.continueLastTurnSupersededForTest();
+
+      expect(result.status).toBe("skipped");
+      expect(await stub.getOnChatMessageCallCount()).toBe(0);
+    });
   });
 });

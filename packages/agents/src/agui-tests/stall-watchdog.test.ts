@@ -53,8 +53,11 @@ describe("stall watchdog (chatStreamStallTimeoutMs)", () => {
     // leaking a terminal error). The scheduled `_chatRecoveryContinue` row is
     // consumed by the delay-0 alarm, so the durable incident (not the transient
     // schedule row) is the stable evidence the stall was routed.
+    // Exactly one: a single stall must open a single incident. More than one
+    // means the watchdog fired again on the same turn (or the continuation
+    // opened its own), which silently burns the attempt budget.
     const incidents = await agentStub.getChatRecoveryIncidentsForTest();
-    expect(incidents.length).toBeGreaterThanOrEqual(1);
+    expect(incidents).toHaveLength(1);
     expect(incidents[0].recoveryKind).toBe("continue");
 
     // The partial generated before the stall was persisted (not lost), so the

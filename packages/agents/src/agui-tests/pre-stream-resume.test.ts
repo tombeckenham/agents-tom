@@ -157,6 +157,42 @@ describe("AGUIChatAgent — pre-stream resume window (#1784)", () => {
     ws2.close(1000);
   });
 
+  it("releases a parked client with exactly STREAM_RESUME_NONE when onChatMessage returns no Response", async () => {
+    // The strict version of the leg above. `PreThrowAguiAgent` records a
+    // terminal on its way out, so its release can legitimately arrive as either
+    // frame; a handler that simply returns `undefined` settles with NO stream
+    // and NO terminal, which leaves the bare `_settlePreStreamTurn` release as
+    // the only thing that can unpark the client. Nothing else can produce a
+    // STREAM_RESUMING here, so the assertion can be exact.
+    const room = `pre-stream-settle-none-${crypto.randomUUID()}`;
+    const path = `/agents/pre-stream-agui-agent/${room}`;
+    const stub = (await getAgentByName(
+      env.PreStreamAguiAgent,
+      room
+    )) as unknown as PreStreamStub;
+
+    const ws1 = await connectChatWS(path);
+    const requestId = "req-settle-none";
+    sendChatRequest(ws1, requestId, [userMessage("u1", "hi")], {
+      responseDelayMs: 500,
+      noStream: true
+    });
+    await waitForHandlerEntered(stub, requestId);
+
+    // Joins mid pre-stream window: parked, told to keep waiting.
+    const ws2 = await connectChatWS(path);
+    const rec2 = recordFrames(ws2);
+    await rec2.waitFor((f) => f.type === CHAT_MESSAGE_TYPES.STREAM_PENDING);
+
+    await rec2.waitFor((f) => f.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE);
+    expect(hasType(rec2.frames, CHAT_MESSAGE_TYPES.STREAM_RESUMING)).toBe(
+      false
+    );
+
+    ws1.close(1000);
+    ws2.close(1000);
+  });
+
   it("keeps a client parked across overlapping submits until a turn streams, never cutting it loose early", async () => {
     const room = `pre-stream-overlap-${crypto.randomUUID()}`;
     const path = `/agents/pre-stream-latest-agui-agent/${room}`;

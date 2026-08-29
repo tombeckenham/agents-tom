@@ -210,11 +210,18 @@ export class PreStreamAguiAgent extends AGUIChatAgent<Env> {
   async onChatMessage(
     _onFinish: (result: unknown) => void | Promise<void>,
     options?: OnChatMessageOptions
-  ) {
+  ): Promise<Response | undefined> {
     if (options?.requestId) this._startedRequestIds.push(options.requestId);
-    const delayMs = (options?.body as { responseDelayMs?: number } | undefined)
-      ?.responseDelayMs;
-    if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const body = options?.body as
+      | { responseDelayMs?: number; noStream?: boolean }
+      | undefined;
+    if (body?.responseDelayMs)
+      await new Promise((resolve) => setTimeout(resolve, body.responseDelayMs));
+    // `noStream`: settle the turn by returning no Response at all — the pre-
+    // stream window closes with neither a stream NOR a terminal record, which
+    // is the only shape that must release a parked client with a bare
+    // STREAM_RESUME_NONE (a pre-Response throw records a terminal instead).
+    if (body?.noStream) return undefined;
     return sseResponse(
       textRunEvents(`assistant-${options?.requestId ?? "x"}`, ["ok"])
     );
@@ -348,12 +355,16 @@ export class SaveMessagesAguiAgent extends AGUIChatAgent<Env> {
  */
 export class AutoContinueAguiAgent extends AGUIChatAgent<Env> {
   private _startedRequestIds: string[] = [];
+  private _capturedBodies: Array<Record<string, unknown> | undefined> = [];
+  private _capturedClientTools: Array<ClientToolSchema[] | undefined> = [];
 
   async onChatMessage(
     _onFinish: (result: unknown) => void | Promise<void>,
     options?: OnChatMessageOptions
   ): Promise<Response | undefined> {
     this._startedRequestIds.push(options?.requestId ?? "unknown");
+    this._capturedBodies.push(options?.body);
+    this._capturedClientTools.push(options?.clientTools);
     const body = options?.body as
       | {
           streamChunks?: number;
@@ -361,11 +372,24 @@ export class AutoContinueAguiAgent extends AGUIChatAgent<Env> {
           responseDelayMs?: number;
           streamToolCallIds?: string[];
           continuationStreamError?: string;
+          continuationStreamChunks?: number;
         }
       | undefined;
 
     if (options?.continuation && body?.continuationStreamError) {
       return errorAfterStartSSEResponse(body.continuationStreamError);
+    }
+
+    // Make only the CONTINUATION slow, so the priming turn stays instant and a
+    // second client has a live continuation stream to probe against.
+    if (options?.continuation && body?.continuationStreamChunks) {
+      return sseResponse(
+        textRunEvents(
+          `assistant-cont-${this._startedRequestIds.length}`,
+          Array(body.continuationStreamChunks).fill("tick ")
+        ),
+        { delayMs: 80, signal: options.abortSignal }
+      );
     }
 
     // Hold the turn accepted-but-not-yet-streaming so a test can land a sibling
@@ -414,6 +438,43 @@ export class AutoContinueAguiAgent extends AGUIChatAgent<Env> {
     return this.messages;
   }
 
+  /** Per-turn `body` / `clientTools` as `onChatMessage` actually received them. */
+  getCapturedBodiesForTest(): Array<Record<string, unknown> | undefined> {
+    return [...this._capturedBodies];
+  }
+
+  getCapturedClientToolsForTest(): Array<ClientToolSchema[] | undefined> {
+    return [...this._capturedClientTools];
+  }
+
+  clearCapturedContextForTest(): void {
+    this._startedRequestIds = [];
+    this._capturedBodies = [];
+    this._capturedClientTools = [];
+  }
+
+  /** The durable request context, as a cold start would find it on disk. */
+  getPersistedRequestContextForTest(): Record<string, string> {
+    const rows =
+      this.sql<{
+        key: string;
+        value: string;
+      }>`select key, value from cf_ai_chat_request_context` || [];
+    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  }
+
+  /**
+   * Simulate a cold start: drop the in-memory request context and rehydrate it
+   * from SQLite exactly as the constructor does.
+   */
+  reloadRequestContextForTest(): void {
+    this._lastBody = undefined;
+    this._lastClientTools = undefined;
+    (
+      this as unknown as { _restoreRequestContext(): void }
+    )._restoreRequestContext();
+  }
+
   /** Seed one assistant message fanning out `toolCallIds` unanswered calls. */
   async persistParallelToolCallsForTest(
     messageId: string,
@@ -460,6 +521,26 @@ export class AutoContinueAguiAgent extends AGUIChatAgent<Env> {
 
   hasPendingInteractionForTest(): boolean {
     return this.hasPendingInteraction();
+  }
+
+  /** Whether a resumable stream is live right now. */
+  hasActiveStreamForTest(): boolean {
+    return (
+      this as unknown as { _resumableStream: { hasActiveStream(): boolean } }
+    )._resumableStream.hasActiveStream();
+  }
+
+  /**
+   * Point continuation ownership at an arbitrary connection id. Used to stage
+   * the state an ABRUPT (1006) disconnect leaves behind: `onClose` never ran,
+   * so the id of a connection that is already gone is still recorded as owner.
+   */
+  setContinuationOwnerForTest(connectionId: string): void {
+    (
+      this as unknown as {
+        _continuation: { activeConnectionId: string | null };
+      }
+    )._continuation.activeConnectionId = connectionId;
   }
 
   /** Turns waiting behind the active one — a continuation the barrier fired. */
@@ -597,10 +678,20 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
       });
     }
 
+    // `streamChunks` / `streamDelayMs` (from the request body) turn the default
+    // reply into a long slow stream a client can cancel mid-flight.
+    const body = options?.body as
+      | { streamChunks?: number; streamDelayMs?: number }
+      | undefined;
     return sseResponse(
-      textRunEvents(`assistant-${this.onChatMessageCallCount}-${Date.now()}`, [
-        "Continued response."
-      ])
+      textRunEvents(
+        `assistant-${this.onChatMessageCallCount}-${Date.now()}`,
+        Array(body?.streamChunks ?? 1).fill("Continued response.")
+      ),
+      {
+        delayMs: body?.streamDelayMs ?? 0,
+        signal: options?.abortSignal
+      }
     );
   }
 
@@ -1075,6 +1166,23 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
       }
     ]);
     return result.status;
+  }
+
+  /** Invoke the protected `continueLastTurn` directly. */
+  async continueLastTurnForTest(
+    body?: Record<string, unknown>
+  ): Promise<SaveMessagesResult> {
+    return this.continueLastTurn(body);
+  }
+
+  /**
+   * Queue a `continueLastTurn`, then bump the turn-queue generation before it
+   * reaches the front — the superseded-epoch skip.
+   */
+  async continueLastTurnSupersededForTest(): Promise<SaveMessagesResult> {
+    const continuing = this.continueLastTurn();
+    this.resetTurnState();
+    return continuing;
   }
 
   async driveAbortedTurnForTest(): Promise<SaveMessagesResult["status"]> {
