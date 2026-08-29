@@ -23,7 +23,11 @@
         "name": "MaxPersistedAguiAgent",
         "class_name": "MaxPersistedAguiAgent"
       },
-      { "name": "SaveMessagesAguiAgent", "class_name": "SaveMessagesAguiAgent" }
+      {
+        "name": "SaveMessagesAguiAgent",
+        "class_name": "SaveMessagesAguiAgent"
+      },
+      { "name": "RecoveryAguiAgent", "class_name": "RecoveryAguiAgent" }
     ]
   },
   "migrations": [
@@ -38,7 +42,8 @@
         "ErrorStreamAguiAgent",
         "ApprovalAguiAgent",
         "MaxPersistedAguiAgent",
-        "SaveMessagesAguiAgent"
+        "SaveMessagesAguiAgent",
+        "RecoveryAguiAgent"
       ]
     }
   ]

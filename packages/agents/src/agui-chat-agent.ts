@@ -24,9 +24,48 @@ import {
   type AgentToolStoredChunk,
   type Connection,
   type ConnectionContext,
+  type FiberRecoveryContext,
   type WSMessage
 } from "./index";
+import { isDurableObjectMemoryLimitReset } from "./retries";
 import { AbortRegistry } from "./chat/abort-registry";
+import { awaitWithDeadline, TIMED_OUT } from "./chat/async-helpers";
+import { aguiRecoveryCodec } from "./chat/agui-recovery-codec";
+import {
+  createChatFiberSnapshot,
+  unwrapChatFiberSnapshot,
+  wrapChatFiberSnapshot,
+  type ChatFiberSnapshot
+} from "./chat/recovery";
+import { shouldCreditStreamProgress } from "./chat/recovery-codec";
+import {
+  ChatRecoveryEngine,
+  chatRecoverySchedulePolicy,
+  runChatRecoveryExhaustion,
+  type ChatFiberWakeHooks,
+  type ChatRecoveryAdapter,
+  type ChatRecoveryScheduleCallback,
+  type ClassifyRecoveredTurnInput,
+  type DispatchRecoveredTurnInput,
+  type ResolvedRecoveryStream
+} from "./chat/recovery-engine";
+import {
+  AgentToolStreamProgressThrottle,
+  buildChatRecoveringFrame,
+  bumpChatRecoveryProgress,
+  clearChatTerminal,
+  listActiveChatRecoveryIncidents,
+  pendingChatTerminal,
+  readChatRecoveryProgress,
+  recordChatTerminal,
+  resolveChatRecoveryConfig,
+  setChatRecovering,
+  StreamProgressCreditThrottle,
+  sweepStaleChatRecoveryIncidents,
+  type ChatRecoveryIncident,
+  type ChatRecoveryKind
+} from "./chat/recovery-incident";
+import { clientResolvableToolNames } from "./chat/tool-state";
 import {
   type AGUIAgentToolEvent,
   applyAGUIAgentToolEvent,
@@ -63,7 +102,12 @@ import {
   type ContinuationConnection
 } from "./chat/continuation-state";
 import type {
+  ChatRecoveryConfig,
+  ChatRecoveryContext,
+  ChatRecoveryExhaustedContext,
+  ChatRecoveryOptions,
   MessageConcurrency,
+  ResolvedChatRecoveryConfig,
   SaveMessagesOptions,
   SaveMessagesResult
 } from "./chat/lifecycle";
@@ -192,6 +236,46 @@ export type OnChatMessageOptions = {
  */
 export type AGUIOnFinishCallback = (result: unknown) => void | Promise<void>;
 
+/**
+ * AG-UI-shaped `onChatRecovery` context. Identical to the shared
+ * `ChatRecoveryContext` except the transcript and reconstructed partial carry
+ * `AGUIMessage[]` (the AG-UI parts vocabulary) instead of AI SDK shapes.
+ */
+export type AGUIChatRecoveryContext = Omit<
+  ChatRecoveryContext,
+  "messages" | "partialParts"
+> & {
+  messages: AGUIMessage[];
+  partialParts: AGUIMessage[];
+};
+
+/** Payload of a scheduled `_chatRecoveryRetry` callback. */
+type ChatRecoveryRetryData = {
+  targetUserId?: string;
+  originalRequestId?: string;
+  incidentId?: string;
+  lastBody?: Record<string, unknown> | null;
+  lastClientTools?: ClientToolSchema[] | null;
+};
+
+/** Payload of a scheduled `_chatRecoveryContinue` callback. */
+type ChatRecoveryContinueData = {
+  targetAssistantId?: string;
+  originalRequestId?: string;
+  incidentId?: string;
+  lastBody?: Record<string, unknown> | null;
+  lastClientTools?: ClientToolSchema[] | null;
+};
+
+/** Classification detail threaded from classify to dispatch on fiber wake. */
+type AGUIRecoveryClassification = { shouldRetryPreStream: boolean };
+
+/** How a consumed stream Response ended. */
+type StreamResultStatus = {
+  status: "completed" | "aborted" | "error";
+  error?: string;
+};
+
 // ----------------------------------------------------------------------------
 // Internal helpers
 // ----------------------------------------------------------------------------
@@ -199,6 +283,10 @@ export type AGUIOnFinishCallback = (result: unknown) => void | Promise<void>;
 type ChatRequestTrigger = "submit-message" | "regenerate-message";
 
 const decoder = new TextDecoder();
+
+/** Error text for a server tool call interrupted before a result landed. */
+const TOOL_INTERRUPTED_MESSAGE =
+  "The tool call was interrupted before a result was recorded.";
 
 function sendIfOpen(connection: Connection, message: string): boolean {
   try {
@@ -295,10 +383,22 @@ export class AGUIChatAgent<
   private _turnQueue = new TurnQueue();
 
   /**
-   * When `true`, chat turns are wrapped in `runFiber` for durable
-   * execution. Mirrors `AIChatAgent.chatRecovery`.
+   * Durable chat recovery configuration. Every chat turn runs in a durable
+   * fiber, enabling `onChatRecovery` and `this.stash()` during streaming.
+   * Assign an object to tune recovery budgets and terminal behavior. Mirrors
+   * `AIChatAgent.chatRecovery` — always enabled; a legacy runtime `false`
+   * value safely receives the defaults. See {@link ChatRecoveryConfig}.
    */
-  chatRecovery = false;
+  chatRecovery: ChatRecoveryConfig = true;
+
+  /** Stable request id for the whole recovery continuation chain, when one is active. */
+  private _activeChatRecoveryRootRequestId: string | undefined;
+
+  /** Per-isolate throttle for crediting recovery progress from streaming deltas. */
+  private _streamProgressCredit = new StreamProgressCreditThrottle();
+
+  /** Per-isolate N9 throttle: forwarded sub-agent chunks credit parent progress. */
+  private _agentToolStreamProgress = new AgentToolStreamProgressThrottle();
 
   private _mergeQueuedUserStartIndexByEpoch = new Map<number, number>();
   private _submitConcurrency = new SubmitConcurrencyController({
@@ -427,6 +527,14 @@ export class AGUIChatAgent<
       }
       if (this._resumableStream.hasActiveStream()) {
         this._notifyStreamResuming(connection);
+      } else {
+        // No active stream: if a recovery is in progress (between attempts),
+        // replay the live "recovering…" status so a client that connects
+        // mid-recovery reads the turn as working rather than frozen (#1620).
+        const recoveringFrame = await this._buildRecoveringConnectFrame();
+        if (recoveringFrame) {
+          sendIfOpen(connection, JSON.stringify(recoveringFrame));
+        }
       }
       return _onConnect(connection, cctx);
     };
@@ -605,6 +713,11 @@ export class AGUIChatAgent<
       return true;
     }
 
+    // A genuinely-new turn supersedes any pending terminal record (#1645)
+    // so a stale exhaustion can't replay on a later reconnect once the
+    // user has moved on.
+    await this._clearChatTerminal();
+
     const releasePendingEnqueue = this._submitConcurrency.beginEnqueue();
     try {
       this._broadcastChatMessage(
@@ -729,16 +842,11 @@ export class AGUIChatAgent<
                   this._abortRegistry.remove(chatMessageId);
                 }
               };
-              if (this.chatRecovery) {
-                await this.runFiber(
-                  `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${chatMessageId}`,
-                  async () => {
-                    await chatTurnBody();
-                  }
-                );
-              } else {
-                await chatTurnBody();
-              }
+              await this._runChatRecoveryFiber(
+                chatMessageId,
+                false,
+                chatTurnBody
+              );
             }
           );
         });
@@ -751,9 +859,12 @@ export class AGUIChatAgent<
     return true;
   }
 
-  private _handleChatClear(connection: Connection): boolean {
+  private async _handleChatClear(connection: Connection): Promise<boolean> {
     this.resetTurnState();
     this.sql`delete from cf_ai_chat_agent_messages`;
+    // Drop any pending terminal record (#1645) so a stale exhaustion can't
+    // replay onto a freshly-cleared conversation.
+    await this._clearChatTerminal();
     this._resumableStream.clearAll();
     this._pendingResumeConnections.clear();
     this._lastClientTools = undefined;
@@ -820,7 +931,13 @@ export class AGUIChatAgent<
         this._resumableStream.activeRequestId
       );
       if (orphanedStreamId) {
-        this._persistOrphanedStream(orphanedStreamId);
+        // Fire-and-forget; the ACK handler does not await.
+        this._persistOrphanedStream(orphanedStreamId).catch((err) =>
+          console.error(
+            "[AGUIChatAgent] _persistOrphanedStream persist failed",
+            err
+          )
+        );
       }
     } else if (this._resumableStream.hasActiveStream()) {
       // Ignore ACKs for a different active stream
@@ -1399,6 +1516,21 @@ export class AGUIChatAgent<
           await this.keepAliveWhile(async () => {
             while (this._pendingChatResponseResults.length > 0) {
               const chatResult = this._pendingChatResponseResults.shift()!;
+              // A later turn ending in a non-error outcome supersedes any
+              // pending terminal record (#1645); a terminal (non-recovered)
+              // stream error is durably recorded so a disconnected client
+              // still learns the turn failed on reconnect.
+              if (
+                chatResult.status === "completed" ||
+                chatResult.status === "aborted"
+              ) {
+                await this._clearChatTerminal();
+              } else if (chatResult.status === "error") {
+                await this._recordChatTerminal(
+                  chatResult.requestId,
+                  chatResult.error ?? "The assistant encountered an error."
+                );
+              }
               try {
                 await this.onChatResponse(chatResult);
               } catch (hookError) {
@@ -1655,16 +1787,7 @@ export class AGUIChatAgent<
                     this._abortRegistry.remove(requestId);
                   }
                 };
-                if (this.chatRecovery) {
-                  await this.runFiber(
-                    `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
-                    async () => {
-                      await autoBody();
-                    }
-                  );
-                } else {
-                  await autoBody();
-                }
+                await this._runChatRecoveryFiber(requestId, true, autoBody);
               }
             );
           });
@@ -1694,14 +1817,14 @@ export class AGUIChatAgent<
     response: Response,
     excludeBroadcastIds: string[] = [],
     options: { continuation?: boolean; chatMessageId?: string } = {}
-  ) {
+  ): Promise<StreamResultStatus> {
     const { continuation = false, chatMessageId } = options;
     const abortSignal = chatMessageId
       ? this._abortRegistry.getExistingSignal(chatMessageId)
       : undefined;
 
     return this.keepAliveWhile(() =>
-      this._tryCatchChat(async () => {
+      this._tryCatchChat(async (): Promise<StreamResultStatus> => {
         if (!response.body) {
           this._clearPendingAutoContinuation(true);
           this._broadcastChatMessage({
@@ -1712,7 +1835,7 @@ export class AGUIChatAgent<
             ...(continuation && { continuation: true })
           });
           this._activateDeferredAutoContinuation();
-          return;
+          return { status: "completed" };
         }
 
         const streamId = this._startStream(id);
@@ -1733,52 +1856,51 @@ export class AGUIChatAgent<
           null;
 
         const streamCompleted = { value: false };
-        let streamEndStatus: "completed" | "aborted" = "completed";
+        let streamResult: StreamResultStatus = { status: "completed" };
         let earlyPersistedAssistantId: string | null = null;
 
         try {
           if (isSSEResponse(response)) {
-            streamEndStatus = await this._streamSSEReply(
-              id,
-              streamId,
-              reader,
-              accumulator,
-              continuation,
-              abortSignal
-            );
+            streamResult = {
+              status: await this._streamSSEReply(
+                id,
+                streamId,
+                reader,
+                accumulator,
+                continuation,
+                abortSignal
+              )
+            };
           } else {
-            streamEndStatus = await this._sendPlaintextReply(
-              id,
-              streamId,
-              reader,
-              accumulator,
-              continuation,
-              abortSignal
-            );
+            streamResult = {
+              status: await this._sendPlaintextReply(
+                id,
+                streamId,
+                reader,
+                accumulator,
+                continuation,
+                abortSignal
+              )
+            };
           }
+          streamCompleted.value = true;
         } catch (error) {
-          if (!streamCompleted.value) {
-            this._markStreamError(streamId);
-            this._broadcastChatMessage({
-              body: error instanceof Error ? error.message : "Stream error",
-              done: true,
-              error: true,
-              id,
-              type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
-              ...(continuation && { continuation: true })
-            });
-            this._emit("message:error", {
-              error: error instanceof Error ? error.message : String(error)
-            });
-            this._pendingChatResponseResults.push({
-              messages: [...accumulator.messages],
-              requestId: id,
-              continuation,
-              status: "error",
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
-          throw error;
+          // Mid-stream failure resolves (not rethrows) with `status: "error"`
+          // so callers (continueLastTurn, saveMessages, recovery) observe the
+          // terminal outcome — mirrors the legacy `AIChatAgent._reply`.
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          streamResult = { status: "error", error: errorMessage };
+          this._markStreamError(streamId);
+          this._broadcastChatMessage({
+            body: errorMessage,
+            done: true,
+            error: true,
+            id,
+            type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+            ...(continuation && { continuation: true })
+          });
+          this._emit("message:error", { error: errorMessage });
         } finally {
           reader.releaseLock();
           this._streamingMessages = null;
@@ -1790,8 +1912,6 @@ export class AGUIChatAgent<
             if (streamCompleted.value) this._emit("message:response");
           }
         }
-
-        streamCompleted.value = true;
 
         if (accumulator.messages.length > 0) {
           await this._persistStreamResult(
@@ -1808,8 +1928,10 @@ export class AGUIChatAgent<
           messages: [...accumulator.messages],
           requestId: id,
           continuation,
-          status: streamEndStatus
+          status: streamResult.status,
+          ...(streamResult.error !== undefined && { error: streamResult.error })
         });
+        return streamResult;
       })
     );
   }
@@ -2112,7 +2234,7 @@ export class AGUIChatAgent<
   // Orphaned-stream recovery (port from AIChatAgent on AG-UI shape)
   // ──────────────────────────────────────────────────────────────────
 
-  protected _persistOrphanedStream(streamId: string) {
+  protected async _persistOrphanedStream(streamId: string): Promise<void> {
     const chunks = this._resumableStream.getStreamChunks(streamId);
     if (!chunks.length) return;
     const snapshot: SnapshotState = createInitialSnapshot();
@@ -2133,13 +2255,10 @@ export class AGUIChatAgent<
     for (const sm of snapshot.messages) {
       if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
     }
-    // Fire-and-forget; the caller (ACK handler) does not await.
-    this.persistMessages(merged).catch((err) =>
-      console.error(
-        "[AGUIChatAgent] _persistOrphanedStream persist failed",
-        err
-      )
-    );
+    // NOTE: progress is bumped at production time in `_storeStreamChunk`
+    // (#1637), NOT here — a recovery/reconnect re-persist must not be
+    // miscounted as new forward progress.
+    await this.persistMessages(merged);
   }
 
   // ── Resumable stream delegates (parity with AIChatAgent) ───────────
@@ -2170,6 +2289,26 @@ export class AGUIChatAgent<
   }
   protected _storeStreamChunk(streamId: string, body: string) {
     this._resumableStream.storeChunk(streamId, body);
+    // Credit recovery forward progress at production time (#1637): milestones
+    // always, streaming deltas through the shared throttle. Immune to client
+    // reconnects / recovery re-persists (those replay stored chunks and never
+    // flow through here).
+    let type: string | undefined;
+    try {
+      type = (JSON.parse(body) as { type?: string }).type;
+    } catch {
+      // non-JSON chunk body — nothing to credit
+    }
+    if (
+      shouldCreditStreamProgress({
+        codec: aguiRecoveryCodec,
+        type,
+        throttle: this._streamProgressCredit,
+        now: Date.now()
+      })
+    ) {
+      this._bumpChatRecoveryProgress().catch(() => {});
+    }
   }
   protected _flushChunkBuffer() {
     this._resumableStream.flushBuffer();
@@ -2177,6 +2316,922 @@ export class AGUIChatAgent<
   protected _markStreamError(streamId: string) {
     this._resumableStream.markError(streamId);
     this._pendingResumeConnections.clear();
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Stability + pending-interaction predicates (AG-UI shape)
+  // ──────────────────────────────────────────────────────────────────
+
+  /**
+   * `true` when any assistant tool call still lacks a tool-result message —
+   * the AG-UI analogue of the legacy `input-available`/`approval-requested`
+   * part scan (tool results are first-class `ToolMessage`s here).
+   */
+  protected hasPendingInteraction(): boolean {
+    return this._hasUnresolvedToolCall();
+  }
+
+  /**
+   * Narrower, client-only predicate used by recovery: an unresolved tool call
+   * counts only when the CLIENT can still resolve it after a restart (its name
+   * is in the last request's client tools). A server tool's orphan is excluded
+   * — its `execute()` died with the isolate and nothing will post its result.
+   * AG-UI note: a pending approval is not detectable from the persisted shape
+   * (approval requests ride CUSTOM events, not messages), so this keys solely
+   * on client-resolvable tool names.
+   */
+  protected hasPendingClientInteraction(): boolean {
+    const clientResolvable = clientResolvableToolNames(this._lastClientTools);
+    if (clientResolvable.size === 0) return false;
+    return this._hasUnresolvedToolCall((name) => clientResolvable.has(name));
+  }
+
+  private _hasUnresolvedToolCall(
+    include?: (toolName: string) => boolean
+  ): boolean {
+    const merged = this._messagesForClientSync();
+    const resolved = new Set<string>();
+    for (const m of merged) {
+      if (m.role === "tool") resolved.add(m.toolCallId);
+    }
+    for (const m of merged) {
+      if (m.role !== "assistant" || !m.toolCalls) continue;
+      for (const tc of m.toolCalls) {
+        if (resolved.has(tc.id)) continue;
+        if (!include || include(tc.function.name)) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Flip interrupted SERVER-tool orphans (an assistant tool call with no
+   * `ToolMessage` result whose tool the client cannot resolve) into errored
+   * tool results before re-entering inference, so a recovered transcript is
+   * settled. Client-resolvable tool calls are left pending — the client
+   * replays their results after reconnect.
+   */
+  private async _repairInterruptedToolsBeforeTurn(): Promise<void> {
+    const clientResolvable = clientResolvableToolNames(this._lastClientTools);
+    const resolved = new Set<string>();
+    for (const m of this.messages) {
+      if (m.role === "tool") resolved.add(m.toolCallId);
+    }
+    const repairs: { assistantIdx: number; toolMessage: ToolMessage }[] = [];
+    this.messages.forEach((m, idx) => {
+      if (m.role !== "assistant" || !m.toolCalls) return;
+      for (const tc of m.toolCalls) {
+        if (resolved.has(tc.id) || clientResolvable.has(tc.function.name)) {
+          continue;
+        }
+        repairs.push({
+          assistantIdx: idx,
+          toolMessage: {
+            id: `tool-${nanoid()}`,
+            role: "tool",
+            toolCallId: tc.id,
+            content: JSON.stringify({ error: TOOL_INTERRUPTED_MESSAGE }),
+            error: TOOL_INTERRUPTED_MESSAGE
+          }
+        });
+      }
+    });
+    if (repairs.length === 0) return;
+    const next = [...this.messages];
+    for (let i = repairs.length - 1; i >= 0; i--) {
+      next.splice(repairs[i].assistantIdx + 1, 0, repairs[i].toolMessage);
+    }
+    await this.persistMessages(next);
+  }
+
+  /**
+   * Wait until the conversation is fully stable — no active turns, no
+   * in-flight submits, no pending interaction, no armed auto-continuation.
+   * Mirrors `AIChatAgent.waitUntilStable`; `pendingInteraction` overrides the
+   * "still waiting" predicate (recovery passes the narrower
+   * {@link hasPendingClientInteraction}).
+   */
+  protected async waitUntilStable(options?: {
+    timeout?: number;
+    pendingInteraction?: () => boolean;
+  }): Promise<boolean> {
+    const deadline =
+      options?.timeout != null ? Date.now() + options.timeout : null;
+    const hasPendingInteraction =
+      options?.pendingInteraction ?? (() => this.hasPendingInteraction());
+    const sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    while (true) {
+      // Drain active turns AND submits past the concurrency decision but not
+      // yet enqueued, so the predicate reflects settled message state.
+      while (true) {
+        if (
+          (await awaitWithDeadline(this._turnQueue.waitForIdle(), deadline)) ===
+          TIMED_OUT
+        ) {
+          return false;
+        }
+        if (this._submitConcurrency.pendingEnqueueCount === 0) break;
+        if ((await awaitWithDeadline(sleep(5), deadline)) === TIMED_OUT) {
+          return false;
+        }
+      }
+
+      if (!hasPendingInteraction()) {
+        if (!this._continuation.pending && !this._continuation.deferred) {
+          return true;
+        }
+        // An auto-continuation is armed — wait for it to enqueue, then re-check.
+        if (
+          (await awaitWithDeadline(
+            sleep(AGUIChatAgent.AUTO_CONTINUATION_COALESCE_MS),
+            deadline
+          )) === TIMED_OUT
+        ) {
+          return false;
+        }
+        continue;
+      }
+
+      const pending = this._pendingInteractionPromise;
+      if (pending) {
+        let result: boolean | typeof TIMED_OUT;
+        try {
+          result = await awaitWithDeadline(pending, deadline);
+        } catch {
+          continue;
+        }
+        if (result === TIMED_OUT) return false;
+      } else if (
+        (await awaitWithDeadline(sleep(100), deadline)) === TIMED_OUT
+      ) {
+        return false;
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Chat recovery via fibers (mirrors AIChatAgent on the AG-UI shape)
+  // ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Wrap a chat turn in a durable fiber carrying the recovery snapshot. The
+   * snapshot kind/envelope key are shared with the legacy `AIChatAgent`
+   * (cutover contract: a fiber persisted by either engine recovers on the
+   * other — the snapshot itself is shape-agnostic).
+   */
+  private async _runChatRecoveryFiber<T>(
+    requestId: string,
+    continuation: boolean,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const snapshot = createChatFiberSnapshot({
+      kind: "ai-chat-turn",
+      requestId,
+      recoveryRootRequestId: this._activeChatRecoveryRootRequestId ?? requestId,
+      continuation,
+      messages: this.messages,
+      lastBody: this._lastBody,
+      lastClientTools: this._lastClientTools
+    });
+
+    return this._runFiberWithStashWrapper(
+      `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
+      async () => fn(),
+      {
+        initialSnapshot: wrapChatFiberSnapshot(
+          "__cfAIChatFiberSnapshot",
+          snapshot,
+          null
+        ),
+        wrapStash: (data) =>
+          wrapChatFiberSnapshot("__cfAIChatFiberSnapshot", snapshot, data)
+      }
+    );
+  }
+
+  private _resolveChatRecoveryConfig(): ResolvedChatRecoveryConfig {
+    return resolveChatRecoveryConfig(this.chatRecovery);
+  }
+
+  /** Durable, monotonic forward-progress marker for recovery budget resets. */
+  private async _chatRecoveryProgressMarker(): Promise<number> {
+    return readChatRecoveryProgress(this.ctx.storage);
+  }
+
+  private async _bumpChatRecoveryProgress(): Promise<void> {
+    return bumpChatRecoveryProgress(this.ctx.storage);
+  }
+
+  /**
+   * N9: forwarding a sub-agent's chunks IS forward progress for this parent
+   * turn — credit the parent's progress marker (throttled per isolate).
+   */
+  protected override async _onAgentToolStreamProgress(): Promise<void> {
+    if (this._agentToolStreamProgress.shouldCredit(Date.now())) {
+      await this._bumpChatRecoveryProgress();
+    }
+  }
+
+  /**
+   * Lazily-built shared recovery engine over the AG-UI adapter binding.
+   * Mirrors `AIChatAgent._chatRecoveryEngine`.
+   */
+  private _chatRecoveryEngineInstance?: ChatRecoveryEngine;
+  private _chatRecoveryEngine(): ChatRecoveryEngine {
+    return (this._chatRecoveryEngineInstance ??= new ChatRecoveryEngine({
+      resolveConfig: () => this._resolveChatRecoveryConfig(),
+      now: () => Date.now(),
+      sweepStaleIncidents: (now) =>
+        sweepStaleChatRecoveryIncidents(this.ctx.storage, now),
+      getIncident: async (key) =>
+        (await this.ctx.storage.get<ChatRecoveryIncident>(key)) ?? null,
+      readProgress: () => this._chatRecoveryProgressMarker(),
+      // A turn parked on a pending CLIENT interaction is waiting on the human,
+      // not stuck — budget-free.
+      isAwaitingClientInteraction: () => this.hasPendingClientInteraction(),
+      putIncident: (key, incident) => this.ctx.storage.put(key, incident),
+      deleteIncident: async (key) => {
+        await this.ctx.storage.delete(key);
+      },
+      emitRecoveryEvent: (event) =>
+        this._emit(event.type, {
+          incidentId: event.incidentId,
+          requestId: event.requestId,
+          attempt: event.attempt,
+          maxAttempts: event.maxAttempts,
+          recoveryKind: event.recoveryKind,
+          ...(event.reason ? { reason: event.reason } : {})
+        }),
+      scheduleRecovery: async (callback, data, reason, delaySeconds) => {
+        await this.schedule(
+          delaySeconds,
+          callback,
+          data,
+          chatRecoverySchedulePolicy(reason)
+        );
+      },
+      setRecovering: (active, requestId) =>
+        this._setChatRecovering(active, requestId),
+      onShouldKeepRecoveringError: (error) =>
+        console.error(
+          "[AGUIChatAgent] chatRecovery shouldKeepRecovering hook threw",
+          error
+        ),
+      exhaustChatRecovery: (incident, config, partial, streamId, createdAt) =>
+        this._exhaustChatRecovery(
+          incident,
+          config,
+          partial,
+          streamId,
+          createdAt
+        ),
+      resolveRecoveryStream: (requestId) =>
+        this._resolveAGUIRecoveryStream(requestId),
+      getPartialStreamText: (streamId) => this._getPartialStreamText(streamId),
+      activeChatRecoveryRootRequestId: () =>
+        this._activeChatRecoveryRootRequestId,
+      onGiveUpBookkeepingError: (phase, error) =>
+        console.error(
+          phase === "read"
+            ? "[AGUIChatAgent] failed to read recovery incident during give-up; synthesizing"
+            : "[AGUIChatAgent] failed to persist sealed recovery incident during give-up",
+          error
+        )
+    } satisfies ChatRecoveryAdapter));
+  }
+
+  private async _beginChatRecoveryIncident(input: {
+    requestId: string;
+    recoveryRootRequestId?: string | null;
+    latestUserMessageId?: string | null;
+    recoveryKind: ChatRecoveryKind;
+    /** Test-only clock injection for deterministic debounce/window timing. */
+    nowMs?: number;
+  }): Promise<{
+    incident: ChatRecoveryIncident;
+    config: ResolvedChatRecoveryConfig;
+    exhausted: boolean;
+  }> {
+    return this._chatRecoveryEngine().beginIncident(input);
+  }
+
+  private async _updateChatRecoveryIncident(
+    incidentId: string | undefined,
+    status: ChatRecoveryIncident["status"],
+    reason?: string
+  ): Promise<void> {
+    return this._chatRecoveryEngine().updateIncident(
+      incidentId,
+      status,
+      reason
+    );
+  }
+
+  private async _exhaustChatRecovery(
+    incident: ChatRecoveryIncident,
+    config: ResolvedChatRecoveryConfig,
+    partial: { text: string; parts: unknown[] },
+    streamId: string,
+    createdAt: number
+  ): Promise<void> {
+    await runChatRecoveryExhaustion(
+      {
+        incident,
+        config,
+        partialText: partial.text,
+        // The engine seam is parts-vocabulary-agnostic; AG-UI's `parts` are
+        // the reconstructed `AGUIMessage[]` and ride through the opaque slot.
+        partialParts:
+          partial.parts as ChatRecoveryExhaustedContext["partialParts"],
+        streamId,
+        createdAt
+      },
+      {
+        emit: (event) => this._emit("chat:recovery:exhausted", event),
+        onExhausted: config.onExhausted,
+        onError: (error) =>
+          console.error(
+            "[AGUIChatAgent] chatRecovery onExhausted hook threw",
+            error
+          ),
+        terminalize: async (ctx) => {
+          // Banner BEFORE the durable terminal write: the write can reject in
+          // the deploy/storage window a give-up runs in (#1730); the throw
+          // then propagates and the whole give-up re-runs on a healthy
+          // isolate (at-least-once banner is the documented edge).
+          this._broadcastChatMessage({
+            body: ctx.terminalMessage,
+            done: true,
+            error: true,
+            id: ctx.requestId,
+            type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE
+          });
+          // Durable terminal record (#1645), replayed to reconnecting clients.
+          await this._recordChatTerminal(ctx.requestId, ctx.terminalMessage);
+          // Exhaustion resolves recovery — clear "recovering…" (#1620).
+          await this._setChatRecovering(false);
+        }
+      }
+    );
+  }
+
+  private async _recordChatTerminal(
+    requestId: string,
+    body: string
+  ): Promise<void> {
+    await recordChatTerminal(this.ctx.storage, requestId, body);
+  }
+
+  private async _clearChatTerminal(): Promise<void> {
+    await clearChatTerminal(this.ctx.storage);
+  }
+
+  protected async _pendingChatTerminal(): Promise<{
+    requestId: string;
+    body: string;
+  } | null> {
+    return pendingChatTerminal(this.ctx.storage);
+  }
+
+  /** On-connect "recovering…" replay frame (#1620), or `null` when none. */
+  private async _buildRecoveringConnectFrame(): Promise<Record<
+    string,
+    unknown
+  > | null> {
+    return buildChatRecoveringFrame(
+      this.ctx.storage,
+      CHAT_MESSAGE_TYPES.CHAT_RECOVERING,
+      Date.now()
+    );
+  }
+
+  private async _setChatRecovering(
+    active: boolean,
+    requestId?: string
+  ): Promise<void> {
+    await setChatRecovering(active, requestId, {
+      storage: this.ctx.storage,
+      messageType: CHAT_MESSAGE_TYPES.CHAT_RECOVERING,
+      broadcast: (frame) =>
+        this._broadcastChatMessage(frame as unknown as OutgoingAGUIMessage),
+      now: Date.now()
+    });
+  }
+
+  protected override async _handleInternalFiberRecovery(
+    ctx: FiberRecoveryContext
+  ): Promise<boolean> {
+    return this._chatRecoveryEngine().handleChatFiberRecovery(ctx, {
+      chatFiberPrefix: () =>
+        `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:`,
+      unwrapRecoverySnapshot: (fiber) => {
+        const { snapshot, user } = unwrapChatFiberSnapshot<"ai-chat-turn">(
+          "__cfAIChatFiberSnapshot",
+          fiber.snapshot,
+          "ai-chat-turn"
+        );
+        return { snapshot, recoveryData: user };
+      },
+      classifyRecoveredTurn: (input) => this._classifyRecoveredChatTurn(input),
+      invokeOnChatRecovery: (input) =>
+        this.onChatRecovery({
+          incidentId: input.incident.incidentId,
+          recoveryRootRequestId: input.recoveryRootRequestId,
+          attempt: input.incident.attempt,
+          maxAttempts: input.incident.maxAttempts,
+          recoveryKind: input.recoveryKind,
+          streamId: input.streamId,
+          requestId: input.requestId,
+          partialText: input.partial.text,
+          partialParts: input.partial.parts as AGUIMessage[],
+          recoveryData: input.recoveryData,
+          messages: [...this.messages],
+          lastBody: input.snapshot?.lastBody ?? this._lastBody,
+          lastClientTools:
+            input.snapshot?.lastClientTools ?? this._lastClientTools,
+          createdAt: input.createdAt
+        }),
+      // Only persist while the stream is still active — the ACK handler may
+      // have already persisted + completed the orphan; persisting again would
+      // double the partial. (The engine ANDs the never-drop-settled clause.)
+      shouldPersistOrphanedPartial: (input) => input.streamStillActive,
+      persistOrphanedStream: (streamId) =>
+        this._persistOrphanedStream(streamId),
+      completeRecoveredStream: (streamId) => {
+        this._resumableStream.complete(streamId);
+      },
+      dispatchRecoveredTurn: (input) => this._dispatchRecoveredChatTurn(input)
+    } satisfies ChatFiberWakeHooks<AGUIRecoveryClassification>);
+  }
+
+  /**
+   * Resolve the orphaned stream for a recovered chat turn. Prefers the newest
+   * durable stream row keyed by the (recovery-root) request id; falls back to
+   * the live active stream; `""` when neither survives. AG-UI does not model
+   * terminal stream status, so `streamStatus` stays undefined.
+   */
+  private _resolveAGUIRecoveryStream(
+    requestId: string
+  ): ResolvedRecoveryStream {
+    let streamId = "";
+    if (requestId) {
+      const rows = this.sql<{ id: string }>`
+        SELECT id FROM cf_ai_chat_stream_metadata
+        WHERE request_id = ${requestId}
+        ORDER BY created_at DESC LIMIT 1
+      `;
+      if (rows.length > 0) {
+        streamId = rows[0].id;
+      }
+    }
+    if (!streamId && this._resumableStream.hasActiveStream()) {
+      streamId = this._resumableStream.activeStreamId ?? "";
+    }
+    const streamStillActive = Boolean(
+      streamId &&
+      this._resumableStream.hasActiveStream() &&
+      this._resumableStream.activeStreamId === streamId
+    );
+    return { streamId, streamStillActive };
+  }
+
+  /** Reconstruct partial text/messages from stored AG-UI event chunks. */
+  private _getPartialStreamText(streamId: string): {
+    text: string;
+    parts: AGUIMessage[];
+    hasSettledToolResults: boolean;
+  } {
+    return aguiRecoveryCodec.toRecoveryPartial(
+      this._resumableStream.getStreamChunks(streamId).map((chunk) => chunk.body)
+    );
+  }
+
+  /**
+   * Classify a recovered turn as `retry` or `continue`. Mirrors
+   * `AIChatAgent._classifyRecoveredChatTurn` (#1691: an empty partial on a new
+   * turn is re-run fresh rather than merged into the previous assistant).
+   */
+  private _classifyRecoveredChatTurn(input: ClassifyRecoveredTurnInput): {
+    recoveryKind: ChatRecoveryKind;
+    detail: AGUIRecoveryClassification;
+  } {
+    const shouldRetryPreStream = this._shouldRetryRecoveredPreStreamTurn(
+      input.snapshot,
+      input.streamId,
+      input.partial
+    );
+    const preStreamLeaf =
+      this.messages.length > 0
+        ? this.messages[this.messages.length - 1]
+        : undefined;
+    const emptyPartialNewTurn =
+      !!input.streamId &&
+      input.snapshot?.continuation === false &&
+      !!input.snapshot.latestUserMessageId &&
+      input.partial.text === "" &&
+      input.partial.parts.length === 0 &&
+      preStreamLeaf?.role === "user" &&
+      preStreamLeaf.id === input.snapshot.latestUserMessageId;
+    const recoveryKind: ChatRecoveryKind =
+      shouldRetryPreStream || emptyPartialNewTurn ? "retry" : "continue";
+    return { recoveryKind, detail: { shouldRetryPreStream } };
+  }
+
+  private _shouldRetryRecoveredPreStreamTurn(
+    snapshot: ChatFiberSnapshot | null,
+    streamId: string,
+    partial: { text: string; parts: unknown[] }
+  ): snapshot is ChatFiberSnapshot & { latestUserMessageId: string } {
+    if (
+      !snapshot ||
+      snapshot.continuation ||
+      !snapshot.latestUserMessageId ||
+      streamId ||
+      partial.text ||
+      partial.parts.length > 0
+    ) {
+      return false;
+    }
+    const lastMessage =
+      this.messages.length > 0 ? this.messages[this.messages.length - 1] : null;
+    return (
+      lastMessage?.role === "user" &&
+      lastMessage.id === snapshot.latestUserMessageId
+    );
+  }
+
+  /**
+   * The retry/continue/skip decision for a recovered chat turn, run after the
+   * partial is persisted and the stream completed. Mirrors
+   * `AIChatAgent._dispatchRecoveredChatTurn`.
+   */
+  private async _dispatchRecoveredChatTurn(
+    input: DispatchRecoveredTurnInput<AGUIRecoveryClassification>
+  ): Promise<void> {
+    const { incident, options, snapshot, recoveryRootRequestId } = input;
+    const leaf =
+      this.messages.length > 0
+        ? this.messages[this.messages.length - 1]
+        : undefined;
+    const lostPartialUserId =
+      snapshot?.continuation === false &&
+      snapshot.latestUserMessageId &&
+      leaf?.role === "user" &&
+      leaf.id === snapshot.latestUserMessageId
+        ? snapshot.latestUserMessageId
+        : undefined;
+
+    const targetId =
+      input.detail.shouldRetryPreStream || lostPartialUserId !== undefined
+        ? undefined
+        : this._findLastAssistantMessage()?.id;
+
+    if (input.detail.shouldRetryPreStream && options.continue !== false) {
+      await this._chatRecoveryEngine().scheduleRecovery({
+        incident,
+        recoveryKind: input.recoveryKind,
+        callback: "_chatRecoveryRetry",
+        data: {
+          targetUserId: snapshot?.latestUserMessageId,
+          originalRequestId: recoveryRootRequestId,
+          incidentId: incident.incidentId,
+          lastBody: snapshot?.lastBody ?? null,
+          lastClientTools: snapshot?.lastClientTools ?? null
+        }
+      });
+    } else if (lostPartialUserId !== undefined && options.continue !== false) {
+      // Re-run the orphaned new turn fresh instead of continuing (and merging
+      // into) the previous assistant message (#1691).
+      await this._chatRecoveryEngine().scheduleRecovery({
+        incident,
+        recoveryKind: "retry",
+        callback: "_chatRecoveryRetry",
+        data: {
+          targetUserId: lostPartialUserId,
+          originalRequestId: recoveryRootRequestId,
+          incidentId: incident.incidentId,
+          lastBody: snapshot?.lastBody ?? null,
+          lastClientTools: snapshot?.lastClientTools ?? null
+        }
+      });
+    } else if (options.continue !== false) {
+      await this._chatRecoveryEngine().scheduleRecovery({
+        incident,
+        recoveryKind: input.recoveryKind,
+        callback: "_chatRecoveryContinue",
+        data: {
+          ...(targetId ? { targetAssistantId: targetId } : {}),
+          originalRequestId: recoveryRootRequestId,
+          incidentId: incident.incidentId,
+          ...(snapshot
+            ? {
+                lastBody: snapshot.lastBody ?? null,
+                lastClientTools: snapshot.lastClientTools ?? null
+              }
+            : {})
+        }
+      });
+    } else {
+      await this._updateChatRecoveryIncident(
+        incident.incidentId,
+        "skipped",
+        "continue_disabled"
+      );
+    }
+  }
+
+  /**
+   * Called when an interrupted chat stream is detected after restart. Return
+   * options to control recovery: `{}` (default) persists the partial and
+   * schedules a continuation; `{ continue: false }` persists only;
+   * `{ persist: false, continue: false }` hands everything to the app.
+   */
+  protected async onChatRecovery(
+    // oxlint-disable-next-line @typescript-eslint/no-unused-vars -- overridable hook
+    _ctx: AGUIChatRecoveryContext
+  ): Promise<ChatRecoveryOptions | void> {
+    return {};
+  }
+
+  async _chatRecoveryContinue(data?: ChatRecoveryContinueData): Promise<void> {
+    const previousRootRequestId = this._activeChatRecoveryRootRequestId;
+    this._activeChatRecoveryRootRequestId =
+      data?.originalRequestId ?? previousRootRequestId;
+    try {
+      const recoveryConfig = this._resolveChatRecoveryConfig();
+      const ready = await this.waitUntilStable({
+        timeout: recoveryConfig.stableTimeoutMs,
+        // Recovery-scoped: a dead server-tool orphan must not block stability
+        // (the pre-turn repair settles it); a genuinely-pending CLIENT
+        // interaction still parks via the `!ready` branch.
+        pendingInteraction: () => this.hasPendingClientInteraction()
+      });
+      if (!ready) {
+        // PARK, don't burn the budget, while a CLIENT interaction is pending —
+        // the turn is waiting on the human, not churning.
+        if (await this._parkRecoveryForPendingInteraction(data)) {
+          return;
+        }
+        console.warn(
+          "[AGUIChatAgent] _chatRecoveryContinue timed out waiting for stable state"
+        );
+        if (
+          await this._rescheduleRecoveryAfterStableTimeout(
+            "_chatRecoveryContinue",
+            data,
+            recoveryConfig.maxAttempts
+          )
+        ) {
+          return;
+        }
+        await this._exhaustRecoveryAfterStableTimeout(
+          "_chatRecoveryContinue",
+          data
+        );
+        return;
+      }
+
+      const targetId = data?.targetAssistantId;
+      if (targetId && this._findLastAssistantMessage()?.id !== targetId) {
+        // The leaf moved, so this continuation is superseded — skip it.
+        await this._updateChatRecoveryIncident(
+          data?.incidentId,
+          "skipped",
+          "conversation_changed"
+        );
+        return;
+      }
+
+      this._applyRecoveredRequestContext(data);
+      const result = await this.continueLastTurn();
+      await this._updateChatRecoveryIncident(
+        data?.incidentId,
+        result.status === "completed"
+          ? "completed"
+          : result.status === "skipped"
+            ? "skipped"
+            : "failed",
+        result.error
+      );
+    } catch (error) {
+      // OOM-only intercept (#1825): route through the tight OOM-retry budget;
+      // everything else rethrows to `Agent._executeScheduleCallback`.
+      if (await this._handleRecoveryOom("_chatRecoveryContinue", data, error)) {
+        return;
+      }
+      throw error;
+    } finally {
+      this._activeChatRecoveryRootRequestId = previousRootRequestId;
+    }
+  }
+
+  async _chatRecoveryRetry(data?: ChatRecoveryRetryData): Promise<void> {
+    const previousRootRequestId = this._activeChatRecoveryRootRequestId;
+    this._activeChatRecoveryRootRequestId =
+      data?.originalRequestId ?? previousRootRequestId;
+    try {
+      const recoveryConfig = this._resolveChatRecoveryConfig();
+      const ready = await this.waitUntilStable({
+        timeout: recoveryConfig.stableTimeoutMs,
+        pendingInteraction: () => this.hasPendingClientInteraction()
+      });
+      if (!ready) {
+        if (await this._parkRecoveryForPendingInteraction(data)) {
+          return;
+        }
+        console.warn(
+          "[AGUIChatAgent] _chatRecoveryRetry timed out waiting for stable state"
+        );
+        if (
+          await this._rescheduleRecoveryAfterStableTimeout(
+            "_chatRecoveryRetry",
+            data,
+            recoveryConfig.maxAttempts
+          )
+        ) {
+          return;
+        }
+        await this._exhaustRecoveryAfterStableTimeout(
+          "_chatRecoveryRetry",
+          data
+        );
+        return;
+      }
+
+      const lastMessage =
+        this.messages.length > 0
+          ? this.messages[this.messages.length - 1]
+          : null;
+      if (!lastMessage || lastMessage.role !== "user") {
+        await this._updateChatRecoveryIncident(
+          data?.incidentId,
+          "skipped",
+          "no_unanswered_user_message"
+        );
+        return;
+      }
+
+      if (data?.targetUserId && lastMessage.id !== data.targetUserId) {
+        await this._updateChatRecoveryIncident(
+          data?.incidentId,
+          "skipped",
+          "conversation_changed"
+        );
+        return;
+      }
+
+      this._applyRecoveredRequestContext(data);
+      const result = await this._retryLastUserTurn(
+        this._lastClientTools,
+        this._lastBody
+      );
+      await this._updateChatRecoveryIncident(
+        data?.incidentId,
+        result.status === "completed"
+          ? "completed"
+          : result.status === "skipped"
+            ? "skipped"
+            : "failed",
+        result.error
+      );
+    } catch (error) {
+      if (await this._handleRecoveryOom("_chatRecoveryRetry", data, error)) {
+        return;
+      }
+      throw error;
+    } finally {
+      this._activeChatRecoveryRootRequestId = previousRootRequestId;
+    }
+  }
+
+  private _applyRecoveredRequestContext(
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined
+  ): void {
+    if (!data) return;
+    if ("lastClientTools" in data) {
+      this._lastClientTools = data.lastClientTools ?? undefined;
+    }
+    if ("lastBody" in data) {
+      this._lastBody = data.lastBody ?? undefined;
+    }
+    if ("lastClientTools" in data || "lastBody" in data) {
+      this._persistRequestContext();
+    }
+  }
+
+  /**
+   * Reschedule a recovery callback that timed out waiting for stable state,
+   * consuming one attempt. `false` once the attempt budget is spent.
+   */
+  private async _rescheduleRecoveryAfterStableTimeout(
+    callback: ChatRecoveryScheduleCallback,
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined,
+    maxAttempts: number
+  ): Promise<boolean> {
+    return this._chatRecoveryEngine().rescheduleAfterStableTimeout({
+      incidentId: data?.incidentId,
+      callback,
+      data,
+      fallbackMaxAttempts: maxAttempts
+    });
+  }
+
+  /**
+   * Park a recovery whose stable-state wait timed out because a CLIENT
+   * interaction is pending: mark the incident `skipped`
+   * (`awaiting_client_interaction`) instead of burning budget — the client's
+   * replayed tool-result / approval drives a fresh continuation on its own.
+   */
+  private async _parkRecoveryForPendingInteraction(
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined
+  ): Promise<boolean> {
+    if (!this.hasPendingClientInteraction()) return false;
+    await this._updateChatRecoveryIncident(
+      data?.incidentId,
+      "skipped",
+      "awaiting_client_interaction"
+    );
+    return true;
+  }
+
+  /** Recovery callbacks the alarm-boundary OOM circuit breaker may purge (#1825). */
+  protected override _cf_recoveryAlarmCallbacks(): string[] {
+    return ["_chatRecoveryContinue", "_chatRecoveryRetry"];
+  }
+
+  /**
+   * Seal any still-live recovery incident as an out-of-memory exhaustion when
+   * the alarm circuit breaker trips (#1825).
+   */
+  protected override async _cf_sealMemoryLimitedRecovery(): Promise<void> {
+    const active = await listActiveChatRecoveryIncidents(this.ctx.storage);
+    for (const { incident } of active) {
+      const callback: ChatRecoveryScheduleCallback =
+        incident.recoveryKind === "retry"
+          ? "_chatRecoveryRetry"
+          : "_chatRecoveryContinue";
+      await this._chatRecoveryEngine().exhaustRecoveryGiveUp({
+        callback,
+        data: { incidentId: incident.incidentId },
+        reason: "out_of_memory"
+      });
+    }
+  }
+
+  /**
+   * Terminalize a recovery turn whose stable-state retry budget drained (or
+   * whose incident record vanished) through the same exhaustion path as
+   * deploy-recovery give-up.
+   */
+  private _exhaustRecoveryAfterStableTimeout(
+    callback: ChatRecoveryScheduleCallback,
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined
+  ): Promise<void> {
+    return this._chatRecoveryEngine().exhaustRecoveryGiveUp({
+      callback,
+      data,
+      reason: "stable_timeout"
+    });
+  }
+
+  /**
+   * Apply the tight OOM-retry budget to an error thrown out of a recovery
+   * turn (#1825). Returns `true` when the error was an OOM and this method
+   * owns the outcome, `false` for non-OOM errors.
+   */
+  private async _handleRecoveryOom(
+    callback: ChatRecoveryScheduleCallback,
+    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined,
+    error: unknown
+  ): Promise<boolean> {
+    if (!isDurableObjectMemoryLimitReset(error)) return false;
+    let decision: "rescheduled" | "exhausted" = "exhausted";
+    try {
+      decision = await this._chatRecoveryEngine().recordOomAndDecide({
+        incidentId: data?.incidentId,
+        callback,
+        data,
+        maxOomRetries: this._resolveChatRecoveryConfig().maxOomRetries
+      });
+    } catch (bookkeepingError) {
+      // Fail closed (seal) rather than risk a silent wedge in the degraded
+      // isolate that just OOMed.
+      console.error(
+        "[AGUIChatAgent] failed to record OOM recovery attempt; terminalizing",
+        bookkeepingError
+      );
+      decision = "exhausted";
+    }
+    if (decision === "exhausted") {
+      await this._chatRecoveryEngine().exhaustRecoveryGiveUp({
+        callback,
+        data,
+        reason: "out_of_memory"
+      });
+    }
+    return true;
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -2196,7 +3251,7 @@ export class AGUIChatAgent<
     const body = this._lastBody;
     const epoch = this._turnQueue.generation;
     let status: SaveMessagesResult["status"] = "completed";
-    let wasAborted = false;
+    let error: string | undefined;
 
     await this._runExclusiveChatTurn(
       requestId,
@@ -2214,21 +3269,21 @@ export class AGUIChatAgent<
           status = "skipped";
           return;
         }
-        wasAborted = await this._runProgrammaticChatTurn(
+        const turnResult = await this._runProgrammaticChatTurn(
           requestId,
           clientTools,
           body,
           options?.signal
         );
+        status = turnResult.status;
+        error = turnResult.error;
       },
       { epoch }
     );
     if (this._turnQueue.generation !== epoch && status === "completed") {
       status = "skipped";
-    } else if (wasAborted && status === "completed") {
-      status = "aborted";
     }
-    return { requestId, status };
+    return { requestId, status, ...(error !== undefined && { error }) };
   }
 
   private async _runProgrammaticChatTurn(
@@ -2236,9 +3291,10 @@ export class AGUIChatAgent<
     clientTools?: ClientToolSchema[],
     body?: Record<string, unknown>,
     externalSignal?: AbortSignal
-  ): Promise<boolean> {
+  ): Promise<StreamResultStatus> {
     this._setRequestContext(clientTools, body);
     let wasAborted = false;
+    let status: StreamResultStatus = { status: "completed" };
     await this._tryCatchChat(async () => {
       return agentContext.run(
         {
@@ -2255,6 +3311,7 @@ export class AGUIChatAgent<
           );
           try {
             const programmaticBody = async () => {
+              await this._repairInterruptedToolsBeforeTurn();
               const response = await this._invokeChatHandler(() => {}, {
                 requestId,
                 abortSignal,
@@ -2263,21 +3320,16 @@ export class AGUIChatAgent<
                 continuation: false
               });
               if (response) {
-                await this._reply(requestId, response, [], {
+                status = await this._reply(requestId, response, [], {
                   chatMessageId: requestId
                 });
               }
             };
-            if (this.chatRecovery) {
-              await this.runFiber(
-                `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
-                async () => {
-                  await programmaticBody();
-                }
-              );
-            } else {
-              await programmaticBody();
-            }
+            await this._runChatRecoveryFiber(
+              requestId,
+              false,
+              programmaticBody
+            );
           } finally {
             if (abortSignal?.aborted) wasAborted = true;
             detachExternal();
@@ -2286,7 +3338,10 @@ export class AGUIChatAgent<
         }
       );
     });
-    return wasAborted;
+    if (status.status === "completed" && wasAborted) {
+      return { status: "aborted" };
+    }
+    return status;
   }
 
   protected async continueLastTurn(
@@ -2301,6 +3356,7 @@ export class AGUIChatAgent<
     const resolvedBody = body ?? this._lastBody;
     const epoch = this._turnQueue.generation;
     let status: SaveMessagesResult["status"] = "completed";
+    let error: string | undefined;
     let wasAborted = false;
 
     await this._runExclusiveChatTurn(
@@ -2327,6 +3383,9 @@ export class AGUIChatAgent<
                   options?.signal
                 );
                 try {
+                  // Repair interrupted server-tool orphans before re-entering
+                  // inference so the recovered transcript is settled.
+                  await this._repairInterruptedToolsBeforeTurn();
                   const response = await this._invokeChatHandler(() => {}, {
                     requestId,
                     abortSignal,
@@ -2335,10 +3394,17 @@ export class AGUIChatAgent<
                     continuation: true
                   });
                   if (response) {
-                    await this._reply(requestId, response, [], {
-                      continuation: true,
-                      chatMessageId: requestId
-                    });
+                    const replyResult = await this._reply(
+                      requestId,
+                      response,
+                      [],
+                      {
+                        continuation: true,
+                        chatMessageId: requestId
+                      }
+                    );
+                    status = replyResult.status;
+                    error = replyResult.error;
                   }
                 } finally {
                   if (abortSignal?.aborted) wasAborted = true;
@@ -2349,16 +3415,7 @@ export class AGUIChatAgent<
             );
           });
         };
-        if (this.chatRecovery) {
-          await this.runFiber(
-            `${(this.constructor as typeof AGUIChatAgent).CHAT_FIBER_NAME}:${requestId}`,
-            async () => {
-              await turnBody();
-            }
-          );
-        } else {
-          await turnBody();
-        }
+        await this._runChatRecoveryFiber(requestId, true, turnBody);
       },
       { epoch }
     );
@@ -2367,7 +3424,52 @@ export class AGUIChatAgent<
     } else if (wasAborted && status === "completed") {
       status = "aborted";
     }
-    return { requestId, status };
+    return { requestId, status, ...(error !== undefined && { error }) };
+  }
+
+  /**
+   * Re-run the last unanswered user turn (the pre-stream retry path). Mirrors
+   * `AIChatAgent._retryLastUserTurn`.
+   */
+  private async _retryLastUserTurn(
+    clientTools?: ClientToolSchema[],
+    body?: Record<string, unknown>,
+    options?: SaveMessagesOptions
+  ): Promise<SaveMessagesResult> {
+    const lastMessage =
+      this.messages.length > 0 ? this.messages[this.messages.length - 1] : null;
+    if (!lastMessage || lastMessage.role !== "user") {
+      return { requestId: "", status: "skipped" };
+    }
+
+    const requestId = nanoid();
+    const epoch = this._turnQueue.generation;
+    let status: SaveMessagesResult["status"] = "completed";
+    let error: string | undefined;
+
+    await this._runExclusiveChatTurn(
+      requestId,
+      async () => {
+        if (this._turnQueue.generation !== epoch) {
+          status = "skipped";
+          return;
+        }
+        const turnResult = await this._runProgrammaticChatTurn(
+          requestId,
+          clientTools,
+          body,
+          options?.signal
+        );
+        status = turnResult.status;
+        error = turnResult.error;
+      },
+      { epoch }
+    );
+
+    if (this._turnQueue.generation !== epoch && status === "completed") {
+      status = "skipped";
+    }
+    return { requestId, status, ...(error !== undefined && { error }) };
   }
 
   // ──────────────────────────────────────────────────────────────────
