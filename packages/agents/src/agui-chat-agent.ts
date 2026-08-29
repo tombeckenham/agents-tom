@@ -513,7 +513,7 @@ export class AGUIChatAgent<
   /**
    * Tool calls whose approval decision this isolate has already applied. AG-UI
    * persists approvals as CUSTOM events rather than message state, so a decided
-   * call keeps looking unanswered in `this.messages` until the continuation
+   * call keeps looking unanswered in `this._aguiMessages` until the continuation
    * executes it — without this the completeness gate would park forever on a
    * batch whose only outstanding member is an already-approved tool.
    *
@@ -529,10 +529,23 @@ export class AGUIChatAgent<
   waitForMcpConnections: boolean | { timeout: number } = { timeout: 10_000 };
 
   /**
+   * Canonical AG-UI message store. Engine internals read/write this directly;
+   * the public {@link messages} accessor delegates to it so a projection
+   * layer (e.g. the AI SDK shim in `@cloudflare/ai-chat`) can override the
+   * public view without disturbing the engine.
+   */
+  protected _aguiMessages: AGUIMessage[] = [];
+
+  /**
    * Authoritative message list. Mutable for backwards compatibility, but
    * write-through `persistMessages` is preferred.
    */
-  messages: AGUIMessage[] = [];
+  get messages(): AGUIMessage[] {
+    return this._aguiMessages;
+  }
+  set messages(value: AGUIMessage[]) {
+    this._aguiMessages = value;
+  }
 
   static readonly CHAT_FIBER_NAME = "__cf_internal_chat_turn";
 
@@ -610,7 +623,7 @@ export class AGUIChatAgent<
     this._resumableStream = new ResumableStream(this.sql.bind(this));
 
     const rawMessages = this._loadMessagesFromDb();
-    this.messages = autoTransformAGUIMessages(rawMessages);
+    this._aguiMessages = autoTransformAGUIMessages(rawMessages);
 
     this._abortRegistry = new AbortRegistry();
 
@@ -718,6 +731,33 @@ export class AGUIChatAgent<
    */
   protected sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
     return message;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Projection seams — identity here; a projection layer (the AI SDK
+  // shim in `@cloudflare/ai-chat`) overrides these to adapt hook shapes
+  // without the engine dispatching user hooks with the wrong vocabulary.
+  // ──────────────────────────────────────────────────────────────────
+
+  /** Applied to the `onChatMessage` return before `_reply` consumes it. */
+  protected _projectHandlerResponse(
+    response: Response | undefined
+  ): Response | undefined {
+    return response;
+  }
+
+  /** Dispatch seam for {@link onChatResponse}. */
+  protected _invokeChatResponseHook(
+    result: AGUIChatResponseResult
+  ): void | Promise<void> {
+    return this.onChatResponse(result);
+  }
+
+  /** Dispatch seam for {@link onChatRecovery}. */
+  protected async _invokeChatRecoveryHook(
+    ctx: AGUIChatRecoveryContext
+  ): Promise<ChatRecoveryOptions | void> {
+    return this.onChatRecovery(ctx);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -1005,7 +1045,7 @@ export class AGUIChatAgent<
     this._lastBody = undefined;
     this._persistRequestContext();
     this._persistedMessageCache.clear();
-    this.messages = [];
+    this._aguiMessages = [];
     this._broadcastChatMessage({ type: CHAT_MESSAGE_TYPES.CHAT_CLEAR }, [
       connection.id
     ]);
@@ -1125,7 +1165,7 @@ export class AGUIChatAgent<
 
   /**
    * Serialize a client-tool result/approval apply behind any in-flight apply
-   * (#1649): each apply is a read-modify-write of `this.messages` followed by a
+   * (#1649): each apply is a read-modify-write of `this._aguiMessages` followed by a
    * persist, and parallel results arrive as independent WebSocket messages.
    * `_pendingInteractionPromise` tracks the newest link so the barrier's
    * pending-interaction signal observes the latest apply; because the chain is
@@ -1222,7 +1262,7 @@ export class AGUIChatAgent<
       return true;
     }
 
-    const next = [...this.messages];
+    const next = [...this._aguiMessages];
     if (assistantIdx >= 0) {
       next.splice(assistantIdx + 1, 0, toolMessage);
     } else {
@@ -1284,8 +1324,8 @@ export class AGUIChatAgent<
     });
     // Persist current snapshot so a refresh between approval and the
     // continuation turn does not lose the decision state.
-    if (this.messages.length > 0) {
-      await this.persistMessages(this.messages);
+    if (this._aguiMessages.length > 0) {
+      await this.persistMessages(this._aguiMessages);
     }
     return true;
   }
@@ -1325,8 +1365,8 @@ export class AGUIChatAgent<
   }
 
   private _findAssistantIndexByToolCall(toolCallId: string): number {
-    for (let i = this.messages.length - 1; i >= 0; i--) {
-      const m = this.messages[i];
+    for (let i = this._aguiMessages.length - 1; i >= 0; i--) {
+      const m = this._aguiMessages[i];
       if (m.role !== "assistant" || !m.toolCalls) continue;
       for (const tc of m.toolCalls) {
         if (tc.id === toolCallId) return i;
@@ -1336,8 +1376,8 @@ export class AGUIChatAgent<
   }
 
   private _findLastAssistantMessage(): AssistantMessage | undefined {
-    for (let i = this.messages.length - 1; i >= 0; i--) {
-      const m = this.messages[i];
+    for (let i = this._aguiMessages.length - 1; i >= 0; i--) {
+      const m = this._aguiMessages[i];
       if (m.role === "assistant") return m;
     }
     return undefined;
@@ -1378,8 +1418,10 @@ export class AGUIChatAgent<
     excludeBroadcastIds: string[] = [],
     options?: { _deleteStaleRows?: boolean }
   ) {
-    const mergedMessages = reconcileMessages(messages, this.messages, (msg) =>
-      this._sanitizeMessageForPersistence(msg)
+    const mergedMessages = reconcileMessages(
+      messages,
+      this._aguiMessages,
+      (msg) => this._sanitizeMessageForPersistence(msg)
     );
 
     for (const message of mergedMessages) {
@@ -1405,7 +1447,7 @@ export class AGUIChatAgent<
     }
 
     if (options?._deleteStaleRows) {
-      const serverIds = new Set(this.messages.map((m) => m.id));
+      const serverIds = new Set(this._aguiMessages.map((m) => m.id));
       const isSubsetOfServer = mergedMessages.every((m) => serverIds.has(m.id));
       if (isSubsetOfServer) {
         const keepIds = new Set(mergedMessages.map((m) => m.id));
@@ -1427,7 +1469,7 @@ export class AGUIChatAgent<
     }
 
     const persistedRows = this._loadMessagesFromDb();
-    this.messages = autoTransformAGUIMessages(persistedRows);
+    this._aguiMessages = autoTransformAGUIMessages(persistedRows);
     this._broadcastChatMessage(
       {
         messages: mergedMessages,
@@ -1437,8 +1479,11 @@ export class AGUIChatAgent<
     );
   }
 
-  /** Subclass-hookable sanitizer composing the built-in pipeline + user hook. */
-  private _sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
+  /**
+   * Subclass-hookable sanitizer composing the built-in pipeline + user hook.
+   * Protected so a projection layer can adapt the hook's message vocabulary.
+   */
+  protected _sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
     const base = sanitizeAGUIMessage(message);
     return this.sanitizeMessageForPersistence(base);
   }
@@ -1582,14 +1627,14 @@ export class AGUIChatAgent<
 
   private _messagesForClientSync(): readonly AGUIMessage[] {
     if (!this._streamingMessages || this._streamingMessages.length === 0) {
-      return this.messages;
+      return this._aguiMessages;
     }
     const streaming = this._streamingMessages;
-    const merged: AGUIMessage[] = this.messages.map(
+    const merged: AGUIMessage[] = this._aguiMessages.map(
       (m) => streaming.find((sm) => sm.id === m.id) ?? m
     );
     for (const sm of streaming) {
-      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+      if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
     }
     return merged;
   }
@@ -1622,7 +1667,7 @@ export class AGUIChatAgent<
       ) {
         this._mergeQueuedUserStartIndexByEpoch.set(
           this._turnQueue.generation,
-          this.messages.length
+          this._aguiMessages.length
         );
       }
     }
@@ -1642,28 +1687,28 @@ export class AGUIChatAgent<
     if (queuedUserStart === undefined) return null;
 
     let queuedUserEnd = queuedUserStart;
-    while (this.messages[queuedUserEnd]?.role === "user") {
+    while (this._aguiMessages[queuedUserEnd]?.role === "user") {
       queuedUserEnd++;
     }
     if (
       queuedUserEnd === queuedUserStart &&
-      queuedUserStart < this.messages.length
+      queuedUserStart < this._aguiMessages.length
     ) {
       console.warn(
         `[AGUIChatAgent] merge: expected user messages at index ${queuedUserStart} ` +
-          `but found role="${this.messages[queuedUserStart]?.role}"; skipping merge`
+          `but found role="${this._aguiMessages[queuedUserStart]?.role}"; skipping merge`
       );
     }
-    const queuedUserMessages = this.messages.slice(
+    const queuedUserMessages = this._aguiMessages.slice(
       queuedUserStart,
       queuedUserEnd
     );
     if (queuedUserMessages.length < 2) return null;
 
     return [
-      ...this.messages.slice(0, queuedUserStart),
+      ...this._aguiMessages.slice(0, queuedUserStart),
       AGUIChatAgent._mergeUserMessages(queuedUserMessages),
-      ...this.messages.slice(queuedUserEnd)
+      ...this._aguiMessages.slice(queuedUserEnd)
     ];
   }
 
@@ -1738,7 +1783,7 @@ export class AGUIChatAgent<
                 );
               }
               try {
-                await this.onChatResponse(chatResult);
+                await this._invokeChatResponseHook(chatResult);
               } catch (hookError) {
                 console.error(
                   "[AGUIChatAgent] onChatResponse threw:",
@@ -1780,7 +1825,9 @@ export class AGUIChatAgent<
     options: OnChatMessageOptions
   ): Promise<Response | undefined> {
     try {
-      return await this.onChatMessage(onFinish, options);
+      return this._projectHandlerResponse(
+        await this.onChatMessage(onFinish, options)
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this._broadcastChatMessage({
@@ -1828,8 +1875,8 @@ export class AGUIChatAgent<
     this._abortRegistry.cancel(requestId, reason);
   }
 
-  protected abortAllRequests(): void {
-    this._abortRegistry.destroyAll();
+  protected abortAllRequests(reason?: unknown): void {
+    this._abortRegistry.destroyAll(reason);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -2223,8 +2270,8 @@ export class AGUIChatAgent<
    */
   private _continuationSeed(): AGUIMessage[] {
     const lastAssistantIdx = (() => {
-      for (let i = this.messages.length - 1; i >= 0; i--) {
-        if (this.messages[i].role === "assistant") return i;
+      for (let i = this._aguiMessages.length - 1; i >= 0; i--) {
+        if (this._aguiMessages[i].role === "assistant") return i;
       }
       return -1;
     })();
@@ -2236,7 +2283,9 @@ export class AGUIChatAgent<
         }
       ];
     }
-    return this.messages.slice(lastAssistantIdx).map((m) => structuredClone(m));
+    return this._aguiMessages
+      .slice(lastAssistantIdx)
+      .map((m) => structuredClone(m));
   }
 
   /**
@@ -2561,12 +2610,12 @@ export class AGUIChatAgent<
     // turn (assistant + tool messages, potentially seeded from the previous
     // assistant turn on continuation). Merge into the persisted list by id.
     const merged: AGUIMessage[] = [];
-    for (const m of this.messages) {
+    for (const m of this._aguiMessages) {
       const replacement = streamedMessages.find((sm) => sm.id === m.id);
       merged.push(replacement ?? m);
     }
     for (const sm of streamedMessages) {
-      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+      if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
     }
     await this.persistMessages(merged, excludeBroadcastIds);
   }
@@ -2589,12 +2638,12 @@ export class AGUIChatAgent<
     }
     if (snapshot.messages.length === 0) return;
     const merged: AGUIMessage[] = [];
-    for (const m of this.messages) {
+    for (const m of this._aguiMessages) {
       const replacement = snapshot.messages.find((sm) => sm.id === m.id);
       merged.push(replacement ?? m);
     }
     for (const sm of snapshot.messages) {
-      if (!this.messages.some((m) => m.id === sm.id)) merged.push(sm);
+      if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
     }
     // NOTE: progress is bumped at production time in `_storeStreamChunk`
     // (#1637), NOT here — a recovery/reconnect re-persist must not be
@@ -2766,11 +2815,11 @@ export class AGUIChatAgent<
   private async _repairInterruptedToolsBeforeTurn(): Promise<void> {
     const clientResolvable = clientResolvableToolNames(this._lastClientTools);
     const resolved = new Set<string>();
-    for (const m of this.messages) {
+    for (const m of this._aguiMessages) {
       if (m.role === "tool") resolved.add(m.toolCallId);
     }
     const repairs: { assistantIdx: number; toolMessage: ToolMessage }[] = [];
-    this.messages.forEach((m, idx) => {
+    this._aguiMessages.forEach((m, idx) => {
       if (m.role !== "assistant" || !m.toolCalls) return;
       for (const tc of m.toolCalls) {
         if (resolved.has(tc.id) || clientResolvable.has(tc.function.name)) {
@@ -2789,7 +2838,7 @@ export class AGUIChatAgent<
       }
     });
     if (repairs.length === 0) return;
-    const next = [...this.messages];
+    const next = [...this._aguiMessages];
     for (let i = repairs.length - 1; i >= 0; i--) {
       next.splice(repairs[i].assistantIdx + 1, 0, repairs[i].toolMessage);
     }
@@ -2885,7 +2934,7 @@ export class AGUIChatAgent<
       requestId,
       recoveryRootRequestId: this._activeChatRecoveryRootRequestId ?? requestId,
       continuation,
-      messages: this.messages,
+      messages: this._aguiMessages,
       lastBody: this._lastBody,
       lastClientTools: this._lastClientTools
     });
@@ -3130,7 +3179,7 @@ export class AGUIChatAgent<
       },
       classifyRecoveredTurn: (input) => this._classifyRecoveredChatTurn(input),
       invokeOnChatRecovery: (input) =>
-        this.onChatRecovery({
+        this._invokeChatRecoveryHook({
           incidentId: input.incident.incidentId,
           recoveryRootRequestId: input.recoveryRootRequestId,
           attempt: input.incident.attempt,
@@ -3141,7 +3190,7 @@ export class AGUIChatAgent<
           partialText: input.partial.text,
           partialParts: input.partial.parts as AGUIMessage[],
           recoveryData: input.recoveryData,
-          messages: [...this.messages],
+          messages: [...this._aguiMessages],
           lastBody: input.snapshot?.lastBody ?? this._lastBody,
           lastClientTools:
             input.snapshot?.lastClientTools ?? this._lastClientTools,
@@ -3218,8 +3267,8 @@ export class AGUIChatAgent<
       input.partial
     );
     const preStreamLeaf =
-      this.messages.length > 0
-        ? this.messages[this.messages.length - 1]
+      this._aguiMessages.length > 0
+        ? this._aguiMessages[this._aguiMessages.length - 1]
         : undefined;
     const emptyPartialNewTurn =
       !!input.streamId &&
@@ -3250,7 +3299,9 @@ export class AGUIChatAgent<
       return false;
     }
     const lastMessage =
-      this.messages.length > 0 ? this.messages[this.messages.length - 1] : null;
+      this._aguiMessages.length > 0
+        ? this._aguiMessages[this._aguiMessages.length - 1]
+        : null;
     return (
       lastMessage?.role === "user" &&
       lastMessage.id === snapshot.latestUserMessageId
@@ -3267,8 +3318,8 @@ export class AGUIChatAgent<
   ): Promise<void> {
     const { incident, options, snapshot, recoveryRootRequestId } = input;
     const leaf =
-      this.messages.length > 0
-        ? this.messages[this.messages.length - 1]
+      this._aguiMessages.length > 0
+        ? this._aguiMessages[this._aguiMessages.length - 1]
         : undefined;
     const lostPartialUserId =
       snapshot?.continuation === false &&
@@ -3456,8 +3507,8 @@ export class AGUIChatAgent<
       }
 
       const lastMessage =
-        this.messages.length > 0
-          ? this.messages[this.messages.length - 1]
+        this._aguiMessages.length > 0
+          ? this._aguiMessages[this._aguiMessages.length - 1]
           : null;
       if (!lastMessage || lastMessage.role !== "user") {
         await this._updateChatRecoveryIncident(
@@ -3536,7 +3587,8 @@ export class AGUIChatAgent<
     const recoveryRootRequestId =
       this._activeChatRecoveryRootRequestId ?? input.requestId;
     const latestUserMessageId =
-      [...this.messages].reverse().find((m) => m.role === "user")?.id ?? null;
+      [...this._aguiMessages].reverse().find((m) => m.role === "user")?.id ??
+      null;
     const { incident, config, exhausted } =
       await this._beginChatRecoveryIncident({
         requestId: input.requestId,
@@ -3715,7 +3767,7 @@ export class AGUIChatAgent<
       async () => {
         const resolved =
           typeof messages === "function"
-            ? await messages(this.messages)
+            ? await messages(this._aguiMessages)
             : messages;
         if (this._turnQueue.generation !== epoch) {
           status = "skipped";
@@ -3894,7 +3946,9 @@ export class AGUIChatAgent<
     options?: SaveMessagesOptions
   ): Promise<SaveMessagesResult> {
     const lastMessage =
-      this.messages.length > 0 ? this.messages[this.messages.length - 1] : null;
+      this._aguiMessages.length > 0
+        ? this._aguiMessages[this._aguiMessages.length - 1]
+        : null;
     if (!lastMessage || lastMessage.role !== "user") {
       return { requestId: "", status: "skipped" };
     }

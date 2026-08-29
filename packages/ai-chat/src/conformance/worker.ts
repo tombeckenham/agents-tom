@@ -12,6 +12,7 @@ import {
   type ChatResponseResult,
   type OnChatMessageOptions
 } from "../";
+import { AIChatAgent as ProjectedAIChatAgent } from "../agent";
 import type {
   UIMessage as ChatMessage,
   GenerateTextOnFinishCallback,
@@ -452,6 +453,93 @@ export class MaxPersistedAgent extends ScriptedAgent {
   maxPersistedMessages = 2;
 }
 
+/**
+ * Phase-3 smoke fixture: the PROJECTED `AIChatAgent` (`../agent.ts` — the
+ * AG-UI engine under the legacy AI SDK surface). Not part of the golden
+ * matrix; exercised by `projected-smoke.test.ts` only.
+ */
+export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
+  private _projHooks: Array<Record<string, unknown>> = [];
+
+  async stable(timeout = 8000): Promise<boolean> {
+    return this.waitUntilStable({ timeout });
+  }
+
+  /** Recorded lifecycle-hook invocations (legacy shapes), in order. */
+  hooks(): Array<Record<string, unknown>> {
+    return this._projHooks;
+  }
+
+  /** Raw persisted rows — AG-UI shape with the `_v` marker. */
+  rows(): Array<{ id: string; message: unknown }> {
+    return (
+      this.sql<{ id: string; message: string }>`
+        select id, message from cf_ai_chat_agent_messages
+        order by created_at, rowid
+      ` || []
+    ).map((row) => ({ id: row.id, message: JSON.parse(row.message) }));
+  }
+
+  /** The legacy-projected view (`this.messages` getter). */
+  uiMessages(): ChatMessage[] {
+    return this.messages;
+  }
+
+  protected onChatResponse(result: ChatResponseResult): void {
+    this._projHooks.push({
+      hook: "onChatResponse",
+      requestId: result.requestId,
+      status: result.status,
+      continuation: result.continuation,
+      messageId: result.message.id,
+      partTypes: result.message.parts.map((part) => part.type)
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    const scenario =
+      (options?.body as { scenario?: string } | undefined)?.scenario ??
+      "plain-text";
+    if (scenario === "tool-single") {
+      return sse([
+        { type: "start" },
+        { type: "start-step" },
+        {
+          type: "tool-input-start",
+          toolCallId: "call-weather-1",
+          toolName: "getWeather"
+        },
+        {
+          type: "tool-input-delta",
+          toolCallId: "call-weather-1",
+          inputTextDelta: '{"city":"Sydney"}'
+        },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-weather-1",
+          toolName: "getWeather",
+          input: { city: "Sydney" }
+        },
+        {
+          type: "tool-output-available",
+          toolCallId: "call-weather-1",
+          output: { temp: 21 }
+        },
+        { type: "finish-step" },
+        { type: "text-start", id: "t-1" },
+        { type: "text-delta", id: "t-1", delta: "It is 21C" },
+        { type: "text-end", id: "t-1" },
+        { type: "finish" }
+      ]);
+    }
+    return sse(textRun("t-1", ["Hello ", "world"]));
+  }
+}
+
 export type Env = {
   ScriptedAgent: DurableObjectNamespace<ScriptedAgent>;
   GatedAgent: DurableObjectNamespace<GatedAgent>;
@@ -460,6 +548,7 @@ export type Env = {
   MergeGatedAgent: DurableObjectNamespace<MergeGatedAgent>;
   DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
+  ProjectedAgent: DurableObjectNamespace<ProjectedAgent>;
 };
 
 export default {

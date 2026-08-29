@@ -279,3 +279,12 @@ export type {
   SaveMessagesOptions,
   SaveMessagesResult
 } from "./lifecycle";
+
+// AG-UI shape helpers used by the AI SDK projection layer
+// (`@cloudflare/ai-chat`): row migration/normalization and the built-in
+// message sanitizer.
+export {
+  autoTransformAGUIMessages,
+  migrateUIMessageToAGUI
+} from "./agui-migration";
+export { sanitizeAGUIMessage } from "./agui-sanitize";

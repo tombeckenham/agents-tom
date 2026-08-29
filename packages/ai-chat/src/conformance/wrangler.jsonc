@@ -18,7 +18,8 @@
       { "name": "DropGatedAgent", "class_name": "DropGatedAgent" },
       { "name": "MergeGatedAgent", "class_name": "MergeGatedAgent" },
       { "name": "DebounceGatedAgent", "class_name": "DebounceGatedAgent" },
-      { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" }
+      { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" },
+      { "name": "ProjectedAgent", "class_name": "ProjectedAgent" }
     ]
   },
   "migrations": [
@@ -33,6 +34,10 @@
         "DebounceGatedAgent",
         "MaxPersistedAgent"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["ProjectedAgent"]
     }
   ]
 }
