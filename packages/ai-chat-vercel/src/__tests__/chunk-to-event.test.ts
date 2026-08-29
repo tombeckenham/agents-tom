@@ -277,10 +277,11 @@ describe("ChunkToEventProjector — data chunks and metadata", () => {
     const events = project([
       { type: "data-foo", data: { hello: "world" } } as UIMessageChunk
     ]);
+    // The value is wrapped so the part id / transient flag round-trip.
     expect(events[0]).toMatchObject({
       type: "CUSTOM",
       name: "data.foo",
-      value: { hello: "world" }
+      value: { data: { hello: "world" } }
     });
   });
 

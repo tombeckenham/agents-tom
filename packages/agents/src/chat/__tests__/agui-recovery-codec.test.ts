@@ -199,8 +199,9 @@ describe("AGUIRecoveryCodec.toRecoveryPartial", () => {
     ]);
 
     expect(partial.text).toBe("Hello world");
+    // Interrupted mid-text (no TEXT_MESSAGE_END): the snapshot is partial.
     expect(partial.parts).toEqual([
-      { id: "a1", role: "assistant", content: "Hello world" }
+      { id: "a1", role: "assistant", content: "Hello world", partial: true }
     ]);
     expect(partial.hasSettledToolResults).toBe(false);
   });
@@ -265,7 +266,7 @@ describe("AGUIRecoveryCodec.toRecoveryPartial", () => {
         toolCallId: "tc-1",
         content: '{"temp":21}'
       },
-      { id: "a2", role: "assistant", content: "It is 21" }
+      { id: "a2", role: "assistant", content: "It is 21", partial: true }
     ]);
     expect(partial.hasSettledToolResults).toBe(true);
   });
@@ -339,7 +340,7 @@ describe("AGUIRecoveryCodec.toRecoveryPartial", () => {
     expect(partial.text).toBe("answer");
     expect(partial.parts).toEqual([
       { id: "r1", role: "reasoning", content: "thinking" },
-      { id: "a1", role: "assistant", content: "answer" }
+      { id: "a1", role: "assistant", content: "answer", partial: true }
     ]);
   });
 

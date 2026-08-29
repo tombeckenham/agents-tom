@@ -94,10 +94,14 @@ type Stack = {
   agents: Record<Family, { ns: unknown; kebab: string }>;
 };
 
+// Post-swap both rows run the AG-UI engine: the first through the package's
+// legacy entry point (`../` — what users import), the second through the
+// sidecar fixtures built directly on `../agent`. Both diff against the
+// goldens recorded from the pre-cutover legacy implementation.
 const stacks: Stack[] = [
   {
-    name: "legacy AIChatAgent",
-    projected: false,
+    name: "swapped AIChatAgent (legacy entry point)",
+    projected: true,
     agents: {
       scripted: { ns: env.ScriptedAgent, kebab: "scripted-agent" },
       gated: { ns: env.GatedAgent, kebab: "gated-agent" },
