@@ -1309,6 +1309,10 @@ export class AGUIChatAgent<
     // The decision settles this call for the batch-completeness gate — the
     // continuation turn is what actually produces its `ToolMessage`.
     this._decidedApprovals.add(toolCallId);
+    // Durable record on the issuing assistant row (persisted below / on
+    // stream completion) so the decision survives an isolate restart and
+    // projects back to approval-responded / output-denied.
+    this._recordApprovalDecisionOnRow(toolCallId, value.approvalId, approved);
     const event: AGUIEvent = {
       type: "CUSTOM",
       name: CF_TOOL_APPROVAL_DECISION,
@@ -1328,6 +1332,38 @@ export class AGUIChatAgent<
       await this.persistMessages(this._aguiMessages);
     }
     return true;
+  }
+
+  /**
+   * Write an approval decision onto the assistant row that issued the call —
+   * persisted (or the in-flight streaming copy, persisted on completion).
+   * Prefers the request's original approvalId when the row already has one.
+   */
+  private _recordApprovalDecisionOnRow(
+    toolCallId: string,
+    approvalId: string,
+    approved: boolean
+  ): void {
+    const record = (messages: readonly AGUIMessage[]): boolean => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role !== "assistant") continue;
+        if (!m.toolCalls?.some((tc) => tc.id === toolCallId)) continue;
+        const existing = m.toolApprovals?.[toolCallId];
+        (m.toolApprovals ??= {})[toolCallId] = {
+          approvalId: existing?.approvalId ?? approvalId,
+          approved
+        };
+        return true;
+      }
+      return false;
+    };
+    if (record(this._aguiMessages)) {
+      // New array identity so projection layers memoizing on it re-project.
+      this._aguiMessages = [...this._aguiMessages];
+    } else if (this._streamingAccumulator) {
+      record(this._streamingAccumulator.messages);
+    }
   }
 
   /** Whether any assistant — persisted or still streaming — issued this call. */
@@ -1421,12 +1457,15 @@ export class AGUIChatAgent<
     const mergedMessages = reconcileMessages(
       messages,
       this._aguiMessages,
-      (msg) => this._sanitizeMessageForPersistence(msg)
+      (msg) => this._sanitizeMessageForPersistence(msg, messages)
     );
 
     for (const message of mergedMessages) {
       if (isEmptyReasoningMessage(message)) continue;
-      const sanitized = this._sanitizeMessageForPersistence(message);
+      const sanitized = this._sanitizeMessageForPersistence(
+        message,
+        mergedMessages
+      );
       const safe = enforceRowSizeLimit(sanitized);
       const persisted = wrapPersistedShape(safe);
       const json = JSON.stringify(persisted);
@@ -1481,9 +1520,14 @@ export class AGUIChatAgent<
 
   /**
    * Subclass-hookable sanitizer composing the built-in pipeline + user hook.
-   * Protected so a projection layer can adapt the hook's message vocabulary.
+   * Protected so a projection layer can adapt the hook's message vocabulary;
+   * `context` is the batch being persisted (lets a projection resolve
+   * cross-row references, e.g. a tool result's issuing assistant).
    */
-  protected _sanitizeMessageForPersistence(message: AGUIMessage): AGUIMessage {
+  protected _sanitizeMessageForPersistence(
+    message: AGUIMessage,
+    _context?: readonly AGUIMessage[]
+  ): AGUIMessage {
     const base = sanitizeAGUIMessage(message);
     return this.sanitizeMessageForPersistence(base);
   }
@@ -2577,7 +2621,7 @@ export class AGUIChatAgent<
     // from the live event stream; broadcasting would double-render.
     for (const m of messages) {
       if (isEmptyReasoningMessage(m)) continue;
-      const sanitized = this._sanitizeMessageForPersistence(m);
+      const sanitized = this._sanitizeMessageForPersistence(m, messages);
       const safe = enforceRowSizeLimit(sanitized);
       const persisted = wrapPersistedShape(safe);
       const json = JSON.stringify(persisted);
@@ -2791,9 +2835,16 @@ export class AGUIChatAgent<
     include?: (toolName: string) => boolean
   ): boolean {
     const merged = this._messagesForClientSync();
-    const resolved = new Set<string>();
+    const resolved = new Set<string>(this._decidedApprovals);
     for (const m of merged) {
       if (m.role === "tool") resolved.add(m.toolCallId);
+      // A decided approval settles its call: a denied call never gets a tool
+      // result row, and an approved one is owned by the armed continuation.
+      if (m.role === "assistant" && m.toolApprovals) {
+        for (const [callId, approval] of Object.entries(m.toolApprovals)) {
+          if (approval.approved !== undefined) resolved.add(callId);
+        }
+      }
     }
     for (const m of merged) {
       if (m.role !== "assistant" || !m.toolCalls) continue;
@@ -2823,6 +2874,13 @@ export class AGUIChatAgent<
       if (m.role !== "assistant" || !m.toolCalls) return;
       for (const tc of m.toolCalls) {
         if (resolved.has(tc.id) || clientResolvable.has(tc.function.name)) {
+          continue;
+        }
+        // A call with approval state is not an orphan: undecided ones await
+        // the human, decided ones are settled (deny) or owned by the
+        // continuation about to run the tool (approve). Fabricating an
+        // interrupted result here would clobber the approval flow.
+        if (this._decidedApprovals.has(tc.id) || m.toolApprovals?.[tc.id]) {
           continue;
         }
         repairs.push({

@@ -6,7 +6,11 @@ import {
   isPersistedAGUIMessage,
   migrateUIMessageToAGUI
 } from "../agui-migration";
-import { PERSISTED_MESSAGE_SCHEMA_VERSION } from "../agui-types";
+import { toUIMessages } from "../agui-to-ui-messages";
+import {
+  PERSISTED_MESSAGE_SCHEMA_VERSION,
+  type AGUIMessage
+} from "../agui-types";
 
 let warnSpy: ReturnType<typeof vi.spyOn>;
 
@@ -268,5 +272,150 @@ describe("agui-migration", () => {
     const result = autoTransformAGUIMessages(wire);
     expect(result).toEqual(wire);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("migrates a reasoning-only assistant into one ReasoningMessage with a stable id", () => {
+    const ui = {
+      id: "r-standalone",
+      role: "assistant",
+      parts: [{ type: "reasoning", text: "thinking" }]
+    };
+    // No `-reasoning-N` suffix, no fabricated empty assistant row.
+    expect(migrateUIMessageToAGUI(ui)).toEqual([
+      { id: "r-standalone", role: "reasoning", content: "thinking" }
+    ]);
+  });
+
+  it("migrates output-error tool parts into an errored ToolMessage", () => {
+    const ui = {
+      id: "a-err",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-boom",
+          toolCallId: "c-1",
+          state: "output-error",
+          input: {},
+          errorText: "exploded"
+        }
+      ]
+    };
+    const result = migrateUIMessageToAGUI(ui);
+    expect(result[1]).toEqual({
+      id: "a-err-tool-0",
+      role: "tool",
+      toolCallId: "c-1",
+      content: JSON.stringify({ error: "exploded" }),
+      error: "exploded"
+    });
+  });
+
+  it("carries approval state, metadata, and extra parts across migration", () => {
+    const ui = {
+      id: "a-ap",
+      role: "assistant",
+      metadata: { model: "m" },
+      parts: [
+        {
+          type: "tool-riskyTool",
+          toolCallId: "c-1",
+          state: "output-denied",
+          input: { level: 9 },
+          approval: { id: "ap-1", approved: false }
+        },
+        {
+          type: "file",
+          mediaType: "text/plain",
+          url: "data:text/plain;base64,aGk="
+        }
+      ]
+    };
+    const [assistant, ...rest] = migrateUIMessageToAGUI(ui);
+    // Denied calls carry no ToolMessage — the approval record is durable.
+    expect(rest).toEqual([]);
+    expect(assistant).toMatchObject({
+      role: "assistant",
+      metadata: { model: "m" },
+      toolApprovals: { "c-1": { approvalId: "ap-1", approved: false } },
+      extraParts: [{ type: "file" }]
+    });
+  });
+
+  describe("migrate→project→migrate is a fixed point", () => {
+    const roundTrip = (transcript: unknown[]) => {
+      const first = transcript.flatMap((m) => migrateUIMessageToAGUI(m));
+      const projected = toUIMessages(first as AGUIMessage[]);
+      const second = projected.flatMap((m) => migrateUIMessageToAGUI(m));
+      return { first, second };
+    };
+
+    it("holds for a [reasoning, assistant, tool] transcript", () => {
+      const { first, second } = roundTrip([
+        { id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [
+            { type: "reasoning", text: "thinking" },
+            {
+              type: "tool-search",
+              toolCallId: "c-1",
+              state: "output-available",
+              input: { q: "x" },
+              output: { hits: 3 }
+            },
+            { type: "text", text: "answer" }
+          ]
+        }
+      ]);
+      expect(second).toEqual(first);
+    });
+
+    it("holds across three passes with no id growth or fabricated rows", () => {
+      const transcript = [
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [{ type: "reasoning", text: "only thinking" }]
+        }
+      ];
+      let rows = transcript.flatMap((m) => migrateUIMessageToAGUI(m));
+      for (let pass = 0; pass < 3; pass++) {
+        const next = toUIMessages(rows as AGUIMessage[]).flatMap((m) =>
+          migrateUIMessageToAGUI(m)
+        );
+        expect(next).toEqual(rows);
+        rows = next;
+      }
+      expect(rows).toEqual([
+        { id: "a1", role: "reasoning", content: "only thinking" }
+      ]);
+    });
+
+    it("holds for approval and error tool states", () => {
+      const { first, second } = roundTrip([
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-riskyTool",
+              toolCallId: "c-deny",
+              state: "output-denied",
+              input: { level: 9 },
+              approval: { id: "ap-1", approved: false }
+            },
+            {
+              type: "tool-boom",
+              toolCallId: "c-err",
+              state: "output-error",
+              input: {},
+              errorText: "exploded"
+            }
+          ]
+        }
+      ]);
+      expect(second).toEqual(first);
+    });
   });
 });

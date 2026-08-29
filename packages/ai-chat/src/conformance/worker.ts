@@ -496,6 +496,16 @@ export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
     });
   }
 
+  protected findToolPart(toolCallId: string): ToolPart | undefined {
+    const lastAssistant = [...this.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    return lastAssistant?.parts.find(
+      (part): part is ToolPart =>
+        "toolCallId" in part && part.toolCallId === toolCallId
+    );
+  }
+
   // eslint-disable-next-line @typescript-eslint/require-await
   async onChatMessage(
     _onFinish: GenerateTextOnFinishCallback<ToolSet>,
@@ -504,39 +514,142 @@ export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
     const scenario =
       (options?.body as { scenario?: string } | undefined)?.scenario ??
       "plain-text";
-    if (scenario === "tool-single") {
-      return sse([
-        { type: "start" },
-        { type: "start-step" },
-        {
-          type: "tool-input-start",
-          toolCallId: "call-weather-1",
-          toolName: "getWeather"
-        },
-        {
-          type: "tool-input-delta",
-          toolCallId: "call-weather-1",
-          inputTextDelta: '{"city":"Sydney"}'
-        },
-        {
-          type: "tool-input-available",
-          toolCallId: "call-weather-1",
-          toolName: "getWeather",
-          input: { city: "Sydney" }
-        },
-        {
-          type: "tool-output-available",
-          toolCallId: "call-weather-1",
-          output: { temp: 21 }
-        },
-        { type: "finish-step" },
-        { type: "text-start", id: "t-1" },
-        { type: "text-delta", id: "t-1", delta: "It is 21C" },
-        { type: "text-end", id: "t-1" },
-        { type: "finish" }
-      ]);
+    switch (scenario) {
+      case "tool-single":
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-weather-1",
+            toolName: "getWeather"
+          },
+          {
+            type: "tool-input-delta",
+            toolCallId: "call-weather-1",
+            inputTextDelta: '{"city":"Sydney"}'
+          },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-weather-1",
+            toolName: "getWeather",
+            input: { city: "Sydney" }
+          },
+          {
+            type: "tool-output-available",
+            toolCallId: "call-weather-1",
+            output: { temp: 21 }
+          },
+          { type: "finish-step" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "It is 21C" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "reasoning":
+        return sse([
+          { type: "start" },
+          { type: "reasoning-start", id: "r-1" },
+          { type: "reasoning-delta", id: "r-1", delta: "thinking about it" },
+          { type: "reasoning-end", id: "r-1" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "reasoned answer" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "tool-error":
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-boom-1",
+            toolName: "boom",
+            input: { fuse: "short" }
+          },
+          {
+            type: "tool-output-error",
+            toolCallId: "call-boom-1",
+            errorText: "exploded"
+          },
+          { type: "finish-step" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "tool failed" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "approval": {
+        if (options?.continuation) {
+          const part = this.findToolPart("call-approval-1");
+          if (part?.state === "approval-responded") {
+            return sse([
+              { type: "start" },
+              { type: "start-step" },
+              {
+                type: "tool-output-available",
+                toolCallId: "call-approval-1",
+                output: { ran: true }
+              },
+              { type: "text-start", id: "t-appr" },
+              { type: "text-delta", id: "t-appr", delta: "approved and ran" },
+              { type: "text-end", id: "t-appr" },
+              { type: "finish" }
+            ]);
+          }
+          return sse(textRun("t-deny", ["denied — riskyTool not run"]));
+        }
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-approval-1",
+            toolName: "riskyTool",
+            input: { level: 9 }
+          },
+          {
+            type: "tool-approval-request",
+            toolCallId: "call-approval-1",
+            approvalId: "approval-1"
+          }
+        ]);
+      }
+
+      case "metadata":
+        return sse([
+          { type: "start" },
+          {
+            type: "message-metadata",
+            messageMetadata: { model: "fixture-model" }
+          },
+          {
+            type: "data-weather",
+            id: "data-1",
+            data: { city: "Sydney", temp: 21 }
+          },
+          {
+            type: "file",
+            url: "data:text/plain;base64,aGk=",
+            mediaType: "text/plain"
+          },
+          {
+            type: "source-url",
+            sourceId: "src-1",
+            url: "https://example.com/doc",
+            title: "Doc"
+          },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "with extras" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      default:
+        return sse(textRun("t-1", ["Hello ", "world"]));
     }
-    return sse(textRun("t-1", ["Hello ", "world"]));
   }
 }
 
