@@ -12,6 +12,7 @@ const entries = [
   "src/lifecycle/index.ts",
   "src/chat/index.ts",
   "src/chat/agui-types.ts",
+  "src/chat/agui-ws-transport.ts",
   "src/chat/transport.ts",
   "src/chat/react.tsx",
   "src/chat-sdk/index.ts",

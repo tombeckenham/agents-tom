@@ -217,6 +217,11 @@
       "import": "./dist/chat/agui-types.js",
       "require": "./dist/chat/agui-types.js"
     },
+    "./chat/agui-ws-transport": {
+      "types": "./dist/chat/agui-ws-transport.d.ts",
+      "import": "./dist/chat/agui-ws-transport.js",
+      "require": "./dist/chat/agui-ws-transport.js"
+    },
     "./chat/transport": {
       "types": "./dist/chat/transport.d.ts",
       "import": "./dist/chat/transport.js",
