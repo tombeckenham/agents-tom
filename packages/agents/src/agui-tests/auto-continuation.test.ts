@@ -335,13 +335,14 @@ describe("auto-continuation barrier (AG-UI)", () => {
     await stub.waitUntilStableForTest(10_000);
 
     // No leaked pending/deferred continuation and no armed timer — the barrier
-    // is re-armable rather than wedged by the failed turn. (`activeRequestId`
-    // is left set by the errored-stream path, which does not run
-    // `_completeStream`; that is orthogonal to the barrier.)
+    // is re-armable rather than wedged by the failed turn. `activeRequestId`
+    // must be released too: an errored continuation gives up ownership exactly
+    // like a completed one, so nothing later reads a dead turn as the owner.
     expect(await stub.getContinuationStateForTest()).toMatchObject({
       hasPending: false,
       hasDeferred: false,
-      armed: false
+      armed: false,
+      activeRequestId: null
     });
     ws.close(1000);
   });

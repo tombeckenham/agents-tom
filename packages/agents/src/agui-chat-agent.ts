@@ -402,6 +402,8 @@ export class AGUIChatAgent<
   // to apply tool results / approvals to a turn that has not yet persisted.
   private _streamingMessages: AGUIMessage[] | null = null;
   private _streamingAssistantId: string | null = null;
+  /** The in-flight turn's accumulator, so tool results can join it live. */
+  private _streamingAccumulator: AGUIStreamAccumulator | null = null;
 
   private _pendingChatResponseResults: AGUIChatResponseResult[] = [];
   private _insideResponseHook = false;
@@ -1181,6 +1183,36 @@ export class AGUIChatAgent<
       ...(errorText !== undefined && { error: errorText })
     };
 
+    // The assistant that issued this call may still be streaming, and so is
+    // not persisted yet. Hand the result to the live turn instead of writing a
+    // standalone row that would land BEFORE its assistant and collide with it
+    // in reconciliation. Mirrors the legacy `_findAndUpdateToolPart`, which
+    // updates `_streamingMessage` in place and lets stream completion persist.
+    const streaming = this._streamingAccumulator;
+    if (
+      assistantIdx < 0 &&
+      streaming &&
+      this._streamingOwnsToolCall(streaming, toolCallId)
+    ) {
+      streaming.applyEvent({
+        type: "TOOL_CALL_RESULT",
+        messageId: toolMessage.id,
+        toolCallId,
+        content: toolMessage.content
+      });
+      if (toolMessage.error !== undefined) {
+        // The reducer builds a bare ToolMessage; carry the error text across.
+        const added = streaming.messages.at(-1);
+        if (added?.role === "tool") added.error = toolMessage.error;
+      }
+      this._streamingMessages = [...streaming.messages];
+      this._broadcastChatMessage({
+        type: CHAT_MESSAGE_TYPES.MESSAGE_UPDATED,
+        message: toolMessage
+      });
+      return true;
+    }
+
     const next = [...this.messages];
     if (assistantIdx >= 0) {
       next.splice(assistantIdx + 1, 0, toolMessage);
@@ -1235,11 +1267,26 @@ export class AGUIChatAgent<
     return true;
   }
 
+  /** Whether the in-flight turn's assistant issued this tool call. */
+  private _streamingOwnsToolCall(
+    streaming: AGUIStreamAccumulator,
+    toolCallId: string
+  ): boolean {
+    return streaming.messages.some(
+      (m) =>
+        m.role === "assistant" &&
+        (m.toolCalls?.some((tc) => tc.id === toolCallId) ?? false)
+    );
+  }
+
   private _findToolMessageByCallId(
     toolCallId: string
   ): ToolMessage | undefined {
-    for (let i = this.messages.length - 1; i >= 0; i--) {
-      const m = this.messages[i];
+    // Includes the in-flight turn's messages so a duplicate frame arriving
+    // mid-stream is still a first-write-wins no-op.
+    const messages = this._messagesForClientSync();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
       if (m.role === "tool" && m.toolCallId === toolCallId) return m;
     }
     return undefined;
@@ -1991,6 +2038,7 @@ export class AGUIChatAgent<
         const accumulator = new AGUIStreamAccumulator({
           existingMessages: seed
         });
+        this._streamingAccumulator = accumulator;
         this._streamingMessages = [...seed];
         this._streamingAssistantId =
           seed.find((m): m is AssistantMessage => m.role === "assistant")?.id ??
@@ -2096,6 +2144,7 @@ export class AGUIChatAgent<
           }
         } finally {
           reader.releaseLock();
+          this._streamingAccumulator = null;
           this._streamingMessages = null;
           this._streamingAssistantId = null;
           earlyPersistedAssistantId = this._approvalPersistedAssistantId;
@@ -2566,8 +2615,16 @@ export class AGUIChatAgent<
     this._resumableStream.flushBuffer();
   }
   protected _markStreamError(streamId: string) {
+    const erroredRequestId = this._resumableStream.activeRequestId;
     this._resumableStream.markError(streamId);
     this._pendingResumeConnections.clear();
+    // An errored continuation releases ownership exactly like a completed one
+    // — otherwise a later resume probe is told `continuation-owned` for a turn
+    // that is already dead (mirrors `AIChatAgent._markStreamError`).
+    if (erroredRequestId === this._continuation.activeRequestId) {
+      this._continuation.activeRequestId = null;
+      this._continuation.activeConnectionId = null;
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────
