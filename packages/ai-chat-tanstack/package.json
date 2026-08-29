@@ -20,9 +20,6 @@
   "bugs": {
     "url": "https://github.com/cloudflare/agents/issues"
   },
-  "dependencies": {
-    "nanoid": "^5.1.16"
-  },
   "devDependencies": {
     "@tanstack/ai": "0.48.0",
     "@tanstack/ai-client": "0.26.0",
