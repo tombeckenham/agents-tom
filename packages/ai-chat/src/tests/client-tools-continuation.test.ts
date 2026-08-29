@@ -627,10 +627,24 @@ describe("Client tools continuation", () => {
       expect(reasoningStartIndex).toBeGreaterThanOrEqual(0);
       expect(reasoningDeltaIndex).toBeGreaterThan(reasoningStartIndex);
 
-      const persistedMessagesBroadcast = (await waitForMessage(
-        receivedMessages,
-        (message) => message.type === MessageType.CF_AGENT_CHAT_MESSAGES
-      )) as { messages: ChatMessage[] } | undefined;
+      // Post-cutover interaction applies broadcast interim CHAT_MESSAGES
+      // snapshots too — wait for one that carries the CONTINUATION's second
+      // reasoning part (the final persist).
+      await waitForMessage(receivedMessages, (message) => {
+        if (message.type !== MessageType.CF_AGENT_CHAT_MESSAGES) return false;
+        const assistant = (
+          message as unknown as { messages: ChatMessage[] }
+        ).messages.find((m) => m.id === "assistant-issue-1480");
+        return (
+          (assistant?.parts.filter((p) => p.type === "reasoning").length ??
+            0) >= 2
+        );
+      });
+      const persistedMessagesBroadcast = [...receivedMessages]
+        .reverse()
+        .find(
+          (message) => message.type === MessageType.CF_AGENT_CHAT_MESSAGES
+        ) as unknown as { messages: ChatMessage[] } | undefined;
       expect(persistedMessagesBroadcast).toBeDefined();
 
       const persistedAssistant = persistedMessagesBroadcast!.messages.find(
@@ -1478,7 +1492,12 @@ describe("Client tools continuation", () => {
 
       for (const chunk of startChunks) {
         const parsed = JSON.parse(chunk.body as string);
-        expect(parsed.messageId).toBeUndefined();
+        // Post-cutover the continuation is ANCHORED on the seed assistant id
+        // (instead of stripping the provider id) — same #1229 outcome, the
+        // provider's fresh id never reaches the wire.
+        if (parsed.messageId !== undefined) {
+          expect(parsed.messageId).not.toContain("fresh-msg");
+        }
       }
     } finally {
       wsA.close(1000);

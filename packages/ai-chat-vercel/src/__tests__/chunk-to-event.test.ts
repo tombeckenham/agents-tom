@@ -114,19 +114,22 @@ describe("ChunkToEventProjector — reasoning", () => {
       { type: "reasoning-delta", id: "r1", delta: "thinking" },
       { type: "reasoning-end", id: "r1" }
     ]);
-    expect(events).toContainEqual({
-      type: "REASONING_MESSAGE_START",
-      messageId: "r1",
-      role: "reasoning"
-    });
+    // Reasoning part ids are remapped to a fresh per-run message id (part
+    // ids are reused across turns by producers); the id is opaque but
+    // consistent across the lifecycle.
+    const start = events.find((e) => e.type === "REASONING_MESSAGE_START") as {
+      messageId: string;
+    };
+    expect(start).toMatchObject({ role: "reasoning" });
+    expect(typeof start.messageId).toBe("string");
     expect(events).toContainEqual({
       type: "REASONING_MESSAGE_CONTENT",
-      messageId: "r1",
+      messageId: start.messageId,
       delta: "thinking"
     });
     expect(events).toContainEqual({
       type: "REASONING_MESSAGE_END",
-      messageId: "r1"
+      messageId: start.messageId
     });
   });
 });

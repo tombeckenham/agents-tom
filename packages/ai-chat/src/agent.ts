@@ -177,7 +177,12 @@ export class AIChatAgent<
     return toAGUIResponse(
       response,
       context?.seedAssistantId !== undefined
-        ? { messageId: context.seedAssistantId }
+        ? {
+            messageId: context.seedAssistantId,
+            // #1229: the continuation must extend the seed assistant even if
+            // the provider mints a fresh start.messageId.
+            messageIdAuthoritative: true
+          }
         : undefined
     );
   }

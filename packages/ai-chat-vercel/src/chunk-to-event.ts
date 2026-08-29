@@ -31,6 +31,12 @@ export type ChunkToEventProjectorOptions = {
    * so the streamed text extends that message instead of opening a new one.
    */
   messageId?: string;
+  /**
+   * When true, `messageId` outranks a producer-supplied `start.messageId`
+   * (#1229): a continuation must extend the seed assistant even when the
+   * provider mints a fresh message id, or the turn forks a duplicate.
+   */
+  messageIdAuthoritative?: boolean;
 };
 
 export class ChunkToEventProjector {
@@ -49,6 +55,10 @@ export class ChunkToEventProjector {
   // when synthesizing `TEXT_MESSAGE_END` etc.
   private currentTextId: string | null = null;
   private currentReasoningId: string | null = null;
+  // Vercel reasoning part id -> the AG-UI message id it maps to. Reasoning
+  // ids are PART ids that producers reuse across turns; mapping them to a
+  // fresh per-run id keeps two turns from colliding on one persisted row.
+  private reasoningMessageIds = new Map<string, string>();
   // Vercel `tool-input-start` arrives without args; AG-UI emits a separate
   // `TOOL_CALL_START`. We track the toolName per id so tool-output frames
   // can include it on `TOOL_CALL_RESULT`.
@@ -61,10 +71,14 @@ export class ChunkToEventProjector {
   // any get their arguments synthesized from `tool-input-available.input`.
   private argsEmitted = new Set<string>();
 
+  private readonly runMessageIdLocked: boolean;
+
   constructor(options?: ChunkToEventProjectorOptions) {
     this.threadId = options?.threadId ?? nanoid();
     this.runId = options?.runId ?? nanoid();
     this.runMessageId = options?.messageId ?? null;
+    this.runMessageIdLocked =
+      options?.messageIdAuthoritative === true && options?.messageId != null;
   }
 
   /** Project a single Vercel `UIMessageChunk` into zero or more `AGUIEvent`s. */
@@ -74,7 +88,10 @@ export class ChunkToEventProjector {
         // `RUN_STARTED` has no message id, so remember the one the Vercel
         // `start` carries and hand it to tool calls as `parentMessageId` —
         // the only id source a tool-first turn has. See `toolCallStart`.
-        if (chunk.messageId != null) this.runMessageId = chunk.messageId;
+        // An authoritative anchor (continuation seed, #1229) outranks it.
+        if (chunk.messageId != null && !this.runMessageIdLocked) {
+          this.runMessageId = chunk.messageId;
+        }
         const events = this.emitRunStarted();
         // A `start` can carry messageMetadata (the AI SDK writes it onto the
         // message); forward it so the reducer attaches it to the assistant.
@@ -129,7 +146,7 @@ export class ChunkToEventProjector {
       case "reasoning-start": {
         const events = this.emitRunStarted();
         // Some producers omit the part id; AG-UI requires one — synthesize.
-        const reasoningId = chunk.id ?? nanoid();
+        const reasoningId = this.reasoningMessageId(chunk.id);
         this.currentReasoningId = reasoningId;
         events.push({
           type: "REASONING_MESSAGE_START",
@@ -140,7 +157,10 @@ export class ChunkToEventProjector {
       }
 
       case "reasoning-delta": {
-        const reasoningId = chunk.id ?? this.currentReasoningId;
+        const reasoningId =
+          chunk.id != null
+            ? this.reasoningMessageId(chunk.id)
+            : this.currentReasoningId;
         if (reasoningId == null) return [];
         return [
           {
@@ -152,7 +172,10 @@ export class ChunkToEventProjector {
       }
 
       case "reasoning-end": {
-        const reasoningId = chunk.id ?? this.currentReasoningId;
+        const reasoningId =
+          chunk.id != null
+            ? this.reasoningMessageId(chunk.id)
+            : this.currentReasoningId;
         this.currentReasoningId = null;
         if (reasoningId == null) return [];
         return [{ type: "REASONING_MESSAGE_END", messageId: reasoningId }];
@@ -378,6 +401,16 @@ export class ChunkToEventProjector {
         : partId;
     this.textPartMessageIds.set(partId, messageId);
     return messageId;
+  }
+
+  private reasoningMessageId(partId: string | undefined): string {
+    if (partId == null) return nanoid();
+    let mapped = this.reasoningMessageIds.get(partId);
+    if (!mapped) {
+      mapped = nanoid();
+      this.reasoningMessageIds.set(partId, mapped);
+    }
+    return mapped;
   }
 
   private toolCallStart(toolCallId: string, toolCallName: string): AGUIEvent {

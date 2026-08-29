@@ -2357,7 +2357,13 @@ export class AGUIChatAgent<
           if (chatMessageId) {
             this._abortRegistry.remove(chatMessageId);
             if (streamCompleted && !stallRouted) {
-              this._emit("message:response");
+              // An in-band RUN_ERROR is a terminal error, not a response.
+              const inBandError = accumulator.lastError;
+              if (inBandError) {
+                this._emit("message:error", { error: inBandError.message });
+              } else {
+                this._emit("message:response");
+              }
             }
           }
         }

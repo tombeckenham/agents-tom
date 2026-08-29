@@ -107,10 +107,13 @@ export function wrapLegacyWireWS(ws: WebSocket): WebSocket {
 }
 
 /**
- * Connects to the chat agent and returns the WebSocket. Inbound frames are
- * projected to the legacy wire — see {@link wrapLegacyWireWS}.
+ * Connects to the chat agent and returns the raw WebSocket (AG-UI wire).
+ * Use this when handing the socket to `WebSocketChatTransport`, which runs
+ * its own event→chunk projection.
  */
-export async function connectChatWS(path: string): Promise<{ ws: WebSocket }> {
+export async function connectChatWSRaw(
+  path: string
+): Promise<{ ws: WebSocket }> {
   const res = await exports.default.fetch(`http://example.com${path}`, {
     headers: { Upgrade: "websocket" }
   });
@@ -118,6 +121,15 @@ export async function connectChatWS(path: string): Promise<{ ws: WebSocket }> {
   const ws = res.webSocket as WebSocket;
   expect(ws).toBeDefined();
   ws.accept();
+  return { ws };
+}
+
+/**
+ * Connects to the chat agent and returns the WebSocket. Inbound frames are
+ * projected to the legacy wire — see {@link wrapLegacyWireWS}.
+ */
+export async function connectChatWS(path: string): Promise<{ ws: WebSocket }> {
+  const { ws } = await connectChatWSRaw(path);
   return { ws: wrapLegacyWireWS(ws) };
 }
 

@@ -266,8 +266,10 @@ describe("AIChatAgent as an agent-tool child", () => {
     });
 
     const events = await parent.getEventsForTest();
+    // Post-cutover the child stream carries one extra frame (RUN_STARTED).
     expect(events.map((event) => event.event.kind)).toEqual([
       "started",
+      "chunk",
       "chunk",
       "chunk",
       "chunk",
