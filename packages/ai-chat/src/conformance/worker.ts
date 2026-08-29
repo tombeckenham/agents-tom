@@ -18,7 +18,7 @@ import type {
   GenerateTextOnFinishCallback,
   ToolSet
 } from "ai";
-import { routeAgentRequest } from "agents";
+import { Agent, routeAgentRequest, type RunAgentToolResult } from "agents";
 
 type ToolPart = Extract<
   ChatMessage["parts"][number],
@@ -653,6 +653,65 @@ export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
   }
 }
 
+/**
+ * Agent-tool CHILD fixture on the PROJECTED class (Phase 3b review): the
+ * engine's child lifecycle must persist through the AG-UI-native
+ * `_saveAGUIMessages`, never the projected `saveMessages` — the projection's
+ * function form round-trips the whole history AG-UI→UIMessage→AG-UI, and
+ * `toUIMessages` deliberately drops fields it cannot represent
+ * (`encryptedValue`, activity payloads), which would then overwrite the
+ * stored rows in place.
+ */
+export class ProjectedChildAgent extends ProjectedAIChatAgent<Env> {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(): Promise<Response | undefined> {
+    return sse(textRun("t-child", ["child says hi"]));
+  }
+
+  /** Persist an AG-UI reasoning row carrying an encrypted blob (engine shape). */
+  async seedEncryptedRowForTest(): Promise<void> {
+    const aguiRow = {
+      id: "seed-reasoning",
+      role: "reasoning",
+      content: "seeded chain of thought",
+      encryptedValue: "SECRET-ENCRYPTED-BLOB"
+    };
+    // The projected persistMessages passes AG-UI rows through untouched.
+    await this.persistMessages([aguiRow as unknown as ChatMessage]);
+  }
+
+  /** Raw persisted rows (AG-UI shape) — bypasses the UIMessage projection. */
+  rawRowsForTest(): Array<Record<string, unknown>> {
+    return (
+      this.sql<{ message: string }>`
+        select message from cf_ai_chat_agent_messages
+        order by created_at, rowid
+      ` || []
+    ).map((row) => JSON.parse(row.message) as Record<string, unknown>);
+  }
+}
+
+/** Parent driving {@link ProjectedChildAgent} as an agent tool. */
+export class ProjectedToolParent extends Agent<Env> {
+  async seedChildEncryptedRowForTest(runId: string): Promise<void> {
+    const child = await this.subAgent(ProjectedChildAgent, runId);
+    await child.seedEncryptedRowForTest();
+  }
+
+  async runChild(input: unknown, runId: string): Promise<RunAgentToolResult> {
+    return this.runAgentTool(ProjectedChildAgent, {
+      runId,
+      parentToolCallId: "projected-tool-call",
+      input
+    });
+  }
+
+  async childRawRows(runId: string): Promise<Array<Record<string, unknown>>> {
+    const child = await this.subAgent(ProjectedChildAgent, runId);
+    return child.rawRowsForTest();
+  }
+}
+
 export type Env = {
   ScriptedAgent: DurableObjectNamespace<ScriptedAgent>;
   GatedAgent: DurableObjectNamespace<GatedAgent>;
@@ -662,6 +721,8 @@ export type Env = {
   DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
   ProjectedAgent: DurableObjectNamespace<ProjectedAgent>;
+  ProjectedChildAgent: DurableObjectNamespace<ProjectedChildAgent>;
+  ProjectedToolParent: DurableObjectNamespace<ProjectedToolParent>;
 };
 
 export default {

@@ -137,6 +137,10 @@ type ParentStub = DurableObjectStub & {
     abortedAfter: boolean;
     childStatus: string | null;
   }>;
+  childMigratesOldShapeRunTableForTest(
+    runId: string
+  ): Promise<AgentToolRunInspection | null>;
+  childParkedRecoveryKeepsRunOpenForTest(): Promise<string | undefined>;
 };
 
 function getParent(name = crypto.randomUUID()) {
@@ -667,5 +671,34 @@ describe("AGUIChatAgent as an agent-tool child", () => {
     expect(result.abortedBefore).toBe(false);
     expect(result.abortedAfter).toBe(true);
     expect(result.childStatus).toBe("aborted");
+  });
+
+  it("migrates a pre-existing old-shape run table on boot (column ladder)", async () => {
+    // A DO whose `cf_ai_chat_agent_tool_runs` predates the JSON/progress
+    // columns must still inspect cleanly: `create table if not exists` no-ops
+    // on the old table, so the ALTER migration ladder is load-bearing —
+    // without it `_getAgentToolRunRow` throws `no such column` on exactly the
+    // "projected agents keep existing rows" upgrade case.
+    const runId = crypto.randomUUID();
+    const inspection = await (
+      await getParent()
+    ).childMigratesOldShapeRunTableForTest(runId);
+
+    expect(inspection).toMatchObject({
+      runId,
+      status: "completed",
+      startedAt: 1,
+      completedAt: 2
+    });
+  });
+
+  it("keeps a stranded run OPEN while recovery is parked on a client interaction (HITL)", async () => {
+    // A parked recovery (incident skipped/awaiting_client_interaction) is
+    // still resolving — the replayed tool-result / approval drives the
+    // continuation — so the reconcile must not terminalize the run.
+    const status = await (
+      await getParent()
+    ).childParkedRecoveryKeepsRunOpenForTest();
+    expect(status).toBe("running");
   });
 });

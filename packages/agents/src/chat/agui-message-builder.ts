@@ -31,6 +31,10 @@ import {
   CF_TOOL_APPROVAL_EXPIRED,
   CF_TOOL_APPROVAL_REQUEST
 } from "./agui-types";
+import {
+  AGENT_TOOL_MILESTONE_PART,
+  AGENT_TOOL_PROGRESS_PART
+} from "../agent-tool-types";
 
 // ============================================================================
 // State shape
@@ -172,6 +176,18 @@ export function applyEventToSnapshot(
       return handleCustom(state, event);
 
     default: {
+      // Reserved sub-agent progress frames (`reportProgress`) ride a tailing
+      // parent's forwarded stream alongside real AG-UI events. They carry no
+      // message content — recognized no-ops here so live progress doesn't log
+      // a warning per frame. Projecting them into parent-side run UI state is
+      // follow-up work (the child's persisted snapshot stays authoritative).
+      const type = (event as { type?: string }).type;
+      if (
+        type === AGENT_TOOL_PROGRESS_PART ||
+        type === AGENT_TOOL_MILESTONE_PART
+      ) {
+        return true;
+      }
       warn("unrecognized event type", event);
       return false;
     }

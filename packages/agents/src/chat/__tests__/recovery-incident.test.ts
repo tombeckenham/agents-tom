@@ -433,6 +433,37 @@ describe("classifyAgentToolChildRecovery", () => {
     expect(await classify(storage)).toBe("in-progress");
   });
 
+  it("treats a recovery PARKED on a client interaction as in-progress (HITL)", async () => {
+    // `_parkRecoveryForPendingInteraction` marks the incident
+    // skipped/awaiting_client_interaction — the client's replayed tool-result
+    // or approval will drive the continuation, so the child run must not be
+    // terminalized out from under it.
+    const storage = new FakeStorage();
+    storage.data.set(`${CHAT_RECOVERY_INCIDENT_KEY_PREFIX}parked`, {
+      ...staleIncident("parked", T0),
+      status: "skipped",
+      reason: "awaiting_client_interaction"
+    });
+    expect(await classify(storage)).toBe("in-progress");
+  });
+
+  it("keeps every other 'skipped' reason mapped to 'none'", async () => {
+    for (const reason of [
+      undefined,
+      "conversation_changed",
+      "no_unanswered_user_message",
+      "continue_disabled"
+    ]) {
+      const storage = new FakeStorage();
+      storage.data.set(`${CHAT_RECOVERY_INCIDENT_KEY_PREFIX}skipped`, {
+        ...staleIncident("skipped", T0),
+        status: "skipped",
+        ...(reason ? { reason } : {})
+      });
+      expect(await classify(storage)).toBe("none");
+    }
+  });
+
   it("lists by the incident prefix only", async () => {
     const storage = new FakeStorage();
     seed(storage, ["attempting"]);

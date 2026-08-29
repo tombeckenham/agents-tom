@@ -501,7 +501,8 @@ export class AGUIChatAgent<
   >();
   private _agentToolClosers = new Map<string, Set<() => void>>();
   private _agentToolLastErrors = new Map<string, string>();
-  private _agentToolPreTurnAssistantIds = new Map<string, Set<string>>();
+  /** Per-run ids of pre-turn assistant/tool/reasoning rows (turn-scoped roles). */
+  private _agentToolPreTurnMessageIds = new Map<string, Set<string>>();
   private _agentToolLiveSequences = new Map<string, number>();
   private _agentToolAbortControllers = new Map<string, AbortController>();
   /** request-id → run-id attribution cache (null = negatively cached). */
@@ -644,6 +645,9 @@ export class AGUIChatAgent<
     `;
     const runId = rows?.[0]?.run_id;
     if (!runId) return;
+    // Known gap (matches legacy): recovery-path map entries here (and the
+    // tail's `_agentToolLiveSequences` realign) never see `startAgentToolRun`'s
+    // finalizer cleanup — bounded (one run per child facet), so left as is.
     this._agentToolRunsByRequestId.set(requestId, runId);
     this.sql`
       update cf_ai_chat_agent_tool_runs
@@ -3870,6 +3874,26 @@ export class AGUIChatAgent<
         ) => AGUIMessage[] | Promise<AGUIMessage[]>),
     options?: SaveMessagesOptions
   ): Promise<SaveMessagesResult> {
+    return this._saveAGUIMessages(messages, options);
+  }
+
+  /**
+   * AG-UI-native `saveMessages`. Engine-internal callers (the agent-tool
+   * child lifecycle) MUST use this instead of the public `saveMessages`: a
+   * projection layer (the AI SDK shim) overrides the public method and
+   * round-trips the whole history AG-UI→UIMessage→AG-UI, which drops fields
+   * the projection cannot represent (`encryptedValue`, activity payloads)
+   * from rows the caller merely appends to. Projections must NOT override
+   * this method.
+   */
+  protected async _saveAGUIMessages(
+    messages:
+      | AGUIMessage[]
+      | ((
+          currentMessages: readonly AGUIMessage[]
+        ) => AGUIMessage[] | Promise<AGUIMessage[]>),
+    options?: SaveMessagesOptions
+  ): Promise<SaveMessagesResult> {
     const requestId = nanoid();
     const clientTools = this._lastClientTools;
     const body = this._lastBody;
@@ -4122,10 +4146,41 @@ export class AGUIChatAgent<
       summary text,
       error_message text,
       started_at integer not null,
-      completed_at integer,
-      progress_json text,
-      last_signal_at integer
+      completed_at integer
     )`;
+    // Column migration ladder, verbatim from the legacy `AIChatAgent`: on a DO
+    // whose table predates a column (progress_json / last_signal_at arrived in
+    // #1758) the CREATE above no-ops, and `_getAgentToolRunRow` selects every
+    // column — without these ALTERs each inspect/reconcile on a pre-existing
+    // row throws `no such column`.
+    const addColumnIfNotExists = (sql: string) => {
+      try {
+        this.ctx.storage.sql.exec(sql);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.toLowerCase().includes("duplicate column")) {
+          throw error;
+        }
+      }
+    };
+    addColumnIfNotExists(
+      "alter table cf_ai_chat_agent_tool_runs add column input_json text"
+    );
+    addColumnIfNotExists(
+      "alter table cf_ai_chat_agent_tool_runs add column output_json text"
+    );
+    addColumnIfNotExists(
+      "alter table cf_ai_chat_agent_tool_runs add column summary text"
+    );
+    // Latest progress snapshot (rfc-detached-agent-tools §progress); only the
+    // most recent `reportProgress` is retained. `last_signal_at` drives the
+    // parent's resetting no-progress budget across eviction.
+    addColumnIfNotExists(
+      "alter table cf_ai_chat_agent_tool_runs add column progress_json text"
+    );
+    addColumnIfNotExists(
+      "alter table cf_ai_chat_agent_tool_runs add column last_signal_at integer"
+    );
     this.sql`create index if not exists idx_ai_chat_agent_tool_request_id
       on cf_ai_chat_agent_tool_runs(request_id)`;
     // Durable milestones (rfc-detached-agent-tools §progress). One row per
@@ -4428,6 +4483,11 @@ export class AGUIChatAgent<
         const requestId = nanoid();
         void this.keepAliveWhile(() =>
           this._runExclusiveChatTurn(requestId, () => runReply(requestId))
+        ).catch((error) =>
+          console.error(
+            "[AGUIChatAgent] detached-notification reaction turn failed",
+            error
+          )
         );
       } else {
         const requestId = nanoid();
@@ -4568,9 +4628,21 @@ export class AGUIChatAgent<
 
     const startedAt = Date.now();
     const controller = new AbortController();
-    const assistantIdsBeforeStart = new Set(
+    // AG-UI persists tool results and reasoning as STANDALONE rows (they were
+    // parts of the assistant message in the legacy shape), so all three roles
+    // must be captured or pre-turn tool/reasoning rows would survive the
+    // messages-after-start filter and leak into output/summary derivation.
+    // ponytail: this set is in-memory only — a post-eviction reconcile runs
+    // with an empty set and can derive `completed` output off a stale pre-run
+    // assistant; persisting the ids with the run row is follow-up work.
+    const turnScopedIdsBeforeStart = new Set(
       this._aguiMessages
-        .filter((message) => message.role === "assistant")
+        .filter(
+          (message) =>
+            message.role === "assistant" ||
+            message.role === "tool" ||
+            message.role === "reasoning"
+        )
         .map((message) => message.id)
     );
 
@@ -4580,9 +4652,9 @@ export class AGUIChatAgent<
       values (${options.runId}, null, 'running', ${AGUIChatAgent._stringifyAgentToolValue(input)}, ${startedAt})
     `;
     this._agentToolAbortControllers.set(options.runId, controller);
-    this._agentToolPreTurnAssistantIds.set(
+    this._agentToolPreTurnMessageIds.set(
       options.runId,
-      assistantIdsBeforeStart
+      turnScopedIdsBeforeStart
     );
     this._agentToolLiveSequences.set(options.runId, 0);
 
@@ -4601,7 +4673,10 @@ export class AGUIChatAgent<
         const previousClientTools = this._lastClientTools;
         const previousBody = this._lastBody;
         this._setRequestContext(undefined, { agentToolInput: input });
-        const result = await this.saveMessages(
+        // AG-UI-native save: the public `saveMessages` may be a projection
+        // override that lossily round-trips the history (see
+        // `_saveAGUIMessages`).
+        const result = await this._saveAGUIMessages(
           async (messages) => {
             this._registerAgentToolTurn(options.runId);
             return [
@@ -4708,7 +4783,7 @@ export class AGUIChatAgent<
           }
         }
         this._agentToolLastErrors.delete(options.runId);
-        this._agentToolPreTurnAssistantIds.delete(options.runId);
+        this._agentToolPreTurnMessageIds.delete(options.runId);
         this._closeAgentToolTailers(options.runId);
       }
     };
@@ -4824,19 +4899,30 @@ export class AGUIChatAgent<
    * `running` while its recovery is still in progress (#1630 follow-up).
    */
   private async _reconcileOwnStaleAgentToolChildRuns(): Promise<void> {
-    const rows = this.sql<{ run_id: string }>`
-      select run_id from cf_ai_chat_agent_tool_runs
-      where status = 'running'
-    `;
-    for (const { run_id } of rows) {
-      if (this._agentToolAbortControllers.has(run_id)) continue;
-      const row = this._getAgentToolRunRow(run_id);
-      if (!row || row.status !== "running") continue;
-      try {
-        await this._reconcileStaleAgentToolChildRun(run_id, row);
-      } catch {
-        // Best-effort: a parent inspect still reconciles lazily.
+    // Fully best-effort: this is awaited from the `finally` of both recovery
+    // handlers, so a throw here (SQL error, storage read) would replace the
+    // in-flight recovery outcome — e.g. turn a handled-OOM return into a
+    // rethrow. A parent inspect still reconciles lazily.
+    try {
+      const rows = this.sql<{ run_id: string }>`
+        select run_id from cf_ai_chat_agent_tool_runs
+        where status = 'running'
+      `;
+      for (const { run_id } of rows) {
+        if (this._agentToolAbortControllers.has(run_id)) continue;
+        const row = this._getAgentToolRunRow(run_id);
+        if (!row || row.status !== "running") continue;
+        try {
+          await this._reconcileStaleAgentToolChildRun(run_id, row);
+        } catch {
+          // Per-row best-effort: one bad row must not block its siblings.
+        }
       }
+    } catch (error) {
+      console.error(
+        "[AGUIChatAgent] best-effort stale child-run reconcile failed",
+        error
+      );
     }
   }
 
@@ -5038,6 +5124,9 @@ export class AGUIChatAgent<
           // resume re-attaches WITHOUT re-running `startAgentToolRun` (which
           // seeds the counter). Without this realign the recovered turn's new
           // chunks would restart at 0 and be dropped by the high-water dedupe.
+          // Known gap (matches legacy): a chunk broadcast on a COLD counter
+          // during this attach's drain window (before the realign) can be
+          // sequenced below the stored high-water and dropped — follow-up.
           if (lastEmitted > (options?.afterSequence ?? -1)) {
             this._agentToolLiveSequences.set(runId, lastEmitted + 1);
           }
@@ -5105,11 +5194,18 @@ export class AGUIChatAgent<
   }
 
   private _getAgentToolMessagesAfterStart(runId: string): AGUIMessage[] {
-    const previousAssistantIds =
-      this._agentToolPreTurnAssistantIds.get(runId) ?? new Set<string>();
+    const previousTurnScopedIds =
+      this._agentToolPreTurnMessageIds.get(runId) ?? new Set<string>();
+    // Exclude pre-turn assistant AND standalone tool/reasoning rows (AG-UI
+    // stores those separately; the legacy shape carried them as parts, so the
+    // assistant-id filter alone under-filters here). User/system history is
+    // kept, mirroring legacy.
     return this._aguiMessages.filter(
       (message) =>
-        message.role !== "assistant" || !previousAssistantIds.has(message.id)
+        (message.role !== "assistant" &&
+          message.role !== "tool" &&
+          message.role !== "reasoning") ||
+        !previousTurnScopedIds.has(message.id)
     );
   }
 

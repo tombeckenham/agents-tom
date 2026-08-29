@@ -1424,8 +1424,10 @@ export class AguiAgentToolChild extends AGUIChatAgent<Env> {
     request: { runId: string; input: unknown },
     messagesAfterStart: readonly AGUIMessage[]
   ): unknown {
-    const input = request.input as AgentToolInput;
-    if (input.structured) {
+    // `input` can be undefined for a row migrated from an old-shape table
+    // whose input_json column did not exist.
+    const input = request.input as AgentToolInput | undefined;
+    if (input?.structured) {
       return {
         handledPrompt: input.prompt,
         messageCount: messagesAfterStart.length
@@ -1439,8 +1441,8 @@ export class AguiAgentToolChild extends AGUIChatAgent<Env> {
     output: unknown,
     messagesAfterStart: readonly AGUIMessage[]
   ): string {
-    const input = request.input as AgentToolInput;
-    if (input.structured) {
+    const input = request.input as AgentToolInput | undefined;
+    if (input?.structured) {
       return `structured:${input.prompt}`;
     }
     return super.getAgentToolSummary(request, output, messagesAfterStart);
@@ -1930,6 +1932,62 @@ export class AguiAgentToolChild extends AGUIChatAgent<Env> {
       childStatus: this._readChildRunStatusForTest(runId)
     };
   }
+
+  /**
+   * A recovery PARKED on a pending client interaction (incident
+   * skipped/awaiting_client_interaction) must keep a stranded `running` row
+   * OPEN: the client's replayed tool-result / approval will still drive the
+   * continuation, so terminalizing here would discard the child's real
+   * answer. Returns the inspected status — `running` with the fix, `error`
+   * without it (no recovered assistant turn exists yet).
+   */
+  async parkedRecoveryKeepsRunOpenForTest(): Promise<string | undefined> {
+    const runId = crypto.randomUUID();
+    this.sql`
+      insert into cf_ai_chat_agent_tool_runs (run_id, status, input_json, started_at)
+      values (${runId}, 'running', '{}', ${Date.now()})
+    `;
+    await this.ctx.storage.put(`cf:chat-recovery:incident:parked-${runId}`, {
+      incidentId: `parked-${runId}`,
+      requestId: "req-parked",
+      recoveryKind: "continue",
+      attempt: 1,
+      maxAttempts: 3,
+      status: "skipped",
+      reason: "awaiting_client_interaction",
+      firstSeenAt: Date.now(),
+      lastAttemptAt: Date.now()
+    });
+    const inspection = await this.inspectAgentToolRun(runId);
+    return inspection?.status;
+  }
+
+  /**
+   * Simulate a DO whose `cf_ai_chat_agent_tool_runs` predates the JSON /
+   * progress columns: rebuild the table in its oldest shape, seed a settled
+   * row, re-run the constructor's `_ensureAgentToolTables` (the next-boot
+   * path), and inspect. Without the ALTER migration ladder,
+   * `_getAgentToolRunRow`'s SELECT throws `no such column`.
+   */
+  async migrateOldShapeRunTableForTest(
+    runId: string
+  ): Promise<AgentToolRunInspection | null> {
+    this.sql`drop table if exists cf_ai_chat_agent_tool_runs`;
+    this.sql`create table cf_ai_chat_agent_tool_runs (
+      run_id text primary key,
+      request_id text,
+      status text not null,
+      error_message text,
+      started_at integer not null,
+      completed_at integer
+    )`;
+    this.sql`
+      insert into cf_ai_chat_agent_tool_runs (run_id, status, started_at, completed_at)
+      values (${runId}, 'completed', 1, 2)
+    `;
+    this["_ensureAgentToolTables"]();
+    return this.inspectAgentToolRun(runId);
+  }
 }
 
 type AgentToolFinishForTest = {
@@ -2349,6 +2407,18 @@ export class AguiAgentToolParent extends Agent<Env> {
   }> {
     const child = await this.subAgent(AguiAgentToolChild, crypto.randomUUID());
     return child.cancelAgentToolRunAbortsRecoveryForTest();
+  }
+
+  async childMigratesOldShapeRunTableForTest(
+    runId: string
+  ): Promise<AgentToolRunInspection | null> {
+    const child = await this.subAgent(AguiAgentToolChild, runId);
+    return child.migrateOldShapeRunTableForTest(runId);
+  }
+
+  async childParkedRecoveryKeepsRunOpenForTest(): Promise<string | undefined> {
+    const child = await this.subAgent(AguiAgentToolChild, crypto.randomUUID());
+    return child.parkedRecoveryKeepsRunOpenForTest();
   }
 
   async runChildWithTrackedAbortListener(
