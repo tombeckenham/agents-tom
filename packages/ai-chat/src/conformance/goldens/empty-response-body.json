@@ -1,0 +1,45 @@
+{
+  "scenario": "empty-response-body",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": "",
+          "done": true,
+          "id": "id-1",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [],
+  "persistedRows": [
+    {
+      "id": "id-2",
+      "message": {
+        "id": "id-2",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-2",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    }
+  ]
+}

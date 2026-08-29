@@ -1,0 +1,202 @@
+{
+  "scenario": "max-persisted",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "Hello "
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "world"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-4"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "Hello "
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "world"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-5",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-4"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-6",
+      "message": {
+        "id": "id-6",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "second"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-4",
+      "message": {
+        "id": "id-4",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": "Hello world",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-6",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "second"
+        }
+      ]
+    },
+    {
+      "id": "id-4",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "text",
+          "text": "Hello world",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

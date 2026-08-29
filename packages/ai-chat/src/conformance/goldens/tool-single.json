@@ -1,0 +1,215 @@
+{
+  "scenario": "tool-single",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-start",
+            "toolCallId": "id-3",
+            "toolName": "getWeather"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-delta",
+            "toolCallId": "id-3",
+            "inputTextDelta": "{\"city\":\"Sydney\"}"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-available",
+            "toolCallId": "id-3",
+            "toolName": "getWeather",
+            "input": {
+              "city": "Sydney"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-output-available",
+            "toolCallId": "id-3",
+            "output": {
+              "temp": 21
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-4"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-4",
+            "delta": "It is 21C"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-4"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-5",
+      "message": {
+        "id": "id-5",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "step-start"
+          },
+          {
+            "type": "tool-getWeather",
+            "toolCallId": "id-3",
+            "toolName": "getWeather",
+            "state": "output-available",
+            "input": {
+              "city": "Sydney"
+            },
+            "output": {
+              "temp": 21
+            }
+          },
+          {
+            "type": "text",
+            "text": "It is 21C",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-5",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-getWeather",
+          "toolCallId": "id-3",
+          "toolName": "getWeather",
+          "state": "output-available",
+          "input": {
+            "city": "Sydney"
+          },
+          "output": {
+            "temp": 21
+          }
+        },
+        {
+          "type": "text",
+          "text": "It is 21C",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

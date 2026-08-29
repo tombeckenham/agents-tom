@@ -1,0 +1,317 @@
+{
+  "scenario": "client-tool-continuation",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-start",
+            "toolCallId": "id-3",
+            "toolName": "clientEcho"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-available",
+            "toolCallId": "id-3",
+            "toolName": "clientEcho",
+            "input": {
+              "text": "hi"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish",
+            "messageMetadata": {
+              "finishReason": "tool-calls"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "type": "cf_agent_message_updated",
+          "message": {
+            "id": "id-1",
+            "role": "assistant",
+            "parts": [
+              {
+                "type": "step-start"
+              },
+              {
+                "type": "tool-clientEcho",
+                "toolCallId": "id-3",
+                "toolName": "clientEcho",
+                "state": "output-available",
+                "input": {
+                  "text": "hi"
+                },
+                "output": {
+                  "echoed": "hi"
+                },
+                "preliminary": false
+              }
+            ]
+          }
+        },
+        {
+          "type": "cf_agent_stream_resuming",
+          "id": "id-4"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "continuation": true
+        },
+        {
+          "messages": [
+            {
+              "id": "id-5",
+              "role": "user",
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "hello"
+                }
+              ]
+            },
+            {
+              "id": "id-1",
+              "role": "assistant",
+              "parts": [
+                {
+                  "type": "step-start"
+                },
+                {
+                  "type": "tool-clientEcho",
+                  "toolCallId": "id-3",
+                  "toolName": "clientEcho",
+                  "state": "output-available",
+                  "input": {
+                    "text": "hi"
+                  },
+                  "output": {
+                    "echoed": "hi"
+                  },
+                  "preliminary": false
+                },
+                {
+                  "type": "text",
+                  "text": "client tool handled",
+                  "state": "done"
+                }
+              ]
+            }
+          ],
+          "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": {
+            "type": "start"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-6"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-6",
+            "delta": "client tool handled"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-6"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-4",
+      "status": "completed",
+      "continuation": true,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-5",
+      "message": {
+        "id": "id-5",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "step-start"
+          },
+          {
+            "type": "tool-clientEcho",
+            "toolCallId": "id-3",
+            "toolName": "clientEcho",
+            "state": "output-available",
+            "input": {
+              "text": "hi"
+            },
+            "output": {
+              "echoed": "hi"
+            },
+            "preliminary": false
+          },
+          {
+            "type": "text",
+            "text": "client tool handled",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-5",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-clientEcho",
+          "toolCallId": "id-3",
+          "toolName": "clientEcho",
+          "state": "output-available",
+          "input": {
+            "text": "hi"
+          },
+          "output": {
+            "echoed": "hi"
+          },
+          "preliminary": false
+        },
+        {
+          "type": "text",
+          "text": "client tool handled",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

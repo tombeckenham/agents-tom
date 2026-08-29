@@ -1,0 +1,264 @@
+{
+  "scenario": "tool-parallel",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-start",
+            "toolCallId": "id-3",
+            "toolName": "getWeather"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-start",
+            "toolCallId": "id-4",
+            "toolName": "getTime"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-available",
+            "toolCallId": "id-3",
+            "toolName": "getWeather",
+            "input": {
+              "city": "Sydney"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-available",
+            "toolCallId": "id-4",
+            "toolName": "getTime",
+            "input": {
+              "zone": "AEST"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-output-available",
+            "toolCallId": "id-3",
+            "output": {
+              "temp": 21
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-output-available",
+            "toolCallId": "id-4",
+            "output": {
+              "time": "09:00"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-5"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-5",
+            "delta": "21C at 09:00"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-5"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-6",
+      "message": {
+        "id": "id-6",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "step-start"
+          },
+          {
+            "type": "tool-getWeather",
+            "toolCallId": "id-3",
+            "toolName": "getWeather",
+            "state": "output-available",
+            "input": {
+              "city": "Sydney"
+            },
+            "output": {
+              "temp": 21
+            }
+          },
+          {
+            "type": "tool-getTime",
+            "toolCallId": "id-4",
+            "toolName": "getTime",
+            "state": "output-available",
+            "input": {
+              "zone": "AEST"
+            },
+            "output": {
+              "time": "09:00"
+            }
+          },
+          {
+            "type": "text",
+            "text": "21C at 09:00",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-6",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-getWeather",
+          "toolCallId": "id-3",
+          "toolName": "getWeather",
+          "state": "output-available",
+          "input": {
+            "city": "Sydney"
+          },
+          "output": {
+            "temp": 21
+          }
+        },
+        {
+          "type": "tool-getTime",
+          "toolCallId": "id-4",
+          "toolName": "getTime",
+          "state": "output-available",
+          "input": {
+            "zone": "AEST"
+          },
+          "output": {
+            "time": "09:00"
+          }
+        },
+        {
+          "type": "text",
+          "text": "21C at 09:00",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

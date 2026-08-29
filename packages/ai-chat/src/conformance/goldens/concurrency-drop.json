@@ -1,0 +1,166 @@
+{
+  "scenario": "concurrency-drop",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "before-gate "
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "messages": [
+            {
+              "id": "id-4",
+              "role": "user",
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "first"
+                }
+              ]
+            },
+            {
+              "id": "id-1",
+              "role": "assistant",
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "before-gate ",
+                  "state": "streaming"
+                }
+              ]
+            }
+          ],
+          "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "after-gate"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-4",
+      "message": {
+        "id": "id-4",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "first"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": "before-gate after-gate",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-4",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "first"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "text",
+          "text": "before-gate after-gate",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

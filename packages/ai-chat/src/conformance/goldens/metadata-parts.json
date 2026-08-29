@@ -1,0 +1,213 @@
+{
+  "scenario": "metadata-parts",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "message-metadata",
+            "messageMetadata": {
+              "model": "fixture-model"
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "data-weather",
+            "id": "id-3",
+            "data": {
+              "city": "Sydney",
+              "temp": 21
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "file",
+            "url": "data:text/plain;base64,aGk=",
+            "mediaType": "text/plain"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "source-url",
+            "sourceId": "id-4",
+            "url": "https://example.com/doc",
+            "title": "Doc"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-5"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-5",
+            "delta": "with extras"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-5"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-6",
+      "message": {
+        "id": "id-6",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "data-weather",
+            "id": "id-3",
+            "data": {
+              "city": "Sydney",
+              "temp": 21
+            }
+          },
+          {
+            "type": "file",
+            "mediaType": "text/plain",
+            "url": "data:text/plain;base64,aGk="
+          },
+          {
+            "type": "source-url",
+            "sourceId": "id-4",
+            "url": "https://example.com/doc",
+            "title": "Doc"
+          },
+          {
+            "type": "text",
+            "text": "with extras",
+            "state": "done"
+          }
+        ],
+        "metadata": {
+          "model": "fixture-model"
+        }
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-6",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "data-weather",
+          "id": "id-3",
+          "data": {
+            "city": "Sydney",
+            "temp": 21
+          }
+        },
+        {
+          "type": "file",
+          "mediaType": "text/plain",
+          "url": "data:text/plain;base64,aGk="
+        },
+        {
+          "type": "source-url",
+          "sourceId": "id-4",
+          "url": "https://example.com/doc",
+          "title": "Doc"
+        },
+        {
+          "type": "text",
+          "text": "with extras",
+          "state": "done"
+        }
+      ],
+      "metadata": {
+        "model": "fixture-model"
+      }
+    }
+  ]
+}

@@ -1,0 +1,340 @@
+{
+  "scenario": "tool-approval-approve",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-input-available",
+            "toolCallId": "id-3",
+            "toolName": "riskyTool",
+            "input": {
+              "level": 9
+            }
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "tool-approval-request",
+            "toolCallId": "id-3",
+            "approvalId": "id-4"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "type": "cf_agent_message_updated",
+          "message": {
+            "id": "id-1",
+            "role": "assistant",
+            "parts": [
+              {
+                "type": "step-start"
+              },
+              {
+                "type": "tool-riskyTool",
+                "toolCallId": "id-3",
+                "toolName": "riskyTool",
+                "state": "approval-responded",
+                "input": {
+                  "level": 9
+                },
+                "approval": {
+                  "id": "id-4",
+                  "approved": true
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "cf_agent_stream_resuming",
+          "id": "id-5"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "continuation": true
+        },
+        {
+          "messages": [
+            {
+              "id": "id-6",
+              "role": "user",
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "do it"
+                }
+              ]
+            },
+            {
+              "id": "id-1",
+              "role": "assistant",
+              "parts": [
+                {
+                  "type": "step-start"
+                },
+                {
+                  "type": "tool-riskyTool",
+                  "toolCallId": "id-3",
+                  "toolName": "riskyTool",
+                  "state": "output-available",
+                  "input": {
+                    "level": 9
+                  },
+                  "approval": {
+                    "id": "id-4",
+                    "approved": true
+                  },
+                  "output": {
+                    "ran": true
+                  }
+                },
+                {
+                  "type": "step-start"
+                },
+                {
+                  "type": "text",
+                  "text": "approved and ran",
+                  "state": "done"
+                }
+              ]
+            }
+          ],
+          "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": {
+            "type": "start"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "tool-output-available",
+            "toolCallId": "id-3",
+            "output": {
+              "ran": true
+            }
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-7"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-7",
+            "delta": "approved and ran"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-7"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-5",
+      "status": "completed",
+      "continuation": true,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-6",
+      "message": {
+        "id": "id-6",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "do it"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "step-start"
+          },
+          {
+            "type": "tool-riskyTool",
+            "toolCallId": "id-3",
+            "toolName": "riskyTool",
+            "state": "output-available",
+            "input": {
+              "level": 9
+            },
+            "approval": {
+              "id": "id-4",
+              "approved": true
+            },
+            "output": {
+              "ran": true
+            }
+          },
+          {
+            "type": "step-start"
+          },
+          {
+            "type": "text",
+            "text": "approved and ran",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-6",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "do it"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-riskyTool",
+          "toolCallId": "id-3",
+          "toolName": "riskyTool",
+          "state": "output-available",
+          "input": {
+            "level": 9
+          },
+          "approval": {
+            "id": "id-4",
+            "approved": true
+          },
+          "output": {
+            "ran": true
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "approved and ran",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}
