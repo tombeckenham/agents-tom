@@ -1,0 +1,1 @@
+A mid-stream error rides the AG-UI `RUN_ERROR` event (projected to an AI SDK `error` chunk frame) instead of legacy's raw-string body + envelope `error: true` frame; the message, terminal done frame, hook status, and partial `state: "streaming"` row are identical.

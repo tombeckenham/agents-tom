@@ -194,6 +194,12 @@ export type AssistantMessage = BaseMessage & {
   extraParts?: AssistantExtraPart[];
   /** CF extension: see {@link ToolApprovalState}. */
   toolApprovals?: Record<string, ToolApprovalState>;
+  /**
+   * CF extension: text stream still open (no `TEXT_MESSAGE_END` yet). Set by
+   * the reducer while streaming; survives on interrupted persists so the
+   * UIMessage projection can mark the part `state: "streaming"`.
+   */
+  partial?: true;
 };
 
 /**
@@ -222,6 +228,8 @@ export type ReasoningMessage = BaseMessage & {
   readonly role: "reasoning";
   content?: string;
   encryptedValue?: string;
+  /** CF extension: reasoning stream still open — see AssistantMessage.partial. */
+  partial?: true;
 };
 
 /**
@@ -355,6 +363,10 @@ export type RunFinishedEvent = BaseAGUIEvent & {
   readonly threadId: string;
   readonly runId: string;
   readonly result?: unknown;
+  /** CF extension: synthesized at stream end because the producer never
+   * sent a `finish` chunk — clients projecting back to AI SDK chunks can
+   * skip re-inventing one. */
+  readonly synthesized?: true;
 };
 
 /**
@@ -431,6 +443,9 @@ export type ToolCallStartEvent = BaseAGUIEvent & {
   readonly toolCallId: string;
   readonly toolCallName: string;
   readonly parentMessageId?: string;
+  /** CF extension: synthesized from a non-streamed `tool-input-available`
+   * (the producer never sent a `tool-input-start`). */
+  readonly synthesized?: true;
 };
 
 /**
@@ -442,6 +457,12 @@ export type ToolCallArgsEvent = BaseAGUIEvent & {
   readonly type: "TOOL_CALL_ARGS";
   readonly toolCallId: string;
   readonly delta: string;
+  /**
+   * CF extension: the args were synthesized from a non-streamed
+   * `tool-input-available` (the producer never sent input deltas). A client
+   * projection can skip re-emitting a delta chunk the producer never sent.
+   */
+  readonly synthesized?: true;
 };
 
 /**

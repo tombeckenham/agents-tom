@@ -1,0 +1,1 @@
+Row/frame granularity: tool results are standalone AG-UI rows synced via a `cf_agent_chat_messages` snapshot + tool-row `cf_agent_message_updated` (legacy re-sent the folded assistant), and the AI SDK-only `preliminary: false` marker has no AG-UI representation.

@@ -1,0 +1,1 @@
+Same granularity family as approve, plus the deny decision is broadcast as its own AG-UI CUSTOM mini-stream (projected to `start` + `tool-output-denied`) where legacy re-sent the folded assistant via `cf_agent_message_updated`.

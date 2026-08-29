@@ -178,11 +178,13 @@ type LegacyMessage = {
 type LegacyTextPart = {
   type: "text";
   text?: string;
+  state?: string;
 };
 
 type LegacyReasoningPart = {
   type: "reasoning";
   text?: string;
+  state?: string;
 };
 
 type LegacyFilePart = {
@@ -392,7 +394,8 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     const r: ReasoningMessage = {
       id: msg.id,
       role: "reasoning",
-      content: reasoningParts[0].text ?? ""
+      content: reasoningParts[0].text ?? "",
+      ...(reasoningParts[0].state === "streaming" && { partial: true as const })
     };
     return [r];
   }
@@ -401,7 +404,8 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     const r: ReasoningMessage = {
       id: `${msg.id}-reasoning-${reasoningIndex++}`,
       role: "reasoning",
-      content: part.text ?? ""
+      content: part.text ?? "",
+      ...(part.state === "streaming" && { partial: true as const })
     };
     out.push(r);
   }
@@ -490,6 +494,9 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     }
   }
 
+  const streamingText = msg.parts.some(
+    (part) => isTextPart(part) && part.state === "streaming"
+  );
   const assistant: AssistantMessage = {
     id: msg.id,
     role: "assistant",
@@ -497,6 +504,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(Object.keys(toolApprovals).length ? { toolApprovals } : {}),
     ...(extraParts.length ? { extraParts } : {}),
+    ...(streamingText && { partial: true as const }),
     ...(msg.metadata !== undefined && { metadata: msg.metadata })
   };
   out.push(assistant);
@@ -508,7 +516,11 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
 /** Assistant parts with no AG-UI slot that ride `extraParts` verbatim. */
 function isExtraAssistantPart(value: unknown): boolean {
   if (!isObject(value) || typeof value.type !== "string") return false;
-  return value.type === "file" || value.type.startsWith("source-");
+  return (
+    value.type === "file" ||
+    value.type.startsWith("source-") ||
+    value.type === "step-start"
+  );
 }
 
 // ----------------------------------------------------------------------------

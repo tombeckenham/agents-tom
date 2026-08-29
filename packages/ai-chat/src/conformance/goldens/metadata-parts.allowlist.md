@@ -1,0 +1,1 @@
+Extras (metadata/data/file/source) precede any text, and AG-UI carries no assistant id yet at that point, so the leading `start` is emitted id-less and the extra-part ids land in different normalized slots; parts, metadata, and rows are identical.

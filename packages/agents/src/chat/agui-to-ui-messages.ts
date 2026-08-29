@@ -42,14 +42,20 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
     id: string;
     metadata?: unknown;
     text: string;
+    partial?: true;
   }> = [];
+
+  // Streamed parts carry a state marker (legacy shape): "done" once the
+  // stream closed, "streaming" while open / when interrupted (`partial`).
+  const partState = (partial: true | undefined) =>
+    partial ? "streaming" : "done";
 
   const flushStandaloneReasoning = () => {
     for (const r of pendingReasoning) {
       ui.push({
         id: r.id,
         role: "assistant",
-        parts: [{ type: "reasoning", text: r.text }],
+        parts: [{ type: "reasoning", text: r.text, state: partState(r.partial) }],
         ...(r.metadata !== undefined && { metadata: r.metadata })
       } as UIMessage);
     }
@@ -98,7 +104,11 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
       case "assistant": {
         const parts: UIPart[] = [];
         for (const r of pendingReasoning) {
-          parts.push({ type: "reasoning", text: r.text });
+          parts.push({
+            type: "reasoning",
+            text: r.text,
+            state: partState(r.partial)
+          });
         }
         pendingReasoning = [];
         for (const extra of message.extraParts ?? []) {
@@ -110,7 +120,11 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           parts.push(part as unknown as UIPart);
         }
         if (message.content) {
-          parts.push({ type: "text", text: message.content });
+          parts.push({
+            type: "text",
+            text: message.content,
+            state: partState(message.partial)
+          });
         }
         if (parts.length) {
           ui.push({
@@ -144,6 +158,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
         pendingReasoning.push({
           id: message.id,
           text: message.content,
+          ...(message.partial && { partial: message.partial }),
           ...(message.metadata !== undefined && { metadata: message.metadata })
         });
         break;

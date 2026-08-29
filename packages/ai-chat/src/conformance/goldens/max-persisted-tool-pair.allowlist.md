@@ -1,0 +1,1 @@
+`maxPersistedMessages` counts rows, and AG-UI stores tool results as separate rows: trimming to 2 keeps [assistant, tool] (folding back to one assistant message) where legacy kept [user, assistant]. Documented row-granularity difference of the storage flip.

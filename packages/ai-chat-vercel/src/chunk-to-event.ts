@@ -25,15 +25,22 @@ export type ChunkToEventProjectorOptions = {
   threadId?: string;
   /** Stable run id; defaults to a freshly generated one. */
   runId?: string;
+  /**
+   * Assistant message id to anchor the run on when the producer's `start`
+   * chunk carries none — a continuation turn passes the seed assistant's id
+   * so the streamed text extends that message instead of opening a new one.
+   */
+  messageId?: string;
 };
 
 export class ChunkToEventProjector {
   private readonly threadId: string;
   private readonly runId: string;
   private runStarted = false;
-  // Assistant message id from the Vercel `start` chunk; carried onto tool
-  // calls as `parentMessageId` since AG-UI keeps no run-level message id.
-  private runMessageId: string | null = null;
+  // Assistant message id from the Vercel `start` chunk (or the caller's
+  // `messageId` option); carried onto tool calls as `parentMessageId` since
+  // AG-UI keeps no run-level message id. Generated at RUN_STARTED if absent.
+  private runMessageId: string | null;
   // Vercel text part id -> the AG-UI message id it maps to.
   private textPartMessageIds = new Map<string, string>();
   private runFinished = false;
@@ -57,6 +64,7 @@ export class ChunkToEventProjector {
   constructor(options?: ChunkToEventProjectorOptions) {
     this.threadId = options?.threadId ?? nanoid();
     this.runId = options?.runId ?? nanoid();
+    this.runMessageId = options?.messageId ?? null;
   }
 
   /** Project a single Vercel `UIMessageChunk` into zero or more `AGUIEvent`s. */
@@ -151,14 +159,20 @@ export class ChunkToEventProjector {
         const events = this.emitRunStarted();
         if (!this.toolNamesById.has(chunk.toolCallId)) {
           this.toolNamesById.set(chunk.toolCallId, chunk.toolName);
-          events.push(this.toolCallStart(chunk.toolCallId, chunk.toolName));
+          events.push({
+            ...this.toolCallStart(chunk.toolCallId, chunk.toolName),
+            synthesized: true
+          } as AGUIEvent);
         }
         if (!this.argsEmitted.has(chunk.toolCallId)) {
           this.argsEmitted.add(chunk.toolCallId);
           events.push({
             type: "TOOL_CALL_ARGS",
             toolCallId: chunk.toolCallId,
-            delta: JSON.stringify(chunk.input ?? {})
+            delta: JSON.stringify(chunk.input ?? {}),
+            // The producer never streamed deltas; a client projection can
+            // skip re-emitting a delta chunk the producer never sent.
+            synthesized: true
           });
         }
         this.endedToolCalls.add(chunk.toolCallId);
@@ -308,7 +322,13 @@ export class ChunkToEventProjector {
   /** Emit a synthetic `RUN_FINISHED` if no `finish` chunk arrived. */
   flush(): AGUIEvent[] {
     if (this.runFinished || !this.runStarted) return [];
-    return this.emitRunFinished("stop");
+    // No finishReason: the producer never said why it stopped, and the
+    // legacy engine emitted a bare `finish` in that case. Marked
+    // synthesized so a chunk projection can skip re-inventing the finish
+    // chunk the producer never sent.
+    return this.emitRunFinished().map(
+      (event) => ({ ...event, synthesized: true }) as AGUIEvent
+    );
   }
 
   /**
@@ -350,6 +370,13 @@ export class ChunkToEventProjector {
   private emitRunStarted(): AGUIEvent[] {
     if (this.runStarted) return [];
     this.runStarted = true;
+    // No message id from the producer (a bare `start` chunk, or none at
+    // all): generate one, exactly like the legacy engine generated an
+    // assistant id per turn. Without it, part ids leak into AG-UI message
+    // ids — two turns reusing a part id ("t-1") would collide on the same
+    // persisted assistant row, and a tool+text turn would split into two
+    // assistant messages.
+    this.runMessageId ??= nanoid();
     return [
       { type: "RUN_STARTED", threadId: this.threadId, runId: this.runId }
     ];
@@ -386,12 +413,22 @@ export class ChunkToEventProjector {
       );
       return [];
     }
-    const dataValue = (chunk as { data?: unknown }).data;
+    // Wrap so the part's `id`/`transient` round-trip (the reducer persists
+    // `id` on the extra part; `transient` parts are never persisted).
+    const { id, data, transient } = chunk as {
+      id?: string;
+      data?: unknown;
+      transient?: boolean;
+    };
     return [
       {
         type: "CUSTOM",
         name: `data.${typeName.slice("data-".length)}`,
-        value: dataValue
+        value: {
+          ...(id !== undefined && { id }),
+          data,
+          ...(transient !== undefined && { transient })
+        }
       }
     ];
   }

@@ -1,0 +1,1 @@
+Intentional improvement: an `onChatMessage` throw before a Response now broadcasts a terminal `error: true` done frame (legacy sent the requester nothing, stranding it); the request id enters the id map earlier as a result.

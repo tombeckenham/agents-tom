@@ -121,6 +121,11 @@ export function applyEventToSnapshot(
       return handleRunError(state, event);
 
     case "STEP_STARTED":
+      // Durable step boundary marker: the legacy engine persisted a
+      // `step-start` part per step (AI SDK message-builder behavior), so the
+      // UIMessage projection needs it in `extraParts` to match.
+      attachExtraPart(state, { type: "step-start" });
+      return true;
     case "STEP_FINISHED":
       return true;
 
@@ -256,13 +261,15 @@ function handleTextStart(
     if (existing.content === undefined) {
       existing.content = "";
     }
+    existing.partial = true;
     state.textStreams.set(event.messageId, existing);
     return true;
   }
   const assistant: AssistantMessage = {
     id: event.messageId,
     role: "assistant",
-    content: ""
+    content: "",
+    partial: true
   };
   state.messages.push(assistant);
   flushPendingExtras(state, assistant);
@@ -295,6 +302,8 @@ function handleTextEnd(
     warn("TEXT_MESSAGE_END missing messageId", event);
     return false;
   }
+  const open = state.textStreams.get(event.messageId);
+  if (open) delete open.partial;
   state.textStreams.delete(event.messageId);
   return true;
 }
@@ -408,7 +417,8 @@ function handleReasoningStart(
   const reasoning: ReasoningMessage = {
     id: event.messageId,
     role: "reasoning",
-    content: ""
+    content: "",
+    partial: true
   };
   state.messages.push(reasoning);
   state.reasoningStreams.set(event.messageId, reasoning);
@@ -440,6 +450,8 @@ function handleReasoningEnd(
     warn("REASONING_MESSAGE_END missing messageId", event);
     return false;
   }
+  const open = state.reasoningStreams.get(event.messageId);
+  if (open) delete open.partial;
   state.reasoningStreams.delete(event.messageId);
   return true;
 }
@@ -600,12 +612,20 @@ function handleCustom(
     return true;
   }
   if (event.name.startsWith("data.")) {
-    // ponytail: the original data part id is not carried by the CUSTOM event;
-    // Phase 5's metadata golden arbitrates whether chunk-to-event must carry it.
-    attachExtraPart(state, {
-      type: `data-${event.name.slice("data.".length)}`,
-      data: event.value
-    });
+    // The value is either the raw data (older producers) or a
+    // `{ id?, data, transient? }` wrapper (chunk-to-event, so the data part
+    // round-trips with its id — pinned by the metadata conformance golden).
+    // Transient data parts are never persisted, matching the AI SDK.
+    const wrapped = isDataWrapper(event.value)
+      ? event.value
+      : { data: event.value };
+    if (!wrapped.transient) {
+      attachExtraPart(state, {
+        type: `data-${event.name.slice("data.".length)}`,
+        ...(wrapped.id !== undefined && { id: wrapped.id }),
+        data: wrapped.data
+      });
+    }
     state.customEvents.push({ name: event.name, value: event.value });
     return true;
   }
@@ -763,6 +783,21 @@ function findAssistantForToolCall(
     if (m.toolCalls.some((tc) => tc.id === toolCallId)) return m;
   }
   return undefined;
+}
+
+/** Whether a `data.*` CUSTOM value is the `{ id?, data, transient? }` wrapper. */
+function isDataWrapper(
+  value: unknown
+): value is { id?: unknown; data: unknown; transient?: boolean } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    "data" in value &&
+    Object.keys(value).every(
+      (key) => key === "id" || key === "data" || key === "transient"
+    )
+  );
 }
 
 /** Attach an extra part (file/source/data) to the current/next assistant. */

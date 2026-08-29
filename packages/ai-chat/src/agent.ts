@@ -36,6 +36,7 @@ import {
   type AGUIChatResponseResult,
   type AGUIMessage,
   type OnChatMessageOptions,
+  type ProjectHandlerContext,
   type ToolMessage
 } from "agents/agui-chat-agent";
 import {
@@ -164,12 +165,21 @@ export class AIChatAgent<
 
   /** UIMessageChunk SSE → AG-UI SSE; plaintext/empty pass through. */
   protected override _projectHandlerResponse(
-    response: Response | undefined
+    response: Response | undefined,
+    context?: ProjectHandlerContext
   ): Response | undefined {
     if (!response?.body) return response;
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("text/event-stream")) return response;
-    return toAGUIResponse(response);
+    // A continuation anchors streamed text on the seed assistant so it
+    // extends that message (legacy cloning behavior) instead of opening a
+    // second assistant row.
+    return toAGUIResponse(
+      response,
+      context?.seedAssistantId !== undefined
+        ? { messageId: context.seedAssistantId }
+        : undefined
+    );
   }
 
   protected override _invokeChatResponseHook(

@@ -1,0 +1,1 @@
+AG-UI carries no run-level assistant id before text begins, so the wire's leading `start` adopts the reasoning message id rather than the assistant row id; within-stream correlation and the folded assistant row are identical.

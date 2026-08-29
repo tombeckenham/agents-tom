@@ -1,0 +1,1 @@
+Part ordering + frame granularity: `step-start` markers project from `extraParts` ahead of tool/text parts (legacy interleaved them positionally), and the decision/result apply syncs via a `cf_agent_chat_messages` snapshot instead of legacy's folded-assistant `cf_agent_message_updated`.

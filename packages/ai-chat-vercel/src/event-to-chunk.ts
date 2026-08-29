@@ -44,6 +44,15 @@ import type { UIMessageChunk } from "ai";
  */
 function opensMessage(chunk: UIMessageChunk): boolean {
   if (chunk.type.startsWith("tool-")) return true;
+  // file / source-* push parts, and message-metadata writes metadata onto
+  // the message — all begin the run's message in `processUIMessageStream`.
+  if (
+    chunk.type === "file" ||
+    chunk.type.startsWith("source-") ||
+    chunk.type === "message-metadata"
+  ) {
+    return true;
+  }
   return (
     chunk.type.startsWith("data-") &&
     !(chunk as { transient?: boolean }).transient
@@ -63,6 +72,10 @@ export class EventToChunkProjector {
   // an id to attach.
   private runStartedBuffered = false;
   private leadingStartEmitted = false;
+  // STEP_STARTED events that arrived before the leading `start` was emitted:
+  // legacy order is `start` then `start-step`, but AG-UI's STEP_STARTED can
+  // precede the first content event that carries the start's messageId.
+  private pendingStepStarts = 0;
   private toolBuffers = new Map<string, ToolBuffer>();
   // Tracks the messageId of the open reasoning chunk so a stray
   // `REASONING_MESSAGE_CHUNK` without an explicit `messageId` can be
@@ -85,7 +98,19 @@ export class EventToChunkProjector {
     // later server snapshot; the fix is for the producer to send
     // `parentMessageId`, which `chunk-to-event` now does.
     this.leadingStartEmitted = true;
-    return [{ type: "start" }, ...chunks];
+    return [
+      { type: "start" },
+      ...this.flushPendingStepStarts(),
+      ...chunks
+    ];
+  }
+
+  private flushPendingStepStarts(): UIMessageChunk[] {
+    const out: UIMessageChunk[] = [];
+    for (; this.pendingStepStarts > 0; this.pendingStepStarts--) {
+      out.push({ type: "start-step" });
+    }
+    return out;
   }
 
   private projectEvent(event: AGUIEvent): UIMessageChunk[] {
@@ -94,13 +119,34 @@ export class EventToChunkProjector {
         this.runStartedBuffered = true;
         return [];
 
-      case "RUN_FINISHED":
-        return [{ type: "finish" }];
+      case "RUN_FINISHED": {
+        // Synthesized finish (producer sent no `finish` chunk): don't
+        // re-invent one the legacy wire never carried.
+        if ((event as { synthesized?: boolean }).synthesized) return [];
+        const out = this.flushPendingStepStarts();
+        // Legacy carried the producer's finishReason on the finish chunk.
+        const finishReason = (
+          event.result as { finishReason?: string } | undefined
+        )?.finishReason;
+        out.push(
+          finishReason !== undefined
+            ? ({
+                type: "finish",
+                messageMetadata: { finishReason }
+              } as UIMessageChunk)
+            : { type: "finish" }
+        );
+        return out;
+      }
 
       case "RUN_ERROR":
         return [{ type: "error", errorText: event.message }];
 
       case "STEP_STARTED":
+        if (!this.leadingStartEmitted) {
+          this.pendingStepStarts++;
+          return [];
+        }
         return [{ type: "start-step" }];
 
       case "STEP_FINISHED":
@@ -152,21 +198,34 @@ export class EventToChunkProjector {
           args: "",
           startedInputAvailable: false
         });
+        // Synthesized start (non-streamed tool input): track the buffer but
+        // don't emit a `tool-input-start` the producer never sent.
+        const chunks: UIMessageChunk[] = (
+          event as { synthesized?: boolean }
+        ).synthesized
+          ? []
+          : [
+              {
+                type: "tool-input-start",
+                toolCallId: event.toolCallId,
+                toolName: event.toolCallName
+              }
+            ];
         return [
           // `parentMessageId` is the assistant id for a turn whose first
           // content is a tool call — the only id AG-UI carries for one.
           ...this.emitLeadingStart(event.parentMessageId),
-          {
-            type: "tool-input-start",
-            toolCallId: event.toolCallId,
-            toolName: event.toolCallName
-          }
+          ...chunks
         ];
       }
 
       case "TOOL_CALL_ARGS": {
         const buffer = this.toolBuffers.get(event.toolCallId);
         if (buffer) buffer.args += event.delta;
+        // Synthesized args (non-streamed tool input): the producer never
+        // sent a delta chunk, so don't invent one — TOOL_CALL_END still
+        // emits `tool-input-available` with the buffered input.
+        if ((event as { synthesized?: boolean }).synthesized) return [];
         return [
           {
             type: "tool-input-delta",
@@ -274,7 +333,8 @@ export class EventToChunkProjector {
     // present) — it is emitted for the consumers that key off the chunk
     // itself, notably `broadcast-state`'s replay-reset marker.
     return [
-      messageId != null ? { type: "start", messageId } : { type: "start" }
+      messageId != null ? { type: "start", messageId } : { type: "start" },
+      ...this.flushPendingStepStarts()
     ];
   }
 
@@ -299,6 +359,49 @@ export class EventToChunkProjector {
           type: "tool-output-denied",
           toolCallId: decision.toolCallId
         }
+      ];
+    }
+    // Invert the chunk-to-event encodings so the round trip restores the
+    // native AI SDK chunk shapes (pinned by the metadata conformance golden).
+    if (name === "cf.agents.message_metadata") {
+      return [
+        { type: "message-metadata", messageMetadata: value } as UIMessageChunk
+      ];
+    }
+    if (name === "cf.agents.file") {
+      const file = value as { url?: string; mediaType?: string };
+      return [
+        {
+          type: "file",
+          url: file.url,
+          mediaType: file.mediaType
+        } as UIMessageChunk
+      ];
+    }
+    if (name === "cf.agents.source") {
+      const source = value as { kind?: string } & Record<string, unknown>;
+      const { kind, ...rest } = source;
+      return [
+        {
+          type: kind === "document" ? "source-document" : "source-url",
+          ...rest
+        } as UIMessageChunk
+      ];
+    }
+    if (name.startsWith("data.")) {
+      const wrapped =
+        typeof value === "object" && value !== null && "data" in value
+          ? (value as { id?: string; data?: unknown; transient?: boolean })
+          : { data: value };
+      return [
+        {
+          type: `data-${name.slice("data.".length)}`,
+          ...(wrapped.id !== undefined && { id: wrapped.id }),
+          data: wrapped.data,
+          ...(wrapped.transient !== undefined && {
+            transient: wrapped.transient
+          })
+        } as UIMessageChunk
       ];
     }
     // Unknown CUSTOM events surface as data parts so consumers can opt
