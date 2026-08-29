@@ -80,6 +80,47 @@ describe("AGUIChatAgent — resumable streaming", () => {
     ws2.close(1000);
   });
 
+  it("answers an explicit probe with a SECOND STREAM_RESUMING, never deduping it (#1733)", async () => {
+    const path = `/agents/slow-agui-agent/${crypto.randomUUID()}`;
+    const ws = await connectChatWS(path);
+    const rec = recordFrames(ws);
+
+    sendChatRequest(ws, "req1", [userMessage("u1", "go")]);
+    await rec.waitFor(
+      (f) => isResponseFrame(f) && f.id === "req1" && !!f.body?.length
+    );
+
+    const ws2 = await connectChatWS(path);
+    const rec2 = recordFrames(ws2);
+    // onConnect's proactive notify lands first (no probe id).
+    await rec2.waitFor((f) => f.type === CHAT_MESSAGE_TYPES.STREAM_RESUMING);
+
+    ws2.send(
+      JSON.stringify({
+        type: CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST,
+        probeId: "probe-dup"
+      })
+    );
+    await rec2.waitFor(
+      (f) =>
+        f.type === CHAT_MESSAGE_TYPES.STREAM_RESUMING &&
+        f.probeId === "probe-dup"
+    );
+
+    // Both frames must be sent. Deduping the second would hang a client whose
+    // message handler was not yet registered for the proactive one — its
+    // `reconnectToStream` waits for an answer to ITS probe and would time out.
+    const resumings = rec2.frames.filter(
+      (f) => f.type === CHAT_MESSAGE_TYPES.STREAM_RESUMING
+    );
+    expect(resumings).toHaveLength(2);
+    expect(resumings[0].probeId).toBeUndefined();
+    expect(resumings[1].probeId).toBe("probe-dup");
+
+    ws.close(1000);
+    ws2.close(1000);
+  });
+
   it("answers STREAM_RESUME_NONE when no stream is active", async () => {
     const path = `/agents/slow-agui-agent/${crypto.randomUUID()}`;
     const ws = await connectChatWS(path);

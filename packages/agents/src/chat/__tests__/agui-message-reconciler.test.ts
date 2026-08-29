@@ -170,6 +170,16 @@ describe("reconcileMessages", () => {
     expect(result[0]).toBe(malformed);
     expect(warnSpy).toHaveBeenCalled();
   });
+
+  it("keeps an assistant's own id when the server holds its tool result", () => {
+    // Adopting the tool row's id here collapses two rows onto one key, and the
+    // assistant then overwrites the result on persist.
+    const server: AGUIMessage[] = [toolMsg("srv-t1", "tc1", '{"r":1}')];
+    const incoming: AGUIMessage[] = [
+      assistant("cli-a1", "y", [toolCall("tc1", "calc", "{}")])
+    ];
+    expect(reconcileMessages(incoming, server)[0].id).toBe("cli-a1");
+  });
 });
 
 describe("resolveToolMergeId", () => {
@@ -189,10 +199,19 @@ describe("resolveToolMergeId", () => {
     expect(resolveToolMergeId(msg, server)).toBe("srv-a1");
   });
 
-  it("finds server tool message id when a tool message shares toolCallId", () => {
+  it("finds server tool message id for another tool message with the same toolCallId", () => {
+    const server: AGUIMessage[] = [toolMsg("srv-t1", "tc1", '{"r":1}')];
+    expect(resolveToolMergeId(toolMsg("cli-t1", "tc1", "x"), server)).toBe(
+      "srv-t1"
+    );
+  });
+
+  it("never hands an assistant a tool message's id", () => {
+    // The caller adopts this id, so a cross-role match would make the
+    // assistant overwrite the tool result's row on persist.
     const server: AGUIMessage[] = [toolMsg("srv-t1", "tc1", '{"r":1}')];
     const msg = assistant("cli-a1", "y", [toolCall("tc1", "calc", "{}")]);
-    expect(resolveToolMergeId(msg, server)).toBe("srv-t1");
+    expect(resolveToolMergeId(msg, server)).toBeNull();
   });
 
   it("returns null when given a non-tool-bearing user message", () => {

@@ -55,9 +55,9 @@ export function reconcileMessages(
  * input is a `ToolMessage`) share an id with this message. Returns
  * `null` when no candidate matches.
  *
- * Tool call ids are unique per conversation, so cross-role matching is
- * safe — an assistant message's `toolCalls[i].id` and a tool message's
- * `toolCallId` reference the same logical call.
+ * Only same-role candidates are considered: the caller adopts the matched
+ * id, so an assistant must never take its own `ToolMessage`'s id (that row
+ * would then be overwritten by the assistant turn).
  */
 export function resolveToolMergeId(
   message: AGUIMessage,
@@ -68,6 +68,9 @@ export function resolveToolMergeId(
 
   for (const candidate of server) {
     if (candidate.id === message.id) continue;
+    // Same role only: the caller adopts the candidate's id, and an assistant
+    // that borrowed its own `ToolMessage`'s id would overwrite that row.
+    if (candidate.role !== message.role) continue;
     const candidateIds = collectToolCallIds(candidate);
     for (const id of ids) {
       if (candidateIds.includes(id)) return candidate.id;
