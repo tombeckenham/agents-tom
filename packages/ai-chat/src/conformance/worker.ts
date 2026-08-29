@@ -12,6 +12,7 @@ import {
   type ChatResponseResult,
   type OnChatMessageOptions
 } from "../";
+import { AIChatAgent as ProjectedAIChatAgent } from "../agent";
 import type {
   UIMessage as ChatMessage,
   GenerateTextOnFinishCallback,
@@ -452,6 +453,206 @@ export class MaxPersistedAgent extends ScriptedAgent {
   maxPersistedMessages = 2;
 }
 
+/**
+ * Phase-3 smoke fixture: the PROJECTED `AIChatAgent` (`../agent.ts` — the
+ * AG-UI engine under the legacy AI SDK surface). Not part of the golden
+ * matrix; exercised by `projected-smoke.test.ts` only.
+ */
+export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
+  private _projHooks: Array<Record<string, unknown>> = [];
+
+  async stable(timeout = 8000): Promise<boolean> {
+    return this.waitUntilStable({ timeout });
+  }
+
+  /** Recorded lifecycle-hook invocations (legacy shapes), in order. */
+  hooks(): Array<Record<string, unknown>> {
+    return this._projHooks;
+  }
+
+  /** Raw persisted rows — AG-UI shape with the `_v` marker. */
+  rows(): Array<{ id: string; message: unknown }> {
+    return (
+      this.sql<{ id: string; message: string }>`
+        select id, message from cf_ai_chat_agent_messages
+        order by created_at, rowid
+      ` || []
+    ).map((row) => ({ id: row.id, message: JSON.parse(row.message) }));
+  }
+
+  /** The legacy-projected view (`this.messages` getter). */
+  uiMessages(): ChatMessage[] {
+    return this.messages;
+  }
+
+  protected onChatResponse(result: ChatResponseResult): void {
+    this._projHooks.push({
+      hook: "onChatResponse",
+      requestId: result.requestId,
+      status: result.status,
+      continuation: result.continuation,
+      messageId: result.message.id,
+      partTypes: result.message.parts.map((part) => part.type)
+    });
+  }
+
+  protected findToolPart(toolCallId: string): ToolPart | undefined {
+    const lastAssistant = [...this.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    return lastAssistant?.parts.find(
+      (part): part is ToolPart =>
+        "toolCallId" in part && part.toolCallId === toolCallId
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    const scenario =
+      (options?.body as { scenario?: string } | undefined)?.scenario ??
+      "plain-text";
+    switch (scenario) {
+      case "tool-single":
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-weather-1",
+            toolName: "getWeather"
+          },
+          {
+            type: "tool-input-delta",
+            toolCallId: "call-weather-1",
+            inputTextDelta: '{"city":"Sydney"}'
+          },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-weather-1",
+            toolName: "getWeather",
+            input: { city: "Sydney" }
+          },
+          {
+            type: "tool-output-available",
+            toolCallId: "call-weather-1",
+            output: { temp: 21 }
+          },
+          { type: "finish-step" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "It is 21C" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "reasoning":
+        return sse([
+          { type: "start" },
+          { type: "reasoning-start", id: "r-1" },
+          { type: "reasoning-delta", id: "r-1", delta: "thinking about it" },
+          { type: "reasoning-end", id: "r-1" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "reasoned answer" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "tool-error":
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-boom-1",
+            toolName: "boom",
+            input: { fuse: "short" }
+          },
+          {
+            type: "tool-output-error",
+            toolCallId: "call-boom-1",
+            errorText: "exploded"
+          },
+          { type: "finish-step" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "tool failed" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      case "approval": {
+        if (options?.continuation) {
+          const part = this.findToolPart("call-approval-1");
+          if (part?.state === "approval-responded") {
+            return sse([
+              { type: "start" },
+              { type: "start-step" },
+              {
+                type: "tool-output-available",
+                toolCallId: "call-approval-1",
+                output: { ran: true }
+              },
+              { type: "text-start", id: "t-appr" },
+              { type: "text-delta", id: "t-appr", delta: "approved and ran" },
+              { type: "text-end", id: "t-appr" },
+              { type: "finish" }
+            ]);
+          }
+          return sse(textRun("t-deny", ["denied — riskyTool not run"]));
+        }
+        return sse([
+          { type: "start" },
+          { type: "start-step" },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-approval-1",
+            toolName: "riskyTool",
+            input: { level: 9 }
+          },
+          {
+            type: "tool-approval-request",
+            toolCallId: "call-approval-1",
+            approvalId: "approval-1"
+          }
+        ]);
+      }
+
+      case "metadata":
+        return sse([
+          { type: "start" },
+          {
+            type: "message-metadata",
+            messageMetadata: { model: "fixture-model" }
+          },
+          {
+            type: "data-weather",
+            id: "data-1",
+            data: { city: "Sydney", temp: 21 }
+          },
+          {
+            type: "file",
+            url: "data:text/plain;base64,aGk=",
+            mediaType: "text/plain"
+          },
+          {
+            type: "source-url",
+            sourceId: "src-1",
+            url: "https://example.com/doc",
+            title: "Doc"
+          },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "with extras" },
+          { type: "text-end", id: "t-1" },
+          { type: "finish" }
+        ]);
+
+      default:
+        return sse(textRun("t-1", ["Hello ", "world"]));
+    }
+  }
+}
+
 export type Env = {
   ScriptedAgent: DurableObjectNamespace<ScriptedAgent>;
   GatedAgent: DurableObjectNamespace<GatedAgent>;
@@ -460,6 +661,7 @@ export type Env = {
   MergeGatedAgent: DurableObjectNamespace<MergeGatedAgent>;
   DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
+  ProjectedAgent: DurableObjectNamespace<ProjectedAgent>;
 };
 
 export default {

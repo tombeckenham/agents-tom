@@ -4135,6 +4135,9 @@ importers:
         specifier: ^5.1.16
         version: 5.1.16
     devDependencies:
+      '@cloudflare/ai-chat-vercel':
+        specifier: workspace:*
+        version: link:../ai-chat-vercel
       '@playwright/test':
         specifier: ^1.61.1
         version: 1.61.1

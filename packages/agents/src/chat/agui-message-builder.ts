@@ -14,6 +14,7 @@
 import type {
   AGUIEvent,
   AGUIMessage,
+  AssistantExtraPart,
   AssistantMessage,
   CFToolApprovalDecisionValue,
   CFToolApprovalRequestValue,
@@ -22,7 +23,10 @@ import type {
   ToolMessage
 } from "./agui-types";
 import {
+  CF_FILE,
+  CF_MESSAGE_METADATA,
   CF_NAMESPACE_PREFIX,
+  CF_SOURCE,
   CF_TOOL_APPROVAL_DECISION,
   CF_TOOL_APPROVAL_EXPIRED,
   CF_TOOL_APPROVAL_REQUEST
@@ -63,6 +67,10 @@ export type SnapshotState = {
   readonly toolBuffers: Map<string, ToolCallBuffer>;
   readonly pendingApprovals: Map<string, CFToolApprovalRequestValue>;
   readonly customEvents: { name: string; value: unknown }[];
+  /** file/source/data extras that arrived before any assistant exists. */
+  readonly pendingExtraParts: AssistantExtraPart[];
+  /** message metadata that arrived before any assistant exists. */
+  pendingMetadata?: unknown;
   threadId?: string;
   runId?: string;
   state?: unknown;
@@ -82,7 +90,8 @@ export function createInitialSnapshot(
     reasoningStreams: new Map(),
     toolBuffers: new Map(),
     pendingApprovals: new Map(),
-    customEvents: []
+    customEvents: [],
+    pendingExtraParts: []
   };
 }
 
@@ -240,6 +249,7 @@ function handleTextStart(
     content: ""
   };
   state.messages.push(assistant);
+  flushPendingExtras(state, assistant);
   state.textStreams.set(event.messageId, assistant);
   return true;
 }
@@ -357,7 +367,8 @@ function handleToolResult(
     id: event.messageId,
     role: "tool",
     toolCallId: event.toolCallId,
-    content: event.content
+    content: event.content,
+    ...(typeof event.error === "string" && { error: event.error })
   };
   state.messages.push(toolMessage);
   return true;
@@ -517,6 +528,14 @@ function handleCustom(
       return false;
     }
     state.pendingApprovals.set(value.toolCallId, value);
+    // Durable record on the issuing assistant so the approval state survives
+    // persistence and projects back to `approval-requested`.
+    const owner = findAssistantForToolCall(state, value.toolCallId);
+    if (owner) {
+      (owner.toolApprovals ??= {})[value.toolCallId] = {
+        approvalId: value.approvalId
+      };
+    }
     return true;
   }
   if (event.name === CF_TOOL_APPROVAL_DECISION) {
@@ -526,6 +545,51 @@ function handleCustom(
       return false;
     }
     state.pendingApprovals.delete(value.toolCallId);
+    const owner = findAssistantForToolCall(state, value.toolCallId);
+    if (owner && typeof value.approved === "boolean") {
+      const existing = owner.toolApprovals?.[value.toolCallId];
+      (owner.toolApprovals ??= {})[value.toolCallId] = {
+        approvalId: existing?.approvalId ?? value.approvalId,
+        approved: value.approved
+      };
+    }
+    state.customEvents.push({ name: event.name, value: event.value });
+    return true;
+  }
+  if (event.name === CF_MESSAGE_METADATA) {
+    attachMetadata(state, event.value);
+    state.customEvents.push({ name: event.name, value: event.value });
+    return true;
+  }
+  if (event.name === CF_FILE) {
+    const value = event.value as { url?: string; mediaType?: string } | null;
+    attachExtraPart(state, {
+      type: "file",
+      mediaType: value?.mediaType,
+      url: value?.url
+    });
+    state.customEvents.push({ name: event.name, value: event.value });
+    return true;
+  }
+  if (event.name === CF_SOURCE) {
+    const value = event.value as
+      | ({ kind?: string } & Record<string, unknown>)
+      | null;
+    const { kind, ...rest } = value ?? {};
+    attachExtraPart(state, {
+      type: kind === "document" ? "source-document" : "source-url",
+      ...rest
+    });
+    state.customEvents.push({ name: event.name, value: event.value });
+    return true;
+  }
+  if (event.name.startsWith("data.")) {
+    // ponytail: the original data part id is not carried by the CUSTOM event;
+    // Phase 5's metadata golden arbitrates whether chunk-to-event must carry it.
+    attachExtraPart(state, {
+      type: `data-${event.name.slice("data.".length)}`,
+      data: event.value
+    });
     state.customEvents.push({ name: event.name, value: event.value });
     return true;
   }
@@ -646,6 +710,7 @@ function ensureAssistantForToolCall(
       role: "assistant"
     };
     state.messages.push(created);
+    flushPendingExtras(state, created);
     return created;
   }
   const last = state.messages[state.messages.length - 1];
@@ -658,7 +723,64 @@ function ensureAssistantForToolCall(
     role: "assistant"
   };
   state.messages.push(created);
+  flushPendingExtras(state, created);
   return created;
+}
+
+/** Last assistant message in the snapshot, if any. */
+function lastAssistant(state: SnapshotState): AssistantMessage | undefined {
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    const m = state.messages[i];
+    if (m.role === "assistant") return m;
+  }
+  return undefined;
+}
+
+/** The assistant that owns `toolCallId`, if any. */
+function findAssistantForToolCall(
+  state: SnapshotState,
+  toolCallId: string
+): AssistantMessage | undefined {
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    const m = state.messages[i];
+    if (m.role !== "assistant" || !m.toolCalls) continue;
+    if (m.toolCalls.some((tc) => tc.id === toolCallId)) return m;
+  }
+  return undefined;
+}
+
+/** Attach an extra part (file/source/data) to the current/next assistant. */
+function attachExtraPart(state: SnapshotState, part: AssistantExtraPart): void {
+  const assistant = lastAssistant(state);
+  if (assistant) {
+    (assistant.extraParts ??= []).push(part);
+  } else {
+    state.pendingExtraParts.push(part);
+  }
+}
+
+/** Attach message metadata to the current/next assistant. */
+function attachMetadata(state: SnapshotState, metadata: unknown): void {
+  const assistant = lastAssistant(state);
+  if (assistant) {
+    assistant.metadata = metadata;
+  } else {
+    state.pendingMetadata = metadata;
+  }
+}
+
+/** Flush extras/metadata buffered before the first assistant existed. */
+function flushPendingExtras(
+  state: SnapshotState,
+  assistant: AssistantMessage
+): void {
+  if (state.pendingExtraParts.length > 0) {
+    (assistant.extraParts ??= []).push(...state.pendingExtraParts.splice(0));
+  }
+  if (state.pendingMetadata !== undefined) {
+    assistant.metadata = state.pendingMetadata;
+    state.pendingMetadata = undefined;
+  }
 }
 
 function lastOpenReasoningId(state: SnapshotState): string | undefined {
