@@ -19,7 +19,9 @@
       { "name": "MergeGatedAgent", "class_name": "MergeGatedAgent" },
       { "name": "DebounceGatedAgent", "class_name": "DebounceGatedAgent" },
       { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" },
-      { "name": "ProjectedAgent", "class_name": "ProjectedAgent" }
+      { "name": "ProjectedAgent", "class_name": "ProjectedAgent" },
+      { "name": "ProjectedChildAgent", "class_name": "ProjectedChildAgent" },
+      { "name": "ProjectedToolParent", "class_name": "ProjectedToolParent" }
     ]
   },
   "migrations": [
@@ -38,6 +40,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["ProjectedAgent"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ProjectedChildAgent", "ProjectedToolParent"]
     }
   ]
 }

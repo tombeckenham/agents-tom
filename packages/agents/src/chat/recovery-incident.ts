@@ -362,7 +362,14 @@ export async function classifyAgentToolChildRecovery(
     if (
       incident.status === "detected" ||
       incident.status === "scheduled" ||
-      incident.status === "attempting"
+      incident.status === "attempting" ||
+      // A recovery PARKED on a pending client interaction (HITL: the client's
+      // replayed tool-result / approval will drive the continuation) is still
+      // resolving, not settled — mapping it to "none" would let the child-run
+      // reconcile terminalize a run whose real answer is still coming. Only
+      // this skip reason is live; every other "skipped" stays "none".
+      (incident.status === "skipped" &&
+        incident.reason === "awaiting_client_interaction")
     ) {
       return "in-progress";
     }
