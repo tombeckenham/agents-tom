@@ -95,30 +95,40 @@ function parseUIMessageSSE(
   let buffer = "";
 
   return new ReadableStream<import("ai").UIMessageChunk>({
+    // A pull MUST NOT resolve without enqueueing (or closing): workerd does
+    // not reliably re-invoke pull after an empty one when the pending read
+    // belongs to another request context, which strands the consumer. Loop
+    // until at least one chunk lands.
     async pull(controller) {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          // Flush any trailing data: line that wasn't terminated by \n\n.
-          const tail = buffer.trim();
-          if (tail.startsWith("data: ")) {
-            const chunk = parseChunk(tail.slice("data: ".length));
-            if (chunk) controller.enqueue(chunk);
+        let enqueued = false;
+        while (!enqueued) {
+          const { done, value } = await reader.read();
+          if (done) {
+            // Flush any trailing data: line that wasn't terminated by \n\n.
+            const tail = buffer.trim();
+            if (tail.startsWith("data: ")) {
+              const chunk = parseChunk(tail.slice("data: ".length));
+              if (chunk) controller.enqueue(chunk);
+            }
+            controller.close();
+            return;
           }
-          controller.close();
-          return;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary !== -1) {
-          const block = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          for (const line of block.split("\n")) {
-            if (!line.startsWith("data: ")) continue;
-            const chunk = parseChunk(line.slice("data: ".length));
-            if (chunk) controller.enqueue(chunk);
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const block = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            for (const line of block.split("\n")) {
+              if (!line.startsWith("data: ")) continue;
+              const chunk = parseChunk(line.slice("data: ".length));
+              if (chunk) {
+                controller.enqueue(chunk);
+                enqueued = true;
+              }
+            }
+            boundary = buffer.indexOf("\n\n");
           }
-          boundary = buffer.indexOf("\n\n");
         }
       } catch (error) {
         controller.error(error);

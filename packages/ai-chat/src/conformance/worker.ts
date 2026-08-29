@@ -19,6 +19,7 @@ import type {
   ToolSet
 } from "ai";
 import { Agent, routeAgentRequest, type RunAgentToolResult } from "agents";
+import type { ChatResponseResult as EngineChatResponseResult } from "agents/chat";
 
 type ToolPart = Extract<
   ChatMessage["parts"][number],
@@ -147,22 +148,15 @@ class ConformanceBase extends AIChatAgent<Env> {
 }
 
 /**
- * Body-driven fixture: `body.scenario` picks the scripted chunk sequence.
- * The body is stored by the framework and re-supplied on continuations, so
- * continuation turns branch on `options.continuation` + persisted tool state.
+ * The scripted chunk sequence per scenario — shared by the legacy and
+ * projected fixture classes so both stacks run byte-identical scripts.
  */
-export class ScriptedAgent extends ConformanceBase {
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async onChatMessage(
-    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
-    options?: OnChatMessageOptions
-  ): Promise<Response | undefined> {
-    this._chatMessageCalls++;
-    const scenario =
-      (options?.body as { scenario?: string } | undefined)?.scenario ??
-      "plain-text";
-
-    switch (scenario) {
+function scriptedResponse(
+  scenario: string,
+  continuation: boolean,
+  findToolPart: (toolCallId: string) => ToolPart | undefined
+): Response | undefined {
+  switch (scenario) {
       case "pre-throw":
         throw new Error("boom before response");
 
@@ -267,7 +261,7 @@ export class ScriptedAgent extends ConformanceBase {
         ]);
 
       case "client-tool":
-        if (options?.continuation) {
+        if (continuation) {
           return sse(textRun("t-cont", ["client tool handled"]));
         }
         return sse([
@@ -289,8 +283,8 @@ export class ScriptedAgent extends ConformanceBase {
         ]);
 
       case "approval": {
-        if (options?.continuation) {
-          const part = this.findToolPart("call-approval-1");
+        if (continuation) {
+          const part = findToolPart("call-approval-1");
           if (part?.state === "approval-responded") {
             return sse([
               { type: "start" },
@@ -365,7 +359,69 @@ export class ScriptedAgent extends ConformanceBase {
       default:
         return sse(textRun("t-1", ["Hello ", "world"]));
     }
+}
+
+/**
+ * Body-driven fixture: `body.scenario` picks the scripted chunk sequence.
+ * The body is stored by the framework and re-supplied on continuations, so
+ * continuation turns branch on `options.continuation` + persisted tool state.
+ */
+export class ScriptedAgent extends ConformanceBase {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    this._chatMessageCalls++;
+    const scenario =
+      (options?.body as { scenario?: string } | undefined)?.scenario ??
+      "plain-text";
+    return scriptedResponse(scenario, options?.continuation === true, (id) =>
+      this.findToolPart(id)
+    );
   }
+}
+
+/**
+ * The gated stream shared by legacy and projected gated fixtures: a prefix,
+ * then a hold on `gate()` until the test's `release` RPC opens it.
+ */
+function gatedResponse(
+  signal: AbortSignal | undefined,
+  gate: () => Promise<void>
+): Response {
+  const encoder = new TextEncoder();
+  const emit = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    chunk: Record<string, unknown>
+  ) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      emit(controller, { type: "start" });
+      emit(controller, { type: "text-start", id: "t-g" });
+      emit(controller, {
+        type: "text-delta",
+        id: "t-g",
+        delta: "before-gate "
+      });
+      await gate();
+      if (!signal?.aborted) {
+        emit(controller, {
+          type: "text-delta",
+          id: "t-g",
+          delta: "after-gate"
+        });
+        emit(controller, { type: "text-end", id: "t-g" });
+        emit(controller, { type: "finish" });
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    }
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream" }
+  });
 }
 
 /**
@@ -393,41 +449,7 @@ export class GatedAgent extends ConformanceBase {
     options?: OnChatMessageOptions
   ) {
     this._chatMessageCalls++;
-    const signal = options?.abortSignal;
-    const gate = () => this._gate();
-    const encoder = new TextEncoder();
-    const emit = (
-      controller: ReadableStreamDefaultController<Uint8Array>,
-      chunk: Record<string, unknown>
-    ) =>
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        emit(controller, { type: "start" });
-        emit(controller, { type: "text-start", id: "t-g" });
-        emit(controller, {
-          type: "text-delta",
-          id: "t-g",
-          delta: "before-gate "
-        });
-        await gate();
-        if (!signal?.aborted) {
-          emit(controller, {
-            type: "text-delta",
-            id: "t-g",
-            delta: "after-gate"
-          });
-          emit(controller, { type: "text-end", id: "t-g" });
-          emit(controller, { type: "finish" });
-        }
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      }
-    });
-    return new Response(stream, {
-      headers: { "Content-Type": "text/event-stream" }
-    });
+    return gatedResponse(options?.abortSignal, () => this._gate());
   }
 }
 
@@ -450,6 +472,157 @@ export class DebounceGatedAgent extends GatedAgent {
 }
 
 export class MaxPersistedAgent extends ScriptedAgent {
+  maxPersistedMessages = 2;
+}
+
+// ── Projected mirrors (Phase 5 differential) ─────────────────────────
+//
+// One fixture per legacy fixture, extending the PROJECTED `AIChatAgent`
+// (`../agent.ts` — AG-UI engine under the legacy AI SDK surface) and running
+// the same scripted scenarios via `scriptedResponse` / `gatedResponse`.
+
+/** RPC surface mirror of {@link ConformanceBase} on the projected class. */
+class ProjectedConformanceBase extends ProjectedAIChatAgent<Env> {
+  protected _chatMessageCalls = 0;
+  private _hookCalls: Array<Record<string, unknown>> = [];
+
+  async stable(timeout = 8000): Promise<boolean> {
+    return this.waitUntilStable({ timeout });
+  }
+
+  calls(): number {
+    return this._chatMessageCalls;
+  }
+
+  hooks(): Array<Record<string, unknown>> {
+    return this._hookCalls;
+  }
+
+  queueDepth(): number {
+    return (
+      this as unknown as { _turnQueue: { queuedCount(): number } }
+    )._turnQueue.queuedCount();
+  }
+
+  protected override onChatResponse(result: EngineChatResponseResult): void {
+    this._hookCalls.push({
+      hook: "onChatResponse",
+      requestId: result.requestId,
+      status: result.status,
+      continuation: result.continuation,
+      ...(result.error !== undefined && { error: result.error }),
+      messageId: result.message.id
+    });
+  }
+
+  onError(connectionOrError: unknown, error?: unknown): void {
+    this._hookCalls.push({
+      hook: "onError",
+      error: String(error ?? connectionOrError)
+    });
+  }
+
+  overlapping(): number {
+    return (
+      this as unknown as {
+        _submitConcurrency: { overlappingSubmitCount: number };
+      }
+    )._submitConcurrency.overlappingSubmitCount;
+  }
+
+  /** Raw persisted rows — AG-UI shape; the harness projects them for diffing. */
+  rows(): Array<{ id: string; message: unknown; created_at: string }> {
+    return (
+      this.sql<{ id: string; message: string; created_at: string }>`
+        select id, message, created_at
+        from cf_ai_chat_agent_messages order by created_at, rowid
+      ` || []
+    ).map((row) => ({
+      id: row.id,
+      message: JSON.parse(row.message),
+      created_at: row.created_at
+    }));
+  }
+
+  async programmaticTurn(text: string) {
+    return this.saveMessages([
+      ...this.messages,
+      {
+        id: "prog-user-1",
+        role: "user",
+        parts: [{ type: "text", text }]
+      }
+    ]);
+  }
+
+  protected findToolPart(toolCallId: string): ToolPart | undefined {
+    const lastAssistant = [...this.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    return lastAssistant?.parts.find(
+      (part): part is ToolPart =>
+        "toolCallId" in part && part.toolCallId === toolCallId
+    );
+  }
+}
+
+export class ProjectedScriptedAgent extends ProjectedConformanceBase {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    this._chatMessageCalls++;
+    const scenario =
+      (options?.body as { scenario?: string } | undefined)?.scenario ??
+      "plain-text";
+    return scriptedResponse(scenario, options?.continuation === true, (id) =>
+      this.findToolPart(id)
+    );
+  }
+}
+
+export class ProjectedGatedAgent extends ProjectedConformanceBase {
+  private _gateOpen = false;
+  private _waiters: Array<() => void> = [];
+
+  release(): void {
+    this._gateOpen = true;
+    for (const waiter of this._waiters.splice(0)) waiter();
+  }
+
+  private _gate(): Promise<void> {
+    if (this._gateOpen) return Promise.resolve();
+    return new Promise((resolve) => this._waiters.push(resolve));
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ) {
+    this._chatMessageCalls++;
+    return gatedResponse(options?.abortSignal, () => this._gate());
+  }
+}
+
+export class ProjectedLatestGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "latest" as const;
+}
+
+export class ProjectedDropGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "drop" as const;
+}
+
+export class ProjectedMergeGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "merge" as const;
+}
+
+export class ProjectedDebounceGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = { strategy: "debounce", debounceMs: 1 } as const;
+}
+
+export class ProjectedMaxPersistedAgent extends ProjectedScriptedAgent {
   maxPersistedMessages = 2;
 }
 
@@ -720,6 +893,13 @@ export type Env = {
   MergeGatedAgent: DurableObjectNamespace<MergeGatedAgent>;
   DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
+  ProjectedScriptedAgent: DurableObjectNamespace<ProjectedScriptedAgent>;
+  ProjectedGatedAgent: DurableObjectNamespace<ProjectedGatedAgent>;
+  ProjectedLatestGatedAgent: DurableObjectNamespace<ProjectedLatestGatedAgent>;
+  ProjectedDropGatedAgent: DurableObjectNamespace<ProjectedDropGatedAgent>;
+  ProjectedMergeGatedAgent: DurableObjectNamespace<ProjectedMergeGatedAgent>;
+  ProjectedDebounceGatedAgent: DurableObjectNamespace<ProjectedDebounceGatedAgent>;
+  ProjectedMaxPersistedAgent: DurableObjectNamespace<ProjectedMaxPersistedAgent>;
   ProjectedAgent: DurableObjectNamespace<ProjectedAgent>;
   ProjectedChildAgent: DurableObjectNamespace<ProjectedChildAgent>;
   ProjectedToolParent: DurableObjectNamespace<ProjectedToolParent>;

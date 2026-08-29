@@ -21,7 +21,32 @@
       { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" },
       { "name": "ProjectedAgent", "class_name": "ProjectedAgent" },
       { "name": "ProjectedChildAgent", "class_name": "ProjectedChildAgent" },
-      { "name": "ProjectedToolParent", "class_name": "ProjectedToolParent" }
+      { "name": "ProjectedToolParent", "class_name": "ProjectedToolParent" },
+      {
+        "name": "ProjectedScriptedAgent",
+        "class_name": "ProjectedScriptedAgent"
+      },
+      { "name": "ProjectedGatedAgent", "class_name": "ProjectedGatedAgent" },
+      {
+        "name": "ProjectedLatestGatedAgent",
+        "class_name": "ProjectedLatestGatedAgent"
+      },
+      {
+        "name": "ProjectedDropGatedAgent",
+        "class_name": "ProjectedDropGatedAgent"
+      },
+      {
+        "name": "ProjectedMergeGatedAgent",
+        "class_name": "ProjectedMergeGatedAgent"
+      },
+      {
+        "name": "ProjectedDebounceGatedAgent",
+        "class_name": "ProjectedDebounceGatedAgent"
+      },
+      {
+        "name": "ProjectedMaxPersistedAgent",
+        "class_name": "ProjectedMaxPersistedAgent"
+      }
     ]
   },
   "migrations": [
@@ -44,6 +69,18 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["ProjectedChildAgent", "ProjectedToolParent"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "ProjectedScriptedAgent",
+        "ProjectedGatedAgent",
+        "ProjectedLatestGatedAgent",
+        "ProjectedDropGatedAgent",
+        "ProjectedMergeGatedAgent",
+        "ProjectedDebounceGatedAgent",
+        "ProjectedMaxPersistedAgent"
+      ]
     }
   ]
 }

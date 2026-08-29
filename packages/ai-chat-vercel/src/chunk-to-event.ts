@@ -411,22 +411,28 @@ export function projectChunkStreamToAGUISSE(
   const reader = chunks.getReader();
 
   return new ReadableStream<Uint8Array>({
+    // Same contract as parseUIMessageSSE's pull: never resolve without
+    // enqueueing or closing, or a cross-context consumer can be stranded.
     async pull(controller) {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          for (const event of projector.flush()) {
+        let enqueued = false;
+        while (!enqueued) {
+          const { done, value } = await reader.read();
+          if (done) {
+            for (const event of projector.flush()) {
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+              );
+            }
+            controller.close();
+            return;
+          }
+          for (const event of projector.project(value)) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
             );
+            enqueued = true;
           }
-          controller.close();
-          return;
-        }
-        for (const event of projector.project(value)) {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
-          );
         }
       } catch (error) {
         controller.error(error);

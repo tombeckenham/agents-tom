@@ -160,7 +160,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-6"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-4",
@@ -171,7 +171,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-6",
+            "id": "part-1",
             "delta": "client tool handled"
           },
           "done": false,
@@ -183,7 +183,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-6"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-4",

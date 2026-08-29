@@ -15,6 +15,9 @@ import { exports } from "cloudflare:workers";
 import { expect } from "vitest";
 import { MessageType } from "../types";
 import type { UIMessage as ChatMessage } from "ai";
+import { EventToChunkProjector } from "@cloudflare/ai-chat-vercel";
+import { toUIMessages } from "agents/chat";
+import type { AGUIEvent, AGUIMessage } from "agents/chat/agui-types";
 
 export type WireFrame = {
   type: string;
@@ -183,13 +186,17 @@ export function isAnyDone(f: WireFrame): boolean {
   return f.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE && f.done === true;
 }
 
+/** Matches streamed text on either stack's wire (AI SDK chunk / AG-UI event). */
 export function isTextDelta(f: WireFrame): boolean {
-  return (
-    f.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE &&
-    typeof f.body === "object" &&
-    f.body !== null &&
-    (f.body as { type?: string }).type === "text-delta"
-  );
+  if (
+    f.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE ||
+    typeof f.body !== "object" ||
+    f.body === null
+  ) {
+    return false;
+  }
+  const bodyType = (f.body as { type?: string }).type;
+  return bodyType === "text-delta" || bodyType === "TEXT_MESSAGE_CONTENT";
 }
 
 export async function fetchClientView(path: string): Promise<unknown[]> {
@@ -214,8 +221,25 @@ const ID_KEYS = new Set([
 ]);
 const TS_KEYS = new Set(["created_at"]);
 
+/**
+ * Streaming chunk types whose `id` is a PART id: an opaque correlation key
+ * that only groups deltas within one stream. Legacy generated distinct part
+ * ids ("t-1"); AG-UI reuses the assistant messageId. Both are semantically
+ * equivalent, so part ids normalize in their own namespace (`part-N`) —
+ * whether a part id coincides with a message id is not part of the contract.
+ */
+const PART_ID_CHUNK_TYPES = new Set([
+  "text-start",
+  "text-delta",
+  "text-end",
+  "reasoning-start",
+  "reasoning-delta",
+  "reasoning-end"
+]);
+
 export function normalize<T>(value: T): T {
   const ids = new Map<string, string>();
+  const partIds = new Map<string, string>();
   const mapId = (raw: string): string => {
     let mapped = ids.get(raw);
     if (!mapped) {
@@ -224,14 +248,31 @@ export function normalize<T>(value: T): T {
     }
     return mapped;
   };
-  const walk = (val: unknown, key?: string): unknown => {
+  const mapPartId = (raw: string): string => {
+    let mapped = partIds.get(raw);
+    if (!mapped) {
+      mapped = `part-${partIds.size + 1}`;
+      partIds.set(raw, mapped);
+    }
+    return mapped;
+  };
+  const walk = (val: unknown, key?: string, parent?: unknown): unknown => {
     if (Array.isArray(val)) return val.map((item) => walk(item));
     if (val !== null && typeof val === "object") {
       return Object.fromEntries(
-        Object.entries(val).map(([k, v]) => [k, walk(v, k)])
+        Object.entries(val).map(([k, v]) => [k, walk(v, k, val)])
       );
     }
     if (key !== undefined) {
+      if (
+        key === "id" &&
+        typeof val === "string" &&
+        PART_ID_CHUNK_TYPES.has(
+          (parent as { type?: string } | undefined)?.type ?? ""
+        )
+      ) {
+        return mapPartId(val);
+      }
       if (ID_KEYS.has(key) && typeof val === "string") return mapId(val);
       // Timestamps appear both as epoch numbers and SQLite datetime strings.
       if (
@@ -244,6 +285,75 @@ export function normalize<T>(value: T): T {
     return val;
   };
   return walk(value) as T;
+}
+
+// ── Projected-stack → legacy-shape trace projection ──────────────────
+//
+// The projected stack speaks AG-UI on the wire and persists AG-UI rows;
+// storage divergence is a stated design fact (`ag-ui-plan.md` §Versioning),
+// not per-scenario behavior. The differ therefore compares BEHAVIOR: wire
+// frames are projected back through the client-side `EventToChunkProjector`
+// (exactly what the Phase-4 client runs) and rows/views through
+// `toUIMessages` (the sanctioned reverse projection) before diffing against
+// the legacy goldens.
+
+/** AG-UI event frames → legacy UIMessageChunk frames, per stream id. */
+export function projectFramesToLegacy(frames: WireFrame[]): WireFrame[] {
+  const projectors = new Map<string, EventToChunkProjector>();
+  const out: WireFrame[] = [];
+  for (const frame of frames) {
+    const body = frame.body;
+    // Init/refresh frames carry the persisted list; project the rows.
+    if (
+      frame.type === MessageType.CF_AGENT_CHAT_MESSAGES &&
+      Array.isArray((frame as { messages?: unknown }).messages)
+    ) {
+      out.push({
+        ...frame,
+        messages: projectViewToLegacy(
+          (frame as unknown as { messages: unknown[] }).messages
+        )
+      });
+      continue;
+    }
+    if (
+      frame.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE ||
+      typeof body !== "object" ||
+      body === null ||
+      typeof (body as { type?: unknown }).type !== "string"
+    ) {
+      out.push(frame);
+      continue;
+    }
+    const event = body as AGUIEvent;
+    const key = String(frame.id ?? "");
+    // A RUN_STARTED restarts the stream (fresh run or replay pass).
+    if (event.type === "RUN_STARTED" || !projectors.has(key)) {
+      projectors.set(key, new EventToChunkProjector());
+    }
+    const projector = projectors.get(key) as EventToChunkProjector;
+    for (const chunk of projector.project(event)) {
+      out.push({ ...frame, body: chunk });
+    }
+  }
+  return out;
+}
+
+/** AG-UI rows → legacy-shaped persisted rows (message granularity). */
+export function projectRowsToLegacy(rows: unknown[]): unknown[] {
+  const messages = (
+    rows as Array<{ message: unknown; created_at?: string }>
+  ).map((row) => row.message) as AGUIMessage[];
+  return toUIMessages(messages).map((message) => ({
+    id: message.id,
+    message,
+    created_at: "TS"
+  }));
+}
+
+/** AG-UI message list (`/get-messages`) → legacy `UIMessage[]`. */
+export function projectViewToLegacy(view: unknown[]): unknown[] {
+  return toUIMessages(view as AGUIMessage[]);
 }
 
 // ── Trace assembly + golden compare ──────────────────────────────────
@@ -273,32 +383,74 @@ export async function finishTrace(options: {
   stub: ConformanceStub;
   clients: Client[];
   sortFramesByRequestId?: boolean;
+  /** Trace came from the projected stack: project it to legacy shape. */
+  projected?: boolean;
 }): Promise<Trace> {
-  const { scenario, path, stub, clients } = options;
+  const { scenario, path, stub, clients, projected } = options;
   expect(await stub.stable()).toBe(true);
   const hooks = (await stub.hooks()) as unknown[];
-  const persistedRows = (await stub.rows()) as unknown[];
-  const clientView = await fetchClientView(path);
+  const rawRows = (await stub.rows()) as unknown[];
+  const rawView = await fetchClientView(path);
   for (const client of clients) client.close();
   return {
     scenario,
     clients: clients.map((client, index) => {
-      const frames = options.sortFramesByRequestId
+      let frames = options.sortFramesByRequestId
         ? [...client.frames].sort((a, b) => {
             const left = a.id ?? "";
             const right = b.id ?? "";
             return left < right ? -1 : left > right ? 1 : 0;
           })
         : client.frames;
+      if (projected) frames = projectFramesToLegacy(frames);
       return { label: `client-${index + 1}`, frames };
     }),
     hooks,
-    persistedRows,
-    clientView
+    persistedRows: projected ? projectRowsToLegacy(rawRows) : rawRows,
+    clientView: projected ? projectViewToLegacy(rawView) : rawView
   };
 }
 
 export async function expectGolden(name: string, trace: Trace): Promise<void> {
   const json = `${JSON.stringify(normalize(trace), null, 2)}\n`;
   await expect(json).toMatchFileSnapshot(`./goldens/${name}.json`);
+}
+
+// ── Differential compare (projected stack vs legacy goldens) ─────────
+
+const goldenFiles = import.meta.glob("./goldens/*.json", {
+  eager: true
+}) as Record<string, { default: unknown }>;
+
+const allowlistFiles = import.meta.glob("./goldens/*.allowlist.md", {
+  eager: true,
+  query: "?raw",
+  import: "default"
+}) as Record<string, string>;
+
+/**
+ * Diff a projected-stack trace (already projected to legacy shape) against
+ * the committed legacy golden.
+ *
+ * Default: the normalized trace must deep-equal the golden — any difference
+ * is DIVERGENT and fails.
+ *
+ * If `goldens/<name>.allowlist.md` exists (one-line justifications for
+ * semantically-equivalent differences), the trace is instead pinned as its
+ * own snapshot `goldens/<name>.projected.json` so the equivalence stays
+ * reviewable and stable. Re-record with UPDATE_GOLDENS=1.
+ */
+export async function expectProjectedGolden(
+  name: string,
+  trace: Trace
+): Promise<void> {
+  const normalized = normalize(trace);
+  if (allowlistFiles[`./goldens/${name}.allowlist.md`] !== undefined) {
+    const json = `${JSON.stringify(normalized, null, 2)}\n`;
+    await expect(json).toMatchFileSnapshot(`./goldens/${name}.projected.json`);
+    return;
+  }
+  const golden = goldenFiles[`./goldens/${name}.json`];
+  if (!golden) throw new Error(`no committed golden for scenario "${name}"`);
+  expect(normalized).toEqual(golden.default);
 }
