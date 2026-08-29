@@ -98,11 +98,7 @@ export class EventToChunkProjector {
     // later server snapshot; the fix is for the producer to send
     // `parentMessageId`, which `chunk-to-event` now does.
     this.leadingStartEmitted = true;
-    return [
-      { type: "start" },
-      ...this.flushPendingStepStarts(),
-      ...chunks
-    ];
+    return [{ type: "start" }, ...this.flushPendingStepStarts(), ...chunks];
   }
 
   private flushPendingStepStarts(): UIMessageChunk[] {
@@ -200,9 +196,8 @@ export class EventToChunkProjector {
         });
         // Synthesized start (non-streamed tool input): track the buffer but
         // don't emit a `tool-input-start` the producer never sent.
-        const chunks: UIMessageChunk[] = (
-          event as { synthesized?: boolean }
-        ).synthesized
+        const chunks: UIMessageChunk[] = (event as { synthesized?: boolean })
+          .synthesized
           ? []
           : [
               {

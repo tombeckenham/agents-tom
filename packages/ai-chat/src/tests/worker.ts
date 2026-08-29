@@ -26,7 +26,7 @@ import type {
   ChatRecoveryExhaustedContext,
   ChatRecoveryOptions
 } from "../";
-import { ResumableStream } from "agents/chat";
+import { ResumableStream, toUIMessages } from "agents/chat";
 
 // Type helper for tool call parts - extracts from ChatMessage parts
 type TestToolCallPart = Extract<
@@ -511,13 +511,12 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    const rawMessages = (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
-    ).map((row) => {
-      return JSON.parse(row.message as string);
-    });
-    return rawMessages;
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getMessagesForTest(): ChatMessage[] {
@@ -839,7 +838,10 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   testRestoreActiveStream(): void {
-    this._restoreActiveStream();
+    // The engine restores active-stream state in the ResumableStream
+    // constructor; recreating it re-runs that restore (what the legacy
+    // `_restoreActiveStream` did in place).
+    this._resumableStream = new ResumableStream(this.sql.bind(this));
   }
 
   testTriggerStreamCleanup(): void {
@@ -973,13 +975,12 @@ export class CustomSanitizeAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    const rawMessages = (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
-    ).map((row) => {
-      return JSON.parse(row.message as string);
-    });
-    return rawMessages;
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1116,13 +1117,12 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    const rawMessages = (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
-    ).map((row) => {
-      return JSON.parse(row.message as string);
-    });
-    return rawMessages;
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getRequestStartTime(requestId: string): number | null {
@@ -1504,10 +1504,12 @@ export class ResponseAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1536,10 +1538,12 @@ export class ResponseContinuationAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1583,10 +1587,12 @@ export class ResponseThrowingAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1636,10 +1642,12 @@ export class ResponseSaveMessagesAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -2650,10 +2658,12 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getPartialText(streamId?: string) {
@@ -2990,10 +3000,12 @@ export class NonChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getOnChatMessageCallCount(): number {
@@ -3052,10 +3064,12 @@ export class RecoveryThrowingAgent extends AIChatAgent<Env> {
   }
 
   getPersistedMessages(): ChatMessage[] {
-    return (
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
       this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
       []
     ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getActiveFibers(): Array<{ id: string; name: string }> {

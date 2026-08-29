@@ -4,6 +4,7 @@ import { describe, it, expect } from "vitest";
 import type { UIMessage as ChatMessage } from "ai";
 import { convertToModelMessages } from "ai";
 import {
+import { wrapLegacyWireWS } from "./test-utils";
   applyChunkToParts,
   type MessageParts,
   type StreamChunkData
@@ -17,7 +18,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -88,7 +89,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -150,7 +151,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -221,7 +222,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -293,7 +294,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -381,7 +382,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -455,7 +456,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -597,7 +598,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -654,7 +655,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -714,7 +715,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -782,7 +783,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -833,7 +834,7 @@ describe("Client-side tool duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -899,7 +900,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -966,7 +967,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1027,7 +1028,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1090,7 +1091,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1150,7 +1151,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1197,7 +1198,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1262,7 +1263,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1329,7 +1330,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1399,7 +1400,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1462,7 +1463,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1699,7 +1700,7 @@ describe("Tool approval persistence across reconnect", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1782,7 +1783,7 @@ describe("Tool approval denial produces tool_result via convertToModelMessages",
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1854,7 +1855,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1915,7 +1916,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -1978,7 +1979,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -2047,7 +2048,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -2106,7 +2107,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -2167,7 +2168,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -2228,7 +2229,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));
@@ -2289,7 +2290,7 @@ describe("CF_AGENT_TOOL_RESULT with approval states and output-error", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = env.TestChatAgent.get(env.TestChatAgent.idFromName(room));

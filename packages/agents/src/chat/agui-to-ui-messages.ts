@@ -55,7 +55,9 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
       ui.push({
         id: r.id,
         role: "assistant",
-        parts: [{ type: "reasoning", text: r.text, state: partState(r.partial) }],
+        parts: [
+          { type: "reasoning", text: r.text, state: partState(r.partial) }
+        ],
         ...(r.metadata !== undefined && { metadata: r.metadata })
       } as UIMessage);
     }

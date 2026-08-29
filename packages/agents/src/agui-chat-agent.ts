@@ -1928,9 +1928,8 @@ export class AGUIChatAgent<
       // the projection so a chunk→event layer anchors streamed text on it
       // instead of opening a new assistant.
       const seedAssistantId = options.continuation
-        ? [...this._aguiMessages]
-            .reverse()
-            .find((m) => m.role === "assistant")?.id
+        ? [...this._aguiMessages].reverse().find((m) => m.role === "assistant")
+            ?.id
         : undefined;
       return this._projectHandlerResponse(
         await this.onChatMessage(onFinish, options),
@@ -2352,7 +2351,11 @@ export class AGUIChatAgent<
         // though the SSE body ended cleanly — legacy parity: an `error`
         // chunk resolves the turn with `status: "error"` for hooks/callers.
         const runError = accumulator.lastError;
-        if (streamCompleted && streamResult.status === "completed" && runError) {
+        if (
+          streamCompleted &&
+          streamResult.status === "completed" &&
+          runError
+        ) {
           streamResult = { status: "error", error: runError.message };
         }
 
@@ -4355,6 +4358,36 @@ export class AGUIChatAgent<
     return AGUIChatAgent._extractLatestAssistantText(messagesAfterStart);
   }
 
+  // Dispatch seams for the three agent-tool hooks, mirroring
+  // `_invokeChatResponseHook`: a projection layer overrides these to adapt
+  // the hook vocabulary (the AI SDK shim keeps `UIMessage`), so the engine
+  // never calls a user override with the wrong shapes.
+
+  /** Dispatch seam for {@link formatAgentToolInput}. */
+  protected _invokeFormatAgentToolInput(
+    input: unknown,
+    request: { runId: string }
+  ): AGUIMessage {
+    return this.formatAgentToolInput(input, request);
+  }
+
+  /** Dispatch seam for {@link getAgentToolOutput}. */
+  protected _invokeGetAgentToolOutput(
+    request: { runId: string; input: unknown },
+    messagesAfterStart: readonly AGUIMessage[]
+  ): unknown {
+    return this.getAgentToolOutput(request, messagesAfterStart);
+  }
+
+  /** Dispatch seam for {@link getAgentToolSummary}. */
+  protected _invokeGetAgentToolSummary(
+    request: { runId: string; input: unknown },
+    output: unknown,
+    messagesAfterStart: readonly AGUIMessage[]
+  ): string {
+    return this.getAgentToolSummary(request, output, messagesAfterStart);
+  }
+
   /**
    * Override to customize the concise summary stored on the parent run.
    */
@@ -4717,7 +4750,7 @@ export class AGUIChatAgent<
             this._registerAgentToolTurn(options.runId);
             return [
               ...messages,
-              this.formatAgentToolInput(input, { runId: options.runId })
+              this._invokeFormatAgentToolInput(input, { runId: options.runId })
             ];
           },
           { signal: controller.signal }
@@ -4764,11 +4797,11 @@ export class AGUIChatAgent<
         const messagesAfterStart = this._getAgentToolMessagesAfterStart(
           options.runId
         );
-        const output = this.getAgentToolOutput(
+        const output = this._invokeGetAgentToolOutput(
           { runId: options.runId, input },
           messagesAfterStart
         );
-        const summary = this.getAgentToolSummary(
+        const summary = this._invokeGetAgentToolSummary(
           { runId: options.runId, input },
           output,
           messagesAfterStart
@@ -4888,11 +4921,11 @@ export class AGUIChatAgent<
       messagesAfterStart.some((message) => message.role === "assistant");
     if (recoveredTurn) {
       const input = AGUIChatAgent._parseAgentToolValue(row.input_json);
-      const output = this.getAgentToolOutput(
+      const output = this._invokeGetAgentToolOutput(
         { runId, input },
         messagesAfterStart
       );
-      const summary = this.getAgentToolSummary(
+      const summary = this._invokeGetAgentToolSummary(
         { runId, input },
         output,
         messagesAfterStart
@@ -4987,7 +5020,7 @@ export class AGUIChatAgent<
     const output =
       row.status === "completed"
         ? (AGUIChatAgent._parseAgentToolValue(row.output_json) ??
-          this.getAgentToolOutput({ runId, input }, messagesAfterStart))
+          this._invokeGetAgentToolOutput({ runId, input }, messagesAfterStart))
         : undefined;
 
     const progress = AGUIChatAgent._progressSnapshotFromRow(row);

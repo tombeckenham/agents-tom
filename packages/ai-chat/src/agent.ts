@@ -222,6 +222,109 @@ export class AIChatAgent<
   }
 
   // ──────────────────────────────────────────────────────────────────
+  // Agent-tool hook projection (legacy UIMessage vocabulary)
+  // ──────────────────────────────────────────────────────────────────
+
+  /** Same contract as the legacy hook: build the synthetic user message
+   * (UIMessage) that starts a headless child turn. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override formatAgentToolInput(
+    input: unknown,
+    request: { runId: string }
+  ): ChatMessage {
+    let text: string;
+    try {
+      text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+    } catch {
+      text = String(input);
+    }
+    return {
+      id: `agent-tool-${request.runId}-input`,
+      role: "user",
+      parts: [{ type: "text", text }]
+    };
+  }
+
+  /** Same contract as the legacy hook; `messagesAfterStart` is `UIMessage[]`. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override getAgentToolOutput(
+    _request: { runId: string; input: unknown },
+    messagesAfterStart: readonly ChatMessage[]
+  ): unknown {
+    return AIChatAgent._latestAssistantText(messagesAfterStart);
+  }
+
+  /** Same contract as the legacy hook; `messagesAfterStart` is `UIMessage[]`. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override getAgentToolSummary(
+    _request: { runId: string; input: unknown },
+    output: unknown,
+    messagesAfterStart: readonly ChatMessage[]
+  ): string {
+    if (typeof output === "string") return output;
+    if (output === undefined) {
+      return AIChatAgent._latestAssistantText(messagesAfterStart) ?? "";
+    }
+    try {
+      return JSON.stringify(output);
+    } catch {
+      return String(output);
+    }
+  }
+
+  private static _latestAssistantText(
+    messages: readonly ChatMessage[]
+  ): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== "assistant") continue;
+      const text = message.parts
+        .filter(
+          (part): part is Extract<typeof part, { type: "text" }> =>
+            part.type === "text"
+        )
+        .map((part) => part.text)
+        .join("");
+      if (text) return text;
+    }
+    return undefined;
+  }
+
+  protected override _invokeFormatAgentToolInput(
+    input: unknown,
+    request: { runId: string }
+  ): AGUIMessage {
+    const legacy = this.formatAgentToolInput(input, request);
+    const migrated = autoTransformAGUIMessages([legacy]);
+    const row = migrated[0];
+    if (!row) {
+      throw new Error(
+        "[AIChatAgent] formatAgentToolInput returned a message that cannot be persisted"
+      );
+    }
+    return row;
+  }
+
+  protected override _invokeGetAgentToolOutput(
+    request: { runId: string; input: unknown },
+    messagesAfterStart: readonly AGUIMessage[]
+  ): unknown {
+    return this.getAgentToolOutput(request, toUIMessages(messagesAfterStart));
+  }
+
+  protected override _invokeGetAgentToolSummary(
+    request: { runId: string; input: unknown },
+    output: unknown,
+    messagesAfterStart: readonly AGUIMessage[]
+  ): string {
+    return this.getAgentToolSummary(
+      request,
+      output,
+      toUIMessages(messagesAfterStart)
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────
   // sanitizeMessageForPersistence projection
   // ──────────────────────────────────────────────────────────────────
 

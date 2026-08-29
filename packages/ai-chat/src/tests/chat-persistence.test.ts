@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { MessageType } from "../types";
 import type { UIMessage as ChatMessage } from "ai";
-import { connectChatWS } from "./test-utils";
+import { connectChatWS, wrapLegacyWireWS } from "./test-utils";
 import { getAgentByName } from "agents";
 
 // Type helper for tool call parts - extracts ToolUIPart from ChatMessage parts
@@ -193,7 +193,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -245,7 +245,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -345,7 +345,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
