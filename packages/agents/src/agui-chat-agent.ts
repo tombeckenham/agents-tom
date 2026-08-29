@@ -121,7 +121,11 @@ import {
   CHAT_MESSAGE_TYPES,
   type StreamResumeNoneReason
 } from "./chat/protocol";
-import { ResumableStream } from "./chat/resumable-stream";
+import {
+  cleanupStreamBuffers,
+  ResumableStream,
+  STREAM_CLEANUP_DELAY_SECONDS
+} from "./chat/resumable-stream";
 import { ResumeHandshake } from "./chat/resume-handshake";
 import {
   ChatStreamStalledError,
@@ -512,6 +516,9 @@ export class AGUIChatAgent<
    * call keeps looking unanswered in `this.messages` until the continuation
    * executes it — without this the completeness gate would park forever on a
    * batch whose only outstanding member is an already-approved tool.
+   *
+   * Pruned when the call's `ToolMessage` lands (the persisted result takes
+   * over as the answer) and on `resetTurnState`.
    */
   private _decidedApprovals = new Set<string>();
 
@@ -1164,6 +1171,8 @@ export class AGUIChatAgent<
       // First-write-wins — duplicate frames / second-tab races are no-ops.
       return true;
     }
+    // A real result supersedes any approval-decision placeholder for this call.
+    this._decidedApprovals.delete(toolCallId);
 
     // Locate the assistant that owns the call so the new tool message can
     // be inserted immediately after it. Falls back to append if the
@@ -1228,15 +1237,29 @@ export class AGUIChatAgent<
   }
 
   /**
-   * Apply a tool-approval decision by broadcasting a CF custom AG-UI event
-   * and persisting the current message snapshot so the decision survives
-   * hibernation. The approval custom event is also fed into any in-flight
-   * accumulator so the next continuation turn sees it.
+   * Apply a tool-approval decision.
+   *
+   * AG-UI has no per-call approval state in the message shape, so the decision
+   * lives in exactly two places: the broadcast `CUSTOM` event live clients
+   * render from, and the in-isolate {@link _decidedApprovals} ledger the
+   * batch-completeness gate reads. The message snapshot is re-persisted only so
+   * a refresh mid-decision keeps whatever the turn had produced so far — it
+   * does NOT carry the decision, which is why an isolate restart before the
+   * continuation runs loses it and the client replays the approval.
    */
   private async _applyToolApproval(
     toolCallId: string,
     approved: boolean
   ): Promise<boolean> {
+    if (!this._hasToolCall(toolCallId)) {
+      // No assistant ever issued this call: record nothing (a bogus id must not
+      // enter the completeness ledger and settle a batch it isn't part of) and
+      // report failure, mirroring the legacy not-found path.
+      console.warn(
+        `[AGUIChatAgent] _applyToolApproval: no tool call with id ${toolCallId}`
+      );
+      return false;
+    }
     const value: CFToolApprovalDecisionValue = {
       toolCallId,
       approvalId: `approval-${nanoid()}`,
@@ -1265,6 +1288,15 @@ export class AGUIChatAgent<
       await this.persistMessages(this.messages);
     }
     return true;
+  }
+
+  /** Whether any assistant — persisted or still streaming — issued this call. */
+  private _hasToolCall(toolCallId: string): boolean {
+    return this._messagesForClientSync().some(
+      (m) =>
+        m.role === "assistant" &&
+        (m.toolCalls?.some((tc) => tc.id === toolCallId) ?? false)
+    );
   }
 
   /** Whether the in-flight turn's assistant issued this tool call. */
@@ -1759,6 +1791,10 @@ export class AGUIChatAgent<
         type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
         ...(options.continuation && { continuation: true })
       });
+      // Durable record too (#1645): this turn never reaches the stream-result
+      // path that records terminals, so without it a client disconnected at
+      // this instant learns nothing on reconnect.
+      await this._recordChatTerminal(options.requestId, message);
       this._emit("message:error", { error: message });
       throw error;
     }
@@ -1942,6 +1978,7 @@ export class AGUIChatAgent<
               async () => {
                 const autoBody = async () => {
                   try {
+                    await this._repairInterruptedToolsBeforeTurn();
                     const response = await this._invokeChatHandler(
                       async (_finishResult) => {},
                       {
@@ -2051,9 +2088,10 @@ export class AGUIChatAgent<
         // messages are persisted — so the re-armed check sees the whole batch.
         this._streamingTurnActive = true;
 
-        const streamCompleted = { value: false };
+        // Whether the stream function returned normally — drives the success
+        // `message:response` emit below. Never true on the catch path.
+        let streamCompleted = false;
         let streamResult: StreamResultStatus = { status: "completed" };
-        let earlyPersistedAssistantId: string | null = null;
         // Set when a stall watchdog abort was routed into bounded recovery
         // (#1626): a continuation (or terminal exhaustion) now owns the turn,
         // so the terminal error frame and the success `message:response` emit
@@ -2084,16 +2122,13 @@ export class AGUIChatAgent<
               )
             };
           }
-          streamCompleted.value = true;
+          streamCompleted = true;
         } catch (error) {
           // A stall watchdog abort (#1626) is a recoverable interruption, not a
           // terminal error: the partial is persisted below (the same path a
           // normal turn uses, so the continuation re-anchors onto it via
           // `targetAssistantId`) and the turn routes into bounded recovery.
-          if (
-            error instanceof ChatStreamStalledError &&
-            !streamCompleted.value
-          ) {
+          if (error instanceof ChatStreamStalledError) {
             const outcome = await this._routeStallToBoundedRecovery({
               requestId: id,
               streamId,
@@ -2122,7 +2157,6 @@ export class AGUIChatAgent<
             // `aborted` (not `error`) so this attempt does not terminalize the
             // turn for callers (continueLastTurn / saveMessages / recovery).
             streamResult = { status: "aborted" };
-            streamCompleted.value = true;
             stallRouted = true;
           } else {
             // Mid-stream failure resolves (not rethrows) with `status: "error"`
@@ -2147,11 +2181,10 @@ export class AGUIChatAgent<
           this._streamingAccumulator = null;
           this._streamingMessages = null;
           this._streamingAssistantId = null;
-          earlyPersistedAssistantId = this._approvalPersistedAssistantId;
           this._approvalPersistedAssistantId = null;
           if (chatMessageId) {
             this._abortRegistry.remove(chatMessageId);
-            if (streamCompleted.value && !stallRouted) {
+            if (streamCompleted && !stallRouted) {
               this._emit("message:response");
             }
           }
@@ -2160,11 +2193,7 @@ export class AGUIChatAgent<
         if (accumulator.messages.length > 0) {
           await this._persistStreamResult(
             accumulator.messages,
-            excludeBroadcastIds,
-            {
-              continuation,
-              earlyPersistedAssistantId
-            }
+            excludeBroadcastIds
           );
         }
 
@@ -2287,7 +2316,13 @@ export class AGUIChatAgent<
       if (done) {
         if (abortSignal?.aborted) break;
         if (buffer.length > 0) {
-          this._consumeSSELine(buffer, accumulator, streamId, id, continuation);
+          await this._consumeSSELine(
+            buffer,
+            accumulator,
+            streamId,
+            id,
+            continuation
+          );
         }
         this._completeStream(streamId);
         this._broadcastChatMessage({
@@ -2308,15 +2343,22 @@ export class AGUIChatAgent<
         const line = buffer.slice(0, nlIdx);
         buffer = buffer.slice(nlIdx + 1);
         if (line.length > 0) {
-          this._consumeSSELine(line, accumulator, streamId, id, continuation);
+          await this._consumeSSELine(
+            line,
+            accumulator,
+            streamId,
+            id,
+            continuation
+          );
         }
         nlIdx = buffer.indexOf("\n");
       }
     }
 
-    if (!abortSignal?.aborted) {
-      return "completed";
-    }
+    // Every `break` above is guarded by `abortSignal.aborted`, so this is the
+    // abort path. Finish the stream unconditionally anyway: if that invariant
+    // ever changes, a client must still get a terminal frame rather than be
+    // stranded mid-stream.
     this._completeStream(streamId);
     this._broadcastChatMessage({
       body: "",
@@ -2325,16 +2367,16 @@ export class AGUIChatAgent<
       type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
       ...(continuation && { continuation: true })
     });
-    return "aborted";
+    return abortSignal?.aborted ? "aborted" : "completed";
   }
 
-  private _consumeSSELine(
+  private async _consumeSSELine(
     line: string,
     accumulator: AGUIStreamAccumulator,
     streamId: string,
     id: string,
     continuation: boolean
-  ): void {
+  ): Promise<void> {
     const event = parseAGUIEventLine(line);
     if (!event) return;
     const action = accumulator.applyEvent(event);
@@ -2355,7 +2397,7 @@ export class AGUIChatAgent<
     // Store & broadcast every event regardless of action — clients drive
     // their UI from the raw event stream.
     const body = JSON.stringify(event);
-    this._storeStreamChunk(streamId, body);
+    await this._storeStreamChunk(streamId, body);
     this._broadcastChatMessage({
       body,
       done: false,
@@ -2385,7 +2427,7 @@ export class AGUIChatAgent<
     const messageId =
       this._streamingAssistantId ??
       `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-    this._emitSynthetic(
+    await this._emitSynthetic(
       { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
       accumulator,
       streamId,
@@ -2415,7 +2457,7 @@ export class AGUIChatAgent<
       const { done, value } = readResult;
       if (done) {
         if (abortSignal?.aborted) break;
-        this._emitSynthetic(
+        await this._emitSynthetic(
           { type: "TEXT_MESSAGE_END", messageId },
           accumulator,
           streamId,
@@ -2434,7 +2476,7 @@ export class AGUIChatAgent<
       }
       const chunk = decoder.decode(value);
       if (chunk.length > 0) {
-        this._emitSynthetic(
+        await this._emitSynthetic(
           { type: "TEXT_MESSAGE_CONTENT", messageId, delta: chunk },
           accumulator,
           streamId,
@@ -2444,7 +2486,7 @@ export class AGUIChatAgent<
       }
     }
 
-    this._emitSynthetic(
+    await this._emitSynthetic(
       { type: "TEXT_MESSAGE_END", messageId },
       accumulator,
       streamId,
@@ -2462,16 +2504,16 @@ export class AGUIChatAgent<
     return "aborted";
   }
 
-  private _emitSynthetic(
+  private async _emitSynthetic(
     event: AGUIEvent,
     accumulator: AGUIStreamAccumulator,
     streamId: string,
     id: string,
     continuation: boolean
-  ): void {
+  ): Promise<void> {
     accumulator.applyEvent(event);
     const body = JSON.stringify(event);
-    this._storeStreamChunk(streamId, body);
+    await this._storeStreamChunk(streamId, body);
     this._broadcastChatMessage({
       body,
       done: false,
@@ -2490,6 +2532,14 @@ export class AGUIChatAgent<
       const safe = enforceRowSizeLimit(sanitized);
       const persisted = wrapPersistedShape(safe);
       const json = JSON.stringify(persisted);
+      // Same guard as `persistMessages`: an oversized row would throw here and
+      // surface as a terminal stream error rather than a skipped snapshot.
+      if (aguiByteLength(json) > ROW_MAX_BYTES) {
+        console.warn(
+          `[AGUIChatAgent] Skipping approval snapshot of ${safe.id}: row exceeds size limit after enforcement`
+        );
+        continue;
+      }
       this.sql`
 				insert into cf_ai_chat_agent_messages (id, message)
 				values (${safe.id}, ${json})
@@ -2505,11 +2555,7 @@ export class AGUIChatAgent<
 
   private async _persistStreamResult(
     streamedMessages: readonly AGUIMessage[],
-    excludeBroadcastIds: string[],
-    _options: {
-      continuation: boolean;
-      earlyPersistedAssistantId: string | null;
-    }
+    excludeBroadcastIds: string[]
   ): Promise<void> {
     // `streamedMessages` is the full snapshot the reducer produced for this
     // turn (assistant + tool messages, potentially seeded from the previous
@@ -2577,8 +2623,42 @@ export class AGUIChatAgent<
       this._flushAwaitingStreamStartConnections();
       this._activateDeferredAutoContinuation();
     }
+    // Arm the buffer sweep on START so an idle/one-off chat DO still reclaims
+    // its chunk rows even if the turn never finalizes (#1706). The sweep's
+    // last-activity threshold keeps an actively streaming run alive.
+    void this._ensureStreamCleanupScheduled();
     return streamId;
   }
+
+  /**
+   * Ensure a single cleanup alarm is pending for this DO's resumable-stream
+   * buffers. `idempotent` dedupes on (callback, payload, owner) so repeated
+   * arming collapses onto one row.
+   * @internal
+   */
+  protected async _ensureStreamCleanupScheduled({
+    idempotent = true
+  }: { idempotent?: boolean } = {}): Promise<void> {
+    await this.schedule(
+      STREAM_CLEANUP_DELAY_SECONDS,
+      "_cleanupStreamBuffers",
+      undefined,
+      { idempotent }
+    );
+  }
+
+  /**
+   * Alarm callback: sweep aged stream buffers, re-arming while rows remain (see
+   * the shared {@link cleanupStreamBuffers}). Public so it is reachable as a
+   * schedule callback.
+   * @internal
+   */
+  async _cleanupStreamBuffers(): Promise<void> {
+    await cleanupStreamBuffers(this._resumableStream, () =>
+      this._ensureStreamCleanupScheduled({ idempotent: false })
+    );
+  }
+
   protected _completeStream(streamId: string) {
     const completedRequestId = this._resumableStream.activeRequestId;
     this._resumableStream.complete(streamId);
@@ -2588,7 +2668,7 @@ export class AGUIChatAgent<
       this._continuation.activeConnectionId = null;
     }
   }
-  protected _storeStreamChunk(streamId: string, body: string) {
+  protected async _storeStreamChunk(streamId: string, body: string) {
     this._resumableStream.storeChunk(streamId, body);
     // Credit recovery forward progress at production time (#1637): milestones
     // always, streaming deltas through the shared throttle. Immune to client
@@ -2608,7 +2688,10 @@ export class AGUIChatAgent<
         now: Date.now()
       })
     ) {
-      this._bumpChatRecoveryProgress().catch(() => {});
+      // Awaited, not fire-and-forget: the bump is a get-then-put, so
+      // interleaved unawaited bumps lose increments and a write in flight at
+      // isolate teardown is dropped.
+      await this._bumpChatRecoveryProgress();
     }
   }
   protected _flushChunkBuffer() {
@@ -3072,6 +3155,7 @@ export class AGUIChatAgent<
         this._persistOrphanedStream(streamId),
       completeRecoveredStream: (streamId) => {
         this._resumableStream.complete(streamId);
+        void this._ensureStreamCleanupScheduled();
       },
       dispatchRecoveredTurn: (input) => this._dispatchRecoveredChatTurn(input)
     } satisfies ChatFiberWakeHooks<AGUIRecoveryClassification>);

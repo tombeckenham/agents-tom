@@ -139,13 +139,19 @@ describe("AGUIChatAgent — pre-stream resume window (#1784)", () => {
     sendChatRequest(ws1, "req-no-stream", [userMessage("u1", "hi")]);
 
     // ws2 was already connected, so it is not parked by onConnect; probe it
-    // into the park instead, racing the turn. Either it parks and is released,
-    // or the turn already settled and it gets RESUME_NONE straight away —
-    // both end at "not waiting forever", which is the contract.
+    // into the park instead, racing the turn. It parks and is released, or the
+    // turn already settled and it is answered straight away — with RESUME_NONE
+    // if nothing is left to say, or with the resume handshake that carries the
+    // recorded terminal (#1645), since a pre-Response throw is a terminal turn.
+    // All three end at "not waiting forever", which is the contract.
     ws2.send(
       JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST })
     );
-    await rec2.waitFor((f) => f.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE);
+    await rec2.waitFor(
+      (f) =>
+        f.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE ||
+        f.type === CHAT_MESSAGE_TYPES.STREAM_RESUMING
+    );
 
     ws1.close(1000);
     ws2.close(1000);
