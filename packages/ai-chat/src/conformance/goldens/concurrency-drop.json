@@ -5,9 +5,37 @@
       "label": "client-1",
       "frames": [
         {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-3"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-3",
+            "delta": "before-gate "
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
           "messages": [
             {
-              "id": "id-1",
+              "id": "id-4",
               "role": "user",
               "parts": [
                 {
@@ -17,7 +45,7 @@
               ]
             },
             {
-              "id": "id-2",
+              "id": "id-1",
               "role": "assistant",
               "parts": [
                 {
@@ -31,50 +59,28 @@
           "type": "cf_agent_chat_messages"
         },
         {
-          "body": {
-            "type": "start",
-            "messageId": "id-2"
-          },
-          "done": false,
-          "id": "id-3",
-          "type": "cf_agent_use_chat_response"
-        },
-        {
-          "body": {
-            "type": "text-start",
-            "id": "id-4"
-          },
-          "done": false,
-          "id": "id-3",
+          "body": "",
+          "done": true,
+          "id": "id-5",
           "type": "cf_agent_use_chat_response"
         },
         {
           "body": {
             "type": "text-delta",
-            "id": "id-4",
-            "delta": "before-gate "
-          },
-          "done": false,
-          "id": "id-3",
-          "type": "cf_agent_use_chat_response"
-        },
-        {
-          "body": {
-            "type": "text-delta",
-            "id": "id-4",
+            "id": "id-3",
             "delta": "after-gate"
           },
           "done": false,
-          "id": "id-3",
+          "id": "id-2",
           "type": "cf_agent_use_chat_response"
         },
         {
           "body": {
             "type": "text-end",
-            "id": "id-4"
+            "id": "id-3"
           },
           "done": false,
-          "id": "id-3",
+          "id": "id-2",
           "type": "cf_agent_use_chat_response"
         },
         {
@@ -82,29 +88,32 @@
             "type": "finish"
           },
           "done": false,
-          "id": "id-3",
+          "id": "id-2",
           "type": "cf_agent_use_chat_response"
         },
         {
           "body": "",
           "done": true,
-          "id": "id-3",
-          "type": "cf_agent_use_chat_response"
-        },
-        {
-          "body": "",
-          "done": true,
-          "id": "id-5",
+          "id": "id-2",
           "type": "cf_agent_use_chat_response"
         }
       ]
     }
   ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
   "persistedRows": [
     {
-      "id": "id-1",
+      "id": "id-4",
       "message": {
-        "id": "id-1",
+        "id": "id-4",
         "role": "user",
         "parts": [
           {
@@ -116,9 +125,9 @@
       "created_at": "TS"
     },
     {
-      "id": "id-2",
+      "id": "id-1",
       "message": {
-        "id": "id-2",
+        "id": "id-1",
         "role": "assistant",
         "parts": [
           {
@@ -133,7 +142,7 @@
   ],
   "clientView": [
     {
-      "id": "id-1",
+      "id": "id-4",
       "role": "user",
       "parts": [
         {
@@ -143,7 +152,7 @@
       ]
     },
     {
-      "id": "id-2",
+      "id": "id-1",
       "role": "assistant",
       "parts": [
         {

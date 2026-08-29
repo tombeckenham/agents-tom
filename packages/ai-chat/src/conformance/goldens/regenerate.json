@@ -129,6 +129,22 @@
       ]
     }
   ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-5",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-4"
+    }
+  ],
   "persistedRows": [
     {
       "id": "id-6",

@@ -6,12 +6,13 @@
  * `./goldens/`. Re-record with `UPDATE_GOLDENS=1 pnpm test:conformance`.
  */
 
-import { env, exports } from "cloudflare:workers";
-import { afterAll, beforeAll, describe, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { describe, it } from "vitest";
 import { type Agent, getAgentByName } from "agents";
 import type { UIMessage as ChatMessage } from "ai";
 import { MessageType } from "../types";
 import {
+  type Client,
   connectClient,
   expectGolden,
   fetchClientView,
@@ -26,13 +27,6 @@ import {
   userMessage
 } from "./harness";
 
-// Warm up the worker module graph before tests run (mirrors src/tests/setup.ts).
-beforeAll(async () => {
-  await exports.default.fetch("http://warmup/");
-}, 30_000);
-
-afterAll(() => new Promise((resolve) => setTimeout(resolve, 100)));
-
 async function waitUntil(
   predicate: () => Promise<boolean>,
   timeoutMs = 5000
@@ -43,6 +37,27 @@ async function waitUntil(
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`waitUntil timed out after ${timeoutMs}ms`);
+}
+
+/**
+ * Ack a server-initiated continuation stream so its chunks replay to the
+ * client (real clients always ack). The scripted continuation completes
+ * before the ack round-trip, so the replay ends with a replayed done frame
+ * (no replayComplete, which only live streams send).
+ */
+async function ackContinuation(client: Client): Promise<void> {
+  const resuming = await client.waitFor(
+    (f) => f.type === MessageType.CF_AGENT_STREAM_RESUMING
+  );
+  client.ws.send(
+    JSON.stringify({
+      type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+      id: resuming.id
+    })
+  );
+  await client.waitFor(
+    (f) => isDone(resuming.id as string)(f) && f.replay === true
+  );
 }
 
 async function scripted<T extends Agent<Cloudflare.Env>>(
@@ -99,8 +114,27 @@ describe("conformance: legacy AIChatAgent", () => {
     await runScriptedScenario("plaintext-response", "plaintext");
   });
 
-  it("no response body", async () => {
-    await runScriptedScenario("no-response", "no-response");
+  it("empty response body", async () => {
+    await runScriptedScenario("empty-response-body", "empty-response-body");
+  });
+
+  it("no response", async () => {
+    // onChatMessage returns undefined — legacy broadcasts a "No response was
+    // generated" done frame to OTHER clients (the requester is excluded).
+    const { path, stub } = await scripted(env.ScriptedAgent, "scripted-agent");
+    const c1 = await connectClient(path);
+    const c2 = await connectClient(path);
+    sendChatRequest(c1, "req-1", [userMessage("u-1", "hello")], {
+      scenario: "no-response"
+    });
+    await c2.waitFor(isDone("req-1"));
+    const trace = await finishTrace({
+      scenario: "no-response",
+      path,
+      stub,
+      clients: [c1, c2]
+    });
+    await expectGolden("no-response", trace);
   });
 
   it("error mid-stream", async () => {
@@ -109,7 +143,9 @@ describe("conformance: legacy AIChatAgent", () => {
 
   it("pre-Response throw", async () => {
     // Legacy behavior: an onChatMessage throw before a Response is produced
-    // sends NO wire frame to the requesting client — the trace pins that.
+    // sends NO wire frame to the requesting client — the trace pins that
+    // silence. Expected to diverge (improve) in Phase 3: the AG-UI engine
+    // broadcasts a terminal error:true done frame instead.
     const { path, stub } = await scripted(env.ScriptedAgent, "scripted-agent");
     const client = await connectClient(path);
     sendChatRequest(client, "req-1", [userMessage("u-1", "hello")], {
@@ -143,7 +179,7 @@ describe("conformance: legacy AIChatAgent", () => {
     });
     await client.waitFor(isDone("req-1"));
     sendToolResult(client, "call-client-1", "clientEcho", { echoed: "hi" });
-    await client.waitFor((f) => isAnyDone(f) && f.id !== "req-1");
+    await ackContinuation(client);
     const trace = await finishTrace({
       scenario: "client-tool-continuation",
       path,
@@ -161,7 +197,7 @@ describe("conformance: legacy AIChatAgent", () => {
     });
     await client.waitFor(isDone("req-1"));
     sendToolApproval(client, "call-approval-1", true);
-    await client.waitFor((f) => isAnyDone(f) && f.id !== "req-1");
+    await ackContinuation(client);
     const trace = await finishTrace({
       scenario: "tool-approval-approve",
       path,
@@ -179,7 +215,7 @@ describe("conformance: legacy AIChatAgent", () => {
     });
     await client.waitFor(isDone("req-1"));
     sendToolApproval(client, "call-approval-1", false);
-    await client.waitFor((f) => isAnyDone(f) && f.id !== "req-1");
+    await ackContinuation(client);
     const trace = await finishTrace({
       scenario: "tool-approval-deny",
       path,
@@ -310,6 +346,7 @@ describe("conformance: legacy AIChatAgent", () => {
       userMessage("u-a", "first"),
       userMessage("u-b", "second")
     ]);
+    await waitUntil(async () => (await stub.queueDepth()) >= 1);
     await stub.release();
     await client.waitFor(isDone("req-a"));
     await client.waitFor(isDone("req-b"));
@@ -370,14 +407,105 @@ describe("conformance: legacy AIChatAgent", () => {
     await client.waitFor(isDone("req-b"));
     await stub.release();
     await client.waitFor(isDone("req-a"));
+    // No frame sorting: the gate makes drop's interleaving deterministic, and
+    // arrival order is what shows the drop (done-b lands mid-stream of a).
     const trace = await finishTrace({
       scenario: "concurrency-drop",
+      path,
+      stub,
+      clients: [client]
+    });
+    await expectGolden("concurrency-drop", trace);
+  });
+
+  it("messageConcurrency: merge", async () => {
+    // `merge` keeps every queued user message but runs only the newest
+    // queued overlapping submit, rewriting persisted rows (_deleteStaleRows).
+    const { path, stub } = await scripted(
+      env.MergeGatedAgent,
+      "merge-gated-agent"
+    );
+    const client = await connectClient(path);
+    sendChatRequest(client, "req-a", [userMessage("u-a", "first")]);
+    await client.waitFor(isTextDelta);
+    sendChatRequest(client, "req-b", [
+      userMessage("u-a", "first"),
+      userMessage("u-b", "second")
+    ]);
+    sendChatRequest(client, "req-c", [
+      userMessage("u-a", "first"),
+      userMessage("u-b", "second"),
+      userMessage("u-c", "third")
+    ]);
+    await waitUntil(async () => (await stub.overlapping()) >= 2);
+    await stub.release();
+    await client.waitFor(isDone("req-a"));
+    await client.waitFor(isDone("req-c"));
+    const trace = await finishTrace({
+      scenario: "concurrency-merge",
       path,
       stub,
       clients: [client],
       sortFramesByRequestId: true
     });
-    await expectGolden("concurrency-drop", trace);
+    await expectGolden("concurrency-merge", trace);
+  });
+
+  it("messageConcurrency: debounce", async () => {
+    // 1ms debounce window; the gate holds the queue busy, so both overlapping
+    // submits are queued before the window can resolve — outcome is
+    // timing-independent.
+    const { path, stub } = await scripted(
+      env.DebounceGatedAgent,
+      "debounce-gated-agent"
+    );
+    const client = await connectClient(path);
+    sendChatRequest(client, "req-a", [userMessage("u-a", "first")]);
+    await client.waitFor(isTextDelta);
+    sendChatRequest(client, "req-b", [
+      userMessage("u-a", "first"),
+      userMessage("u-b", "second")
+    ]);
+    sendChatRequest(client, "req-c", [
+      userMessage("u-a", "first"),
+      userMessage("u-b", "second"),
+      userMessage("u-c", "third")
+    ]);
+    await waitUntil(async () => (await stub.overlapping()) >= 2);
+    await stub.release();
+    await client.waitFor(isDone("req-a"));
+    await client.waitFor(isDone("req-c"));
+    const trace = await finishTrace({
+      scenario: "concurrency-debounce",
+      path,
+      stub,
+      clients: [client],
+      sortFramesByRequestId: true
+    });
+    await expectGolden("concurrency-debounce", trace);
+  });
+
+  it("maxPersistedMessages trimming across a tool turn", async () => {
+    // Trimming to 2 rows after a client-tool continuation drops the user row
+    // and can sever tool context — the golden pins exactly what survives.
+    const { path, stub } = await scripted(
+      env.MaxPersistedAgent,
+      "max-persisted-agent"
+    );
+    const client = await connectClient(path);
+    sendChatRequest(client, "req-1", [userMessage("u-1", "use the tool")], {
+      scenario: "client-tool"
+    });
+    await client.waitFor(isDone("req-1"));
+    sendToolResult(client, "call-client-1", "clientEcho", { echoed: "hi" });
+    await ackContinuation(client);
+    const trace = await finishTrace({
+      scenario: "max-persisted-tool-pair",
+      path,
+      stub,
+      clients: [client]
+    });
+    await expectGolden("max-persisted-tool-pair", trace);
   });
 
   it("saveMessages programmatic turn", async () => {

@@ -48,6 +48,16 @@
       ]
     }
   ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "error",
+      "continuation": false,
+      "error": "scripted mid-stream failure",
+      "messageId": "id-1"
+    }
+  ],
   "persistedRows": [
     {
       "id": "id-4",

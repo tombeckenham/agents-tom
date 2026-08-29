@@ -16,6 +16,8 @@
       { "name": "GatedAgent", "class_name": "GatedAgent" },
       { "name": "LatestGatedAgent", "class_name": "LatestGatedAgent" },
       { "name": "DropGatedAgent", "class_name": "DropGatedAgent" },
+      { "name": "MergeGatedAgent", "class_name": "MergeGatedAgent" },
+      { "name": "DebounceGatedAgent", "class_name": "DebounceGatedAgent" },
       { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" }
     ]
   },
@@ -27,6 +29,8 @@
         "GatedAgent",
         "LatestGatedAgent",
         "DropGatedAgent",
+        "MergeGatedAgent",
+        "DebounceGatedAgent",
         "MaxPersistedAgent"
       ]
     }

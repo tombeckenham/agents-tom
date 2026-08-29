@@ -1,5 +1,5 @@
 {
-  "scenario": "tool-approval-deny",
+  "scenario": "max-persisted-tool-pair",
   "clients": [
     {
       "label": "client-1",
@@ -23,11 +23,21 @@
         },
         {
           "body": {
+            "type": "tool-input-start",
+            "toolCallId": "id-3",
+            "toolName": "clientEcho"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
             "type": "tool-input-available",
             "toolCallId": "id-3",
-            "toolName": "riskyTool",
+            "toolName": "clientEcho",
             "input": {
-              "level": 9
+              "text": "hi"
             }
           },
           "done": false,
@@ -36,9 +46,18 @@
         },
         {
           "body": {
-            "type": "tool-approval-request",
-            "toolCallId": "id-3",
-            "approvalId": "id-4"
+            "type": "finish-step"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response"
+        },
+        {
+          "body": {
+            "type": "finish",
+            "messageMetadata": {
+              "finishReason": "tool-calls"
+            }
           },
           "done": false,
           "id": "id-2",
@@ -60,41 +79,41 @@
                 "type": "step-start"
               },
               {
-                "type": "tool-riskyTool",
+                "type": "tool-clientEcho",
                 "toolCallId": "id-3",
-                "toolName": "riskyTool",
-                "state": "output-denied",
+                "toolName": "clientEcho",
+                "state": "output-available",
                 "input": {
-                  "level": 9
+                  "text": "hi"
                 },
-                "approval": {
-                  "id": "id-4",
-                  "approved": false
-                }
+                "output": {
+                  "echoed": "hi"
+                },
+                "preliminary": false
               }
             ]
           }
         },
         {
           "type": "cf_agent_stream_resuming",
-          "id": "id-5"
+          "id": "id-4"
         },
         {
           "body": "",
           "done": true,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "continuation": true
         },
         {
           "messages": [
             {
-              "id": "id-6",
+              "id": "id-5",
               "role": "user",
               "parts": [
                 {
                   "type": "text",
-                  "text": "do it"
+                  "text": "use the tool"
                 }
               ]
             },
@@ -106,21 +125,21 @@
                   "type": "step-start"
                 },
                 {
-                  "type": "tool-riskyTool",
+                  "type": "tool-clientEcho",
                   "toolCallId": "id-3",
-                  "toolName": "riskyTool",
-                  "state": "output-denied",
+                  "toolName": "clientEcho",
+                  "state": "output-available",
                   "input": {
-                    "level": 9
+                    "text": "hi"
                   },
-                  "approval": {
-                    "id": "id-4",
-                    "approved": false
-                  }
+                  "output": {
+                    "echoed": "hi"
+                  },
+                  "preliminary": false
                 },
                 {
                   "type": "text",
-                  "text": "denied — riskyTool not run",
+                  "text": "client tool handled",
                   "state": "done"
                 }
               ]
@@ -133,7 +152,7 @@
             "type": "start"
           },
           "done": false,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -141,10 +160,10 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-7"
+            "id": "id-6"
           },
           "done": false,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -152,11 +171,11 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-7",
-            "delta": "denied — riskyTool not run"
+            "id": "id-6",
+            "delta": "client tool handled"
           },
           "done": false,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -164,10 +183,10 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-7"
+            "id": "id-6"
           },
           "done": false,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -177,7 +196,7 @@
             "type": "finish"
           },
           "done": false,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -185,7 +204,7 @@
         {
           "body": "",
           "done": true,
-          "id": "id-5",
+          "id": "id-4",
           "type": "cf_agent_use_chat_response",
           "replay": true,
           "continuation": true
@@ -203,7 +222,7 @@
     },
     {
       "hook": "onChatResponse",
-      "requestId": "id-5",
+      "requestId": "id-4",
       "status": "completed",
       "continuation": true,
       "messageId": "id-1"
@@ -211,14 +230,14 @@
   ],
   "persistedRows": [
     {
-      "id": "id-6",
+      "id": "id-5",
       "message": {
-        "id": "id-6",
+        "id": "id-5",
         "role": "user",
         "parts": [
           {
             "type": "text",
-            "text": "do it"
+            "text": "use the tool"
           }
         ]
       },
@@ -234,21 +253,21 @@
             "type": "step-start"
           },
           {
-            "type": "tool-riskyTool",
+            "type": "tool-clientEcho",
             "toolCallId": "id-3",
-            "toolName": "riskyTool",
-            "state": "output-denied",
+            "toolName": "clientEcho",
+            "state": "output-available",
             "input": {
-              "level": 9
+              "text": "hi"
             },
-            "approval": {
-              "id": "id-4",
-              "approved": false
-            }
+            "output": {
+              "echoed": "hi"
+            },
+            "preliminary": false
           },
           {
             "type": "text",
-            "text": "denied — riskyTool not run",
+            "text": "client tool handled",
             "state": "done"
           }
         ]
@@ -258,12 +277,12 @@
   ],
   "clientView": [
     {
-      "id": "id-6",
+      "id": "id-5",
       "role": "user",
       "parts": [
         {
           "type": "text",
-          "text": "do it"
+          "text": "use the tool"
         }
       ]
     },
@@ -275,21 +294,21 @@
           "type": "step-start"
         },
         {
-          "type": "tool-riskyTool",
+          "type": "tool-clientEcho",
           "toolCallId": "id-3",
-          "toolName": "riskyTool",
-          "state": "output-denied",
+          "toolName": "clientEcho",
+          "state": "output-available",
           "input": {
-            "level": 9
+            "text": "hi"
           },
-          "approval": {
-            "id": "id-4",
-            "approved": false
-          }
+          "output": {
+            "echoed": "hi"
+          },
+          "preliminary": false
         },
         {
           "type": "text",
-          "text": "denied — riskyTool not run",
+          "text": "client tool handled",
           "state": "done"
         }
       ]

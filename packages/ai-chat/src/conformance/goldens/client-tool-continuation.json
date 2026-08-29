@@ -146,8 +146,86 @@
             }
           ],
           "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": {
+            "type": "start"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-6"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-6",
+            "delta": "client tool handled"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-6"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
         }
       ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-4",
+      "status": "completed",
+      "continuation": true,
+      "messageId": "id-1"
     }
   ],
   "persistedRows": [

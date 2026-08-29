@@ -202,25 +202,17 @@ export async function fetchClientView(path: string): Promise<unknown[]> {
 
 // ── Normalization ────────────────────────────────────────────────────
 
+// Only keys that actually appear in goldens — every extra key is a collision
+// risk with real payload values (e.g. "time" once erased a tool output).
 const ID_KEYS = new Set([
   "id",
   "messageId",
   "toolCallId",
   "approvalId",
-  "parentMessageId",
   "sourceId",
-  "requestId",
-  "request_id",
-  "streamId"
+  "requestId"
 ]);
-const TS_KEYS = new Set([
-  "createdAt",
-  "created_at",
-  "timestamp",
-  "startedAt",
-  "completedAt",
-  "time"
-]);
+const TS_KEYS = new Set(["created_at"]);
 
 export function normalize<T>(value: T): T {
   const ids = new Map<string, string>();
@@ -259,11 +251,13 @@ export function normalize<T>(value: T): T {
 type ConformanceStub = {
   stable(timeout?: number): Promise<boolean>;
   rows(): Promise<unknown>;
+  hooks(): Promise<unknown>;
 };
 
 export type Trace = {
   scenario: string;
   clients: Array<{ label: string; frames: WireFrame[] }>;
+  hooks: unknown[];
   persistedRows: unknown[];
   clientView: unknown[];
 };
@@ -282,6 +276,7 @@ export async function finishTrace(options: {
 }): Promise<Trace> {
   const { scenario, path, stub, clients } = options;
   expect(await stub.stable()).toBe(true);
+  const hooks = (await stub.hooks()) as unknown[];
   const persistedRows = (await stub.rows()) as unknown[];
   const clientView = await fetchClientView(path);
   for (const client of clients) client.close();
@@ -289,12 +284,15 @@ export async function finishTrace(options: {
     scenario,
     clients: clients.map((client, index) => {
       const frames = options.sortFramesByRequestId
-        ? [...client.frames].sort((a, b) =>
-            (a.id ?? "").localeCompare(b.id ?? "")
-          )
+        ? [...client.frames].sort((a, b) => {
+            const left = a.id ?? "";
+            const right = b.id ?? "";
+            return left < right ? -1 : left > right ? 1 : 0;
+          })
         : client.frames;
       return { label: `client-${index + 1}`, frames };
     }),
+    hooks,
     persistedRows,
     clientView
   };

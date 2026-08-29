@@ -7,7 +7,11 @@
  * Adapted from the fixtures in `src/tests/worker.ts`.
  */
 
-import { AIChatAgent, type OnChatMessageOptions } from "../";
+import {
+  AIChatAgent,
+  type ChatResponseResult,
+  type OnChatMessageOptions
+} from "../";
 import type {
   UIMessage as ChatMessage,
   GenerateTextOnFinishCallback,
@@ -51,6 +55,7 @@ function textRun(id: string, deltas: string[]): Record<string, unknown>[] {
 /** Shared RPC surface the harness uses to settle and inspect a fixture DO. */
 class ConformanceBase extends AIChatAgent<Env> {
   protected _chatMessageCalls = 0;
+  private _hookCalls: Array<Record<string, unknown>> = [];
 
   /** Wait for the turn queue + interaction applies to drain. */
   async stable(timeout = 8000): Promise<boolean> {
@@ -62,6 +67,38 @@ class ConformanceBase extends AIChatAgent<Env> {
     return this._chatMessageCalls;
   }
 
+  /** Recorded lifecycle-hook invocations, in order — part of the trace. */
+  hooks(): Array<Record<string, unknown>> {
+    return this._hookCalls;
+  }
+
+  /** Turn-queue depth — a barrier for queued-overlap scenarios. */
+  queueDepth(): number {
+    return (
+      this as unknown as { _turnQueue: { queuedCount(): number } }
+    )._turnQueue.queuedCount();
+  }
+
+  protected onChatResponse(result: ChatResponseResult): void {
+    this._hookCalls.push({
+      hook: "onChatResponse",
+      requestId: result.requestId,
+      status: result.status,
+      continuation: result.continuation,
+      ...(result.error !== undefined && { error: result.error }),
+      messageId: result.message.id
+    });
+  }
+
+  // Record (and swallow) server errors so the pre-throw scenario's expected
+  // error lands in the trace instead of an uncaught-exception banner.
+  onError(connectionOrError: unknown, error?: unknown): void {
+    this._hookCalls.push({
+      hook: "onError",
+      error: String(error ?? connectionOrError)
+    });
+  }
+
   /** Overlapping-submit count — the concurrency-test barrier (see src/tests). */
   overlapping(): number {
     return (
@@ -71,12 +108,12 @@ class ConformanceBase extends AIChatAgent<Env> {
     )._submitConcurrency.overlappingSubmitCount;
   }
 
-  /** Raw persisted rows, in table order. */
-  rows(): Array<{ id: string; message: unknown; created_at: number }> {
+  /** Raw persisted rows, in table order (rowid tiebreak for same-second ties). */
+  rows(): Array<{ id: string; message: unknown; created_at: string }> {
     return (
-      this.sql<{ id: string; message: string; created_at: number }>`
+      this.sql<{ id: string; message: string; created_at: string }>`
         select id, message, created_at
-        from cf_ai_chat_agent_messages order by created_at
+        from cf_ai_chat_agent_messages order by created_at, rowid
       ` || []
     ).map((row) => ({
       id: row.id,
@@ -133,7 +170,12 @@ export class ScriptedAgent extends ConformanceBase {
           headers: { "Content-Type": "text/plain" }
         });
 
+      // Truly no response — exercises the "No response was generated" branch.
       case "no-response":
+        return undefined;
+
+      // A Response with an empty body — a different legacy branch.
+      case "empty-response-body":
         return new Response(null);
 
       case "reasoning":
@@ -396,6 +438,16 @@ export class DropGatedAgent extends GatedAgent {
   messageConcurrency = "drop" as const;
 }
 
+export class MergeGatedAgent extends GatedAgent {
+  messageConcurrency = "merge" as const;
+}
+
+export class DebounceGatedAgent extends GatedAgent {
+  // 1ms window: the terminal outcome is timing-independent once it elapses,
+  // and the gate holds the queue busy until the test releases it.
+  messageConcurrency = { strategy: "debounce", debounceMs: 1 } as const;
+}
+
 export class MaxPersistedAgent extends ScriptedAgent {
   maxPersistedMessages = 2;
 }
@@ -405,6 +457,8 @@ export type Env = {
   GatedAgent: DurableObjectNamespace<GatedAgent>;
   LatestGatedAgent: DurableObjectNamespace<LatestGatedAgent>;
   DropGatedAgent: DurableObjectNamespace<DropGatedAgent>;
+  MergeGatedAgent: DurableObjectNamespace<MergeGatedAgent>;
+  DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
 };
 

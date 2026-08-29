@@ -84,7 +84,7 @@
             "type": "tool-output-available",
             "toolCallId": "id-4",
             "output": {
-              "time": "TS"
+              "time": "09:00"
             }
           },
           "done": false,
@@ -144,6 +144,15 @@
       ]
     }
   ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
   "persistedRows": [
     {
       "id": "id-6",
@@ -189,7 +198,7 @@
               "zone": "AEST"
             },
             "output": {
-              "time": "TS"
+              "time": "09:00"
             }
           },
           {
@@ -241,7 +250,7 @@
             "zone": "AEST"
           },
           "output": {
-            "time": "TS"
+            "time": "09:00"
           }
         },
         {

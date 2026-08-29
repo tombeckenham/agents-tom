@@ -133,8 +133,110 @@
             }
           ],
           "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": {
+            "type": "start"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "start-step"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "tool-output-available",
+            "toolCallId": "id-3",
+            "output": {
+              "ran": true
+            }
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "id-7"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "id-7",
+            "delta": "approved and ran"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "id-7"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-5",
+          "type": "cf_agent_use_chat_response",
+          "replay": true,
+          "continuation": true
         }
       ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-5",
+      "status": "completed",
+      "continuation": true,
+      "messageId": "id-1"
     }
   ],
   "persistedRows": [

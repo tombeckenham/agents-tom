@@ -20,6 +20,7 @@ export default defineConfig({
   test: {
     name: "conformance",
     include: [path.join(dir, "**/*.test.ts")],
+    setupFiles: [path.join(dir, "../tests/setup.ts")],
     testTimeout: 15_000,
     teardownTimeout: 60_000,
     // Goldens are vitest file snapshots: UPDATE_GOLDENS=1 re-records them.

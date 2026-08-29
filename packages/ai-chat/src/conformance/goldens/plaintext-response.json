@@ -41,11 +41,20 @@
       ]
     }
   ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-1",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-2"
+    }
+  ],
   "persistedRows": [
     {
-      "id": "id-2",
+      "id": "id-3",
       "message": {
-        "id": "id-2",
+        "id": "id-3",
         "role": "user",
         "parts": [
           {
@@ -57,9 +66,9 @@
       "created_at": "TS"
     },
     {
-      "id": "id-3",
+      "id": "id-2",
       "message": {
-        "id": "id-3",
+        "id": "id-2",
         "role": "assistant",
         "parts": [
           {
@@ -74,7 +83,7 @@
   ],
   "clientView": [
     {
-      "id": "id-2",
+      "id": "id-3",
       "role": "user",
       "parts": [
         {
@@ -84,7 +93,7 @@
       ]
     },
     {
-      "id": "id-3",
+      "id": "id-2",
       "role": "assistant",
       "parts": [
         {
