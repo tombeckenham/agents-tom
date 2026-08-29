@@ -155,8 +155,21 @@ describe("Errored stream replay (#1575)", () => {
       "partial-1 ",
       "partial-2 "
     ]);
-    const liveError = liveFrames.find((f) => f.error === true);
-    expect(liveError?.body).toBe("in-band boom");
+    // Post-cutover the in-band error rides an `error` chunk (RUN_ERROR
+    // projected) rather than a raw-body `error: true` frame.
+    const liveError = liveFrames
+      .map((f) => {
+        try {
+          return JSON.parse((f.body as string) || "null") as {
+            type?: string;
+            errorText?: string;
+          };
+        } catch {
+          return null;
+        }
+      })
+      .find((c) => c?.type === "error");
+    expect(liveError?.errorText).toBe("in-band boom");
     liveWs.close(1000);
 
     // Wait for the turn to fully drain (the durable terminal record is

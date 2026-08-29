@@ -362,22 +362,28 @@ export class TestChatAgent extends AIChatAgent<Env> {
   // auto-continuation (issue #1404).
   async testApplyToolResult(
     toolCallId: string,
-    toolName: string,
+    _toolName: string,
     output: unknown,
     overrideState?: "output-error",
     errorText?: string
   ): Promise<boolean> {
+    // Engine signature: (toolCallId, output, errorText?) — the error branch
+    // is selected by a defined errorText.
     return (
       this as unknown as {
         _applyToolResult(
           toolCallId: string,
-          toolName: string,
           output: unknown,
-          overrideState?: "output-error",
           errorText?: string
         ): Promise<boolean>;
       }
-    )._applyToolResult(toolCallId, toolName, output, overrideState, errorText);
+    )._applyToolResult(
+      toolCallId,
+      output,
+      overrideState === "output-error"
+        ? (errorText ?? "Tool execution failed.")
+        : undefined
+    );
   }
 
   private _getChainedContinuationRegressionResponse(): Response | undefined {
@@ -527,9 +533,8 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   isChatTurnActiveForTest(): boolean {
-    return (
-      this as unknown as { _turnQueue: { isActive: boolean } }
-    )._turnQueue.isActive;
+    return (this as unknown as { _turnQueue: { isActive: boolean } })._turnQueue
+      .isActive;
   }
 
   async waitForIdleForTest(): Promise<void> {
@@ -1217,9 +1222,8 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
   }
 
   isChatTurnActiveForTest(): boolean {
-    return (
-      this as unknown as { _turnQueue: { isActive: boolean } }
-    )._turnQueue.isActive;
+    return (this as unknown as { _turnQueue: { isActive: boolean } })._turnQueue
+      .isActive;
   }
 
   async waitForIdleForTest(): Promise<boolean> {
@@ -2102,7 +2106,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
         type: "TOOL_CALL_RESULT",
         messageId: "tool-tc1",
         toolCallId: "tc1",
-        content: "{\"ok\":true}",
+        content: '{"ok":true}',
         role: "tool"
       })
     );

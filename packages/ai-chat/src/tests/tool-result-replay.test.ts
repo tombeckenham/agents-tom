@@ -191,6 +191,8 @@ describe("Tool result idempotency (issue #1404)", () => {
       )
     ).toBe(true);
 
+    // Let the first apply's frames drain before counting.
+    await new Promise((resolve) => setTimeout(resolve, 150));
     const broadcasts = collectMessages(ws);
 
     expect(
@@ -275,17 +277,15 @@ describe("Tool result idempotency (issue #1404)", () => {
       m.parts.filter((p) => "toolCallId" in p && p.toolCallId === toolCallId)
     ) as Array<Record<string, unknown>>;
 
-    expect(allToolParts).toHaveLength(2);
-    // Original terminal part untouched (first-write-wins).
+    // Post-cutover a tool call is one row keyed by toolCallId: legacy
+    // duplicate parts collapse, and the already-terminal result wins
+    // (first-write-wins).
+    expect(allToolParts).toHaveLength(1);
     expect(allToolParts[0].state).toBe("output-available");
     expect(allToolParts[0].output).toEqual({
       success: true,
       color: "green-old"
     });
-    // Previously-non-terminal part transitioned to output-available
-    // with the new output.
-    expect(allToolParts[1].state).toBe("output-available");
-    expect(allToolParts[1].output).toEqual(realOutput);
 
     ws.close(1000);
   });
@@ -329,14 +329,17 @@ describe("Tool result idempotency (issue #1404)", () => {
       )
     ).toBe(true);
 
+    // Post-cutover MESSAGE_UPDATED carries the AG-UI tool result row.
     const update = (await waitForMessage(
       broadcasts,
       (m) => m.type === MessageType.CF_AGENT_MESSAGE_UPDATED
-    )) as { message: ChatMessage } | undefined;
+    )) as
+      | { message: { role: string; toolCallId?: string; content?: string } }
+      | undefined;
     expect(update).toBeDefined();
-    const tool = getToolPart(update!.message, toolCallId);
-    expect(tool?.state).toBe("output-available");
-    expect(tool?.output).toEqual(output);
+    expect(update!.message.role).toBe("tool");
+    expect(update!.message.toolCallId).toBe(toolCallId);
+    expect(JSON.parse(update!.message.content ?? "null")).toEqual(output);
 
     ws.close(1000);
   });

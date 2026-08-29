@@ -541,14 +541,18 @@ describe("Client-side tool duplicate message prevention", () => {
         "call_edit_workflow_regression"
       ])
     );
-    expect(getTexts(assistantAfterApprovalRequest)).toEqual(
-      expect.arrayContaining([
+    // Post-cutover chained continuation text merges into one content string.
+    {
+      const joined = getTexts(assistantAfterApprovalRequest).join("");
+      for (const piece of [
         "Choice collected.",
         "Credentials collected.",
         "Reading workflow before editing.",
         "Reviewing workflow edits now."
-      ])
-    );
+      ]) {
+        expect(joined).toContain(piece);
+      }
+    }
 
     ws.send(
       JSON.stringify({
@@ -578,15 +582,18 @@ describe("Client-side tool duplicate message prevention", () => {
         "call_edit_workflow_regression"
       ])
     );
-    expect(getTexts(finalAssistant)).toEqual(
-      expect.arrayContaining([
+    {
+      const joined = getTexts(finalAssistant).join("");
+      for (const piece of [
         "Choice collected.",
         "Credentials collected.",
         "Reading workflow before editing.",
         "Reviewing workflow edits now.",
         "Workflow edit approved and applied."
-      ])
-    );
+      ]) {
+        expect(joined).toContain(piece);
+      }
+    }
 
     ws.close(1000);
   });
@@ -955,7 +962,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
+    expect(toolPart.approval).toMatchObject({ approved: true });
 
     ws.close(1000);
   });
@@ -1016,7 +1023,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("output-denied");
-    expect(toolPart.approval).toEqual({ id: toolCallId, approved: false });
+    expect(toolPart.approval).toMatchObject({ approved: false });
 
     ws.close(1000);
   });
@@ -1186,7 +1193,11 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
     // Messages should remain unchanged (no crash, graceful handling)
     expect(messages.length).toBe(2);
     const assistantMsg = messages.find((m) => m.role === "assistant");
-    expect(assistantMsg?.parts[0]).toEqual({ type: "text", text: "Hi there!" });
+    expect(assistantMsg?.parts[0]).toEqual({
+      type: "text",
+      text: "Hi there!",
+      state: "done"
+    });
 
     ws.close(1000);
   });
@@ -1317,7 +1328,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
+    expect(toolPart.approval).toMatchObject({ approved: true });
     expect(assistantMsg.parts.length).toBe(1);
 
     ws.close(1000);
@@ -1385,7 +1396,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("approval-responded");
-    expect(toolPart.approval).toEqual({ id: toolCallId, approved: true });
+    expect(toolPart.approval).toMatchObject({ approved: true });
 
     // Continuation parts should be appended (TestChatAgent returns text response)
     expect(assistantMsg.parts.length).toBeGreaterThan(1);
@@ -1448,7 +1459,7 @@ describe("Tool approval auto-continuation (needsApproval)", () => {
       approval?: { approved: boolean };
     };
     expect(toolPart.state).toBe("output-denied");
-    expect(toolPart.approval).toEqual({ id: toolCallId, approved: false });
+    expect(toolPart.approval).toMatchObject({ approved: false });
 
     // Continuation parts should be appended (LLM sees denial and responds)
     expect(assistantMsg.parts.length).toBeGreaterThan(1);

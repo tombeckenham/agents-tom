@@ -747,7 +747,11 @@ export class AGUIChatAgent<
       return this._tryCatchChat(async () => {
         const url = new URL(request.url);
         if (url.pathname.split("/").pop() === "get-messages") {
-          return Response.json(this._loadMessagesFromDb());
+          // Structural validation on read (legacy parity): unrecognized rows
+          // are skipped rather than served; legacy UIMessage rows migrate.
+          return Response.json(
+            autoTransformAGUIMessages(this._loadMessagesFromDb())
+          );
         }
         return _onRequest(request);
       });
@@ -1169,7 +1173,9 @@ export class AGUIChatAgent<
       this._applyToolResult(
         data.toolCallId,
         data.output,
-        data.state === "output-error" ? data.errorText : undefined
+        data.state === "output-error"
+          ? (data.errorText ?? "Tool execution denied by user")
+          : undefined
       )
     );
 
@@ -1267,6 +1273,14 @@ export class AGUIChatAgent<
       // First-write-wins — duplicate frames / second-tab races are no-ops.
       return true;
     }
+    // A DENIED call never runs: a late result for it is dropped rather than
+    // resurrecting the tool as output-available (legacy parity).
+    const deniedOwner = this._aguiMessages.find(
+      (m) =>
+        m.role === "assistant" &&
+        m.toolApprovals?.[toolCallId]?.approved === false
+    );
+    if (deniedOwner) return true;
     // A real result supersedes any approval-decision placeholder for this call.
     this._decidedApprovals.delete(toolCallId);
 
@@ -2358,6 +2372,9 @@ export class AGUIChatAgent<
           runError
         ) {
           streamResult = { status: "error", error: runError.message };
+          // Mark the stream row errored so #1575's errored-chunk replay can
+          // find the buffered partial on reconnect.
+          this._markStreamError(streamId);
         }
 
         if (accumulator.messages.length > 0) {

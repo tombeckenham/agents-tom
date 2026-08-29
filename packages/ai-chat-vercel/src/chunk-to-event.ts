@@ -120,7 +120,10 @@ export class ChunkToEventProjector {
       case "text-end":
         this.currentTextId = null;
         return [
-          { type: "TEXT_MESSAGE_END", messageId: this.textMessageId(chunk.id ?? "__text") }
+          {
+            type: "TEXT_MESSAGE_END",
+            messageId: this.textMessageId(chunk.id ?? "__text")
+          }
         ];
 
       case "reasoning-start": {

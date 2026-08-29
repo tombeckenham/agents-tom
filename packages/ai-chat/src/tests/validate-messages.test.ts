@@ -160,7 +160,8 @@ describe("Message Structural Validation", () => {
     const persisted = await getValidatedMessages(room);
     expect(persisted.length).toBe(1);
     expect(persisted[0].id).toBe("empty-parts");
-    expect(persisted[0].parts).toEqual([]);
+    // Post-cutover the row is served in AG-UI shape (no parts field).
+    expect(persisted[0].parts ?? []).toEqual([]);
 
     ws.close(1000);
   });

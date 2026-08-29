@@ -111,6 +111,13 @@ export type ToolCall = {
     /** JSON-encoded argument object. Parse with `JSON.parse`. */
     arguments: string;
   };
+  /**
+   * CF extension: legacy tool-part fields with no AG-UI slot
+   * (`providerExecuted`, `callProviderMetadata`, `providerMetadata`,
+   * `preliminary`, …) so provider round-trips survive the storage flip.
+   * Spread back onto the projected tool part verbatim.
+   */
+  partExtras?: Record<string, unknown>;
 };
 
 // ============================================================================
@@ -200,6 +207,8 @@ export type AssistantMessage = BaseMessage & {
    * UIMessage projection can mark the part `state: "streaming"`.
    */
   partial?: true;
+  /** CF extension: the legacy text part's providerMetadata. */
+  contentProviderMetadata?: unknown;
 };
 
 /**
@@ -216,6 +225,9 @@ export type ToolMessage = BaseMessage & {
   content: string;
   error?: string;
   encryptedValue?: string;
+  /** CF extension: result of a provider-executed tool (code_execution,
+   * text_editor, …) whose payload the sanitizer may truncate. */
+  providerExecuted?: true;
 };
 
 /**
@@ -230,6 +242,9 @@ export type ReasoningMessage = BaseMessage & {
   encryptedValue?: string;
   /** CF extension: reasoning stream still open — see AssistantMessage.partial. */
   partial?: true;
+  /** CF extension: the legacy reasoning part's providerMetadata (e.g.
+   * Anthropic redacted_thinking blocks) — required for provider round-trips. */
+  providerMetadata?: unknown;
 };
 
 /**

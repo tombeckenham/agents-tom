@@ -323,6 +323,11 @@ function handleToolStart(
   if (state.toolBuffers.has(event.toolCallId)) {
     return true;
   }
+  // Replay dedupe (#1404): a provider re-emitting a call that already exists
+  // on an assistant (continuation replays) must not add a duplicate.
+  if (findToolCallById(state, event.toolCallId)) {
+    return true;
+  }
   const assistant = ensureAssistantForToolCall(state, event.parentMessageId);
   const toolCall: ToolCall = {
     id: event.toolCallId,
@@ -387,6 +392,11 @@ function handleToolResult(
   ) {
     warn("TOOL_CALL_RESULT missing required fields", event);
     return false;
+  }
+  // Replay dedupe (#1404): first result wins; a re-emitted result for an
+  // already-settled call is a no-op.
+  if (findToolMessageByCallId(state, event.toolCallId)) {
+    return true;
   }
   const toolMessage: ToolMessage = {
     id: event.messageId,

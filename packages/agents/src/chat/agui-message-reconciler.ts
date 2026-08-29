@@ -188,12 +188,9 @@ function reconcileAssistantIds(
       (sm) => isWellFormed(sm) && sm.id === incomingMessage.id
     );
     if (exactServerIdx !== -1) {
-      if (incomingMessage.role === "assistant") {
-        const serverMsg = server[exactServerIdx];
-        if (serverMsg.role === "assistant") {
-          return { ...serverMsg };
-        }
-      }
+      // Exact id match: the incoming version wins (legacy parity — clients
+      // may legitimately update a message's content; the server's authority
+      // is over IDS and tool results, which step 1 already merged).
       return incomingMessage;
     }
 

@@ -60,14 +60,15 @@ describe("reconcileMessages", () => {
     expect(result).not.toBe(incoming);
   });
 
-  it("uses server assistant version when ids match (fresh toolCalls/content)", () => {
+  it("keeps the incoming assistant version when ids match (legacy parity)", () => {
+    // Clients may legitimately update a message's content; the server's
+    // authority is over ids and tool results, not assistant content.
     const server: AGUIMessage[] = [
       assistant("a1", "final text", [toolCall("tc1", "calc", '{"x":1}')])
     ];
     const incoming: AGUIMessage[] = [assistant("a1", "partial")];
     const result = reconcileMessages(incoming, server);
-    expect(result[0]).toEqual(server[0]);
-    expect(result[0]).not.toBe(server[0]);
+    expect(result[0]).toEqual(incoming[0]);
   });
 
   it("server tool result wins over stale incoming tool result with same toolCallId", () => {
