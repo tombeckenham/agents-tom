@@ -17,10 +17,12 @@
  *   host-agnostic engine and are unit-tested in
  *   `chat/__tests__/recovery-engine.test.ts`; re-driving them per host would
  *   test the same code twice.
- * - Incident-scoring legs (#1628 compaction, sub-agent N9 crediting, the
- *   work-budget wall clock) — likewise owned by
- *   `chat/__tests__/recovery-incident.test.ts` and, for the AG-UI chunk
- *   vocabulary, `chat/__tests__/agui-recovery-codec.test.ts`.
+ * - Incident-scoring legs (#1628 compaction, the work-budget wall clock) —
+ *   likewise owned by `chat/__tests__/recovery-incident.test.ts` and, for the
+ *   AG-UI chunk vocabulary, `chat/__tests__/agui-recovery-codec.test.ts`.
+ *   The DO-level N9 sub-agent stream-progress crediting legs ARE ported here
+ *   (they drive the real `_forwardAgentToolStream` → `_bumpChatRecoveryProgress`
+ *   wiring on the agent).
  * - Assertions written against `UIMessage` parts (`input-streaming` /
  *   `output-available` tool-part states, `persist: false` part skipping,
  *   `_getPartialStreamText` part shapes) — not portable as written: AG-UI
@@ -127,6 +129,10 @@ interface RecoveryStub {
     reason?: string;
   }>;
   ageIncidentForTest(incidentId: string, ms: number): Promise<void>;
+  forwardChildStreamProgressForTest(chunks: number): Promise<{
+    start: number;
+    after: number;
+  }>;
   seedIncidentForTest(incident: {
     incidentId: string;
     requestId: string;
@@ -326,6 +332,70 @@ describe("onChatRecovery (AG-UI)", () => {
 
     // Without further progress it climbs again and exhausts at the cap.
     expect((await stub.beginIncidentForTest(at())).attempt).toBe(2);
+    const exhausted = await stub.beginIncidentForTest(at());
+    expect(exhausted.attempt).toBe(3);
+    expect(exhausted.exhausted).toBe(true);
+  });
+
+  it("credits forwarding a sub-agent's stream as parent forward progress (N9)", async () => {
+    const room = crypto.randomUUID();
+    const stub = await getTestAgent(room);
+    await stub.setChatRecoveryConfigForTest({ maxAttempts: 2 });
+
+    const baseInput = {
+      requestId: "req-n9",
+      recoveryRootRequestId: "req-n9",
+      latestUserMessageId: "u1",
+      recoveryKind: "continue" as const
+    };
+    let t = 1_000_000;
+    const at = () => {
+      const nowMs = t;
+      t += 40_000;
+      return { ...baseInput, nowMs };
+    };
+
+    // A parent whose turn merely awaits a sub-agent climbs toward the cap.
+    expect((await stub.beginIncidentForTest(at())).attempt).toBe(1);
+    expect((await stub.beginIncidentForTest(at())).attempt).toBe(2);
+
+    // Re-attaching and forwarding the child's stream IS the parent's forward
+    // progress (N9) — the durable marker advances through the real
+    // `_forwardAgentToolStream` path, so the budget resets just like in-band
+    // content does. Without this the deploy-churn parent exhausts while the
+    // child streams healthily.
+    const forwarded = await stub.forwardChildStreamProgressForTest(3);
+    expect(forwarded.after).toBe(forwarded.start + 1);
+    const afterChildStream = await stub.beginIncidentForTest(at());
+    expect(afterChildStream.attempt).toBe(1);
+    expect(afterChildStream.exhausted).toBe(false);
+  });
+
+  it("does NOT credit a silent/hung sub-agent, so the parent still exhausts (N9)", async () => {
+    const room = crypto.randomUUID();
+    const stub = await getTestAgent(room);
+    await stub.setChatRecoveryConfigForTest({ maxAttempts: 2 });
+
+    const baseInput = {
+      requestId: "req-n9-silent",
+      recoveryRootRequestId: "req-n9-silent",
+      latestUserMessageId: "u1",
+      recoveryKind: "continue" as const
+    };
+    let t = 2_000_000;
+    const at = () => {
+      const nowMs = t;
+      t += 40_000;
+      return { ...baseInput, nowMs };
+    };
+
+    expect((await stub.beginIncidentForTest(at())).attempt).toBe(1);
+    expect((await stub.beginIncidentForTest(at())).attempt).toBe(2);
+
+    // A re-attach where the child produces NO output forwards nothing, so the
+    // parent banks no progress and the cap still binds.
+    const forwarded = await stub.forwardChildStreamProgressForTest(0);
+    expect(forwarded.after).toBe(forwarded.start);
     const exhausted = await stub.beginIncidentForTest(at());
     expect(exhausted.attempt).toBe(3);
     expect(exhausted.exhausted).toBe(true);
