@@ -1,0 +1,37 @@
+{
+  "scenario": "pre-response-throw",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": []
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-1",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    }
+  ]
+}
