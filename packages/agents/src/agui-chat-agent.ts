@@ -29,7 +29,12 @@ import {
 } from "./index";
 import { isDurableObjectMemoryLimitReset } from "./retries";
 import { AbortRegistry } from "./chat/abort-registry";
-import { awaitWithDeadline, TIMED_OUT } from "./chat/async-helpers";
+import {
+  awaitWithDeadline,
+  drainInteractionApplies,
+  TIMED_OUT
+} from "./chat/async-helpers";
+import { AutoContinuationController } from "./chat/auto-continuation-controller";
 import { aguiRecoveryCodec } from "./chat/agui-recovery-codec";
 import {
   createChatFiberSnapshot,
@@ -401,6 +406,8 @@ export class AGUIChatAgent<
   private _pendingChatResponseResults: AGUIChatResponseResult[] = [];
   private _insideResponseHook = false;
   private _pendingInteractionPromise: Promise<boolean> | null = null;
+  /** Tail of the serialized tool-result/approval apply chain (#1649). */
+  private _interactionApplyTail: Promise<unknown> = Promise.resolve();
 
   // Set when an approval CUSTOM event arrives mid-stream and we eagerly
   // persist the assistant turn so a page refresh sees the approval modal.
@@ -470,7 +477,42 @@ export class AGUIChatAgent<
   /** JSON cache for incremental persistence (skip SQL writes for unchanged rows). */
   private _persistedMessageCache: Map<string, string> = new Map();
 
-  private static AUTO_CONTINUATION_COALESCE_MS = 10;
+  /**
+   * Shared auto-continuation barrier (#1649 / #1650): owns the coalesce timer
+   * and the double-fire guard. Parameterized by this agent's stream-active
+   * signal, apply-drain, and continuation-turn pipeline
+   * (`_fireAutoContinuation`) — the same controller `AIChatAgent` and
+   * `@cloudflare/think` drive, on AG-UI-shaped completeness predicates.
+   */
+  private _autoContinuation = new AutoContinuationController<Connection>({
+    continuation: this._continuation,
+    generateRequestId: () => nanoid(),
+    isStreamActive: () => this._streamingTurnActive,
+    hasPendingInteraction: () => this._pendingInteractionPromise !== null,
+    hasIncompleteToolBatch: () => this._hasIncompleteToolBatch(),
+    drainInteractionApplies: () => this._drainInteractionApplies(),
+    keepAliveWhile: <T>(fn: () => Promise<T>) => this.keepAliveWhile(fn),
+    fire: () => this._fireAutoContinuation()
+  });
+
+  /**
+   * Stream-active gate for the auto-continuation barrier (#1650). True while an
+   * assistant turn is streaming in `_reply`: the parallel tool batch can still
+   * grow with tool calls the model hasn't emitted yet, so no completeness check
+   * is meaningful until the stream finalizes. `_onStreamingTurnFinalized`
+   * clears it and re-runs the barrier once the batch is fully materialized.
+   */
+  private _streamingTurnActive = false;
+
+  /**
+   * Tool calls whose approval decision this isolate has already applied. AG-UI
+   * persists approvals as CUSTOM events rather than message state, so a decided
+   * call keeps looking unanswered in `this.messages` until the continuation
+   * executes it — without this the completeness gate would park forever on a
+   * batch whose only outstanding member is an already-approved tool.
+   */
+  private _decidedApprovals = new Set<string>();
+
   private static MESSAGE_DEBOUNCE_MS = 750;
 
   maxPersistedMessages: number | undefined = undefined;
@@ -1018,28 +1060,28 @@ export class AGUIChatAgent<
     // In the AG-UI shape, tool results are first-class `ToolMessage`s. We
     // upsert / append a tool message and persist immediately so subsequent
     // turns see it.
-    const applyPromise = this._applyToolResult(
-      data.toolCallId,
-      data.output,
-      data.state === "output-error" ? data.errorText : undefined
+    this._enqueueInteractionApply(() =>
+      this._applyToolResult(
+        data.toolCallId,
+        data.output,
+        data.state === "output-error" ? data.errorText : undefined
+      )
     );
-    this._pendingInteractionPromise = applyPromise;
-    applyPromise
-      .finally(() => {
-        if (this._pendingInteractionPromise === applyPromise) {
-          this._pendingInteractionPromise = null;
-        }
-      })
-      .catch(() => {});
 
     if (data.autoContinue) {
-      this._enqueueAutoContinuation(
+      this._autoContinuation.schedule({
         connection,
-        data.clientTools ?? this._lastClientTools,
-        this._lastBody,
-        "[AGUIChatAgent] Tool continuation failed:",
-        applyPromise
-      );
+        clientTools: data.clientTools ?? this._lastClientTools,
+        body: this._lastBody,
+        errorPrefix: "[AGUIChatAgent] Tool continuation failed:"
+      });
+    } else {
+      // A result that arrived WITHOUT autoContinue (e.g. a standalone errored
+      // tool) can still be the one that completes a parallel batch a sibling
+      // already opted to continue — re-arm the barrier so that continuation
+      // fires once the batch is whole (#1650). Never CREATES a pending
+      // continuation.
+      this._autoContinuation.rearmForBatch();
     }
     return true;
   }
@@ -1055,29 +1097,50 @@ export class AGUIChatAgent<
       toolCallId: data.toolCallId,
       approved: data.approved
     });
-    const approvalPromise = this._applyToolApproval(
-      data.toolCallId,
-      data.approved
+    this._enqueueInteractionApply(() =>
+      this._applyToolApproval(data.toolCallId, data.approved)
     );
-    this._pendingInteractionPromise = approvalPromise;
-    approvalPromise
+
+    if (data.autoContinue) {
+      this._autoContinuation.schedule({
+        connection,
+        clientTools: this._lastClientTools,
+        body: this._lastBody,
+        errorPrefix: "[AGUIChatAgent] Tool approval continuation failed:"
+      });
+    } else {
+      this._autoContinuation.rearmForBatch();
+    }
+    return true;
+  }
+
+  /**
+   * Serialize a client-tool result/approval apply behind any in-flight apply
+   * (#1649): each apply is a read-modify-write of `this.messages` followed by a
+   * persist, and parallel results arrive as independent WebSocket messages.
+   * `_pendingInteractionPromise` tracks the newest link so the barrier's
+   * pending-interaction signal observes the latest apply; because the chain is
+   * serial, awaiting it transitively waits for every predecessor.
+   */
+  protected _enqueueInteractionApply(
+    apply: () => Promise<boolean>
+  ): Promise<boolean> {
+    // `.then(apply, apply)` runs regardless of a predecessor's outcome so one
+    // rejected apply can't poison the rest of the batch.
+    const resultPromise = this._interactionApplyTail.then(apply, apply);
+    this._interactionApplyTail = resultPromise.then(
+      () => undefined,
+      () => undefined
+    );
+    this._pendingInteractionPromise = resultPromise;
+    resultPromise
       .finally(() => {
-        if (this._pendingInteractionPromise === approvalPromise) {
+        if (this._pendingInteractionPromise === resultPromise) {
           this._pendingInteractionPromise = null;
         }
       })
       .catch(() => {});
-
-    if (data.autoContinue) {
-      this._enqueueAutoContinuation(
-        connection,
-        this._lastClientTools,
-        this._lastBody,
-        "[AGUIChatAgent] Tool approval continuation failed:",
-        approvalPromise
-      );
-    }
-    return true;
+    return resultPromise;
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -1148,6 +1211,9 @@ export class AGUIChatAgent<
       approved,
       decidedAt: Date.now()
     };
+    // The decision settles this call for the batch-completeness gate — the
+    // continuation turn is what actually produces its `ToolMessage`.
+    this._decidedApprovals.add(toolCallId);
     const event: AGUIEvent = {
       type: "CUSTOM",
       name: CF_TOOL_APPROVAL_DECISION,
@@ -1657,6 +1723,15 @@ export class AGUIChatAgent<
     this._abortRegistry.destroyAll();
     this._submitConcurrency.reset();
     this._pendingInteractionPromise = null;
+    // Drop the apply chain so new interactions don't serialize behind a stale
+    // (possibly hung) apply from the turn we just reset (#1649).
+    this._interactionApplyTail = Promise.resolve();
+    // Tear down the event-driven auto-continuation barrier (#1650): cancel the
+    // coalesce timer and clear the double-fire / stream-active gates so a reset
+    // mid-park can't leave a stale flag pinning future continuations.
+    this._autoContinuation.reset();
+    this._streamingTurnActive = false;
+    this._decidedApprovals.clear();
     this._continuation.sendResumeNone();
     this._continuation.clearAll();
     // Cut parked clients loose (#1784): the turns they were waiting on are gone.
@@ -1678,40 +1753,8 @@ export class AGUIChatAgent<
   // Auto-continuation
   // ──────────────────────────────────────────────────────────────────
 
-  private _mergeAutoContinuationPrerequisite(
-    current: Promise<boolean> | null,
-    next?: Promise<boolean>
-  ): Promise<boolean> | null {
-    if (!next) return current;
-    if (!current) return next;
-    return Promise.all([current, next]).then(([a, b]) => a && b);
-  }
-
-  private _storeDeferredAutoContinuation(
-    connection: Connection,
-    clientTools: ClientToolSchema[] | undefined,
-    body: Record<string, unknown> | undefined,
-    errorPrefix: string,
-    prerequisite?: Promise<boolean>
-  ) {
-    const existing = this._continuation.deferred;
-    this._continuation.deferred = {
-      connection,
-      connectionId: connection.id,
-      clientTools,
-      body,
-      errorPrefix,
-      prerequisite: this._mergeAutoContinuationPrerequisite(
-        existing?.prerequisite ?? null,
-        prerequisite
-      )
-    };
-  }
-
   private _activateDeferredAutoContinuation() {
-    const pending = this._continuation.activateDeferred(() => nanoid());
-    if (!pending) return;
-    this._queueAutoContinuation(pending.requestId);
+    this._autoContinuation.activateDeferredAndReschedule();
   }
 
   private _clearAllAutoContinuationState(sendNone = false) {
@@ -1731,79 +1774,103 @@ export class AGUIChatAgent<
     );
   }
 
-  private _enqueueAutoContinuation(
-    connection: Connection,
-    clientTools: ClientToolSchema[] | undefined,
-    body: Record<string, unknown> | undefined,
-    errorPrefix: string,
-    prerequisite?: Promise<boolean>
-  ) {
-    if (this._continuation.pending) {
-      if (this._continuation.pending.pastCoalesce) {
-        this._storeDeferredAutoContinuation(
-          connection,
-          clientTools,
-          body,
-          errorPrefix,
-          prerequisite
-        );
-        return;
+  /**
+   * Drain every in-flight tool-result/approval apply, including any enqueued
+   * while we wait, so the subsequent {@link _hasIncompleteToolBatch} re-check
+   * sees every result that has ALREADY arrived. Bounded by real apply activity
+   * (a storage write each), never by a fixed timer.
+   */
+  private _drainInteractionApplies(): Promise<void> {
+    return drainInteractionApplies(
+      () => this._continuation.pending !== null,
+      () => this._interactionApplyTail
+    );
+  }
+
+  /**
+   * `true` when the latest assistant message is mid-batch: at least one of its
+   * tool calls is answered and at least one is still outstanding. That is the
+   * #1649 signature — the model fanned out parallel tool calls and only some
+   * have come back. The AG-UI analogue of the legacy leaf-part scan: results
+   * are standalone `ToolMessage`s, so a call counts as answered when a matching
+   * `ToolMessage` exists (or an approval decision has been applied for it).
+   */
+  private _hasIncompleteToolBatch(): boolean {
+    const messages = this._messagesForClientSync();
+    let leaf: AssistantMessage | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === "assistant") {
+        leaf = m;
+        break;
       }
-      this._continuation.pending.connection = connection;
-      this._continuation.pending.connectionId = connection.id;
-      this._continuation.awaitingConnections.set(connection.id, connection);
-      this._continuation.pending.clientTools = clientTools;
-      this._continuation.pending.body = body;
-      this._continuation.pending.errorPrefix = errorPrefix;
-      this._continuation.pending.prerequisite =
-        this._mergeAutoContinuationPrerequisite(
-          this._continuation.pending.prerequisite,
-          prerequisite
-        );
-      return;
     }
-    const requestId = nanoid();
-    this._continuation.pending = {
-      connection,
-      connectionId: connection.id,
-      requestId,
-      clientTools,
-      body,
-      errorPrefix,
-      prerequisite: this._mergeAutoContinuationPrerequisite(null, prerequisite),
-      pastCoalesce: false
-    };
-    this._continuation.awaitingConnections.set(connection.id, connection);
-    this._queueAutoContinuation(requestId);
+    if (!leaf?.toolCalls?.length) return false;
+
+    const answered = new Set<string>(this._decidedApprovals);
+    for (const m of messages) {
+      if (m.role === "tool") answered.add(m.toolCallId);
+    }
+    let hasPending = false;
+    let hasSettled = false;
+    for (const call of leaf.toolCalls) {
+      if (answered.has(call.id)) {
+        hasSettled = true;
+      } else {
+        hasPending = true;
+      }
+      if (hasPending && hasSettled) return true;
+    }
+    return false;
   }
 
-  private async _awaitPendingAutoContinuationPrerequisite(): Promise<boolean> {
-    while (true) {
-      const prerequisite = this._continuation.pending?.prerequisite;
-      if (!prerequisite) return true;
-      const applied = await prerequisite;
-      if (!applied) return false;
-      await new Promise((resolve) =>
-        setTimeout(resolve, AGUIChatAgent.AUTO_CONTINUATION_COALESCE_MS)
-      );
-      if (this._continuation.pending?.prerequisite === prerequisite)
-        return true;
-    }
+  /**
+   * Called when a streaming assistant turn finalizes (its messages, with all
+   * tool calls, are now persisted). Clears the stream-active gate and re-runs
+   * the barrier for a continuation the gate held (#1650). Essential for an
+   * all-fast parallel batch whose every result landed mid-stream: once the
+   * stream ends there is no further tool-result event to re-arm, so without
+   * this the held continuation would never fire.
+   */
+  private _onStreamingTurnFinalized(): void {
+    this._streamingTurnActive = false;
+    this._autoContinuation.rearmForBatch();
   }
 
-  private _queueAutoContinuation(requestId: string) {
+  /**
+   * `true` when an auto-continuation is armed and going to fire on its own —
+   * its coalesce timer is still pending or its completeness barrier is
+   * mid-drain (#1650). Such an agent is NOT stable: a continuation turn is
+   * imminent. A continuation that has already entered its turn
+   * (`pastCoalesce`) is covered by the turn queue, and a parked one (waiting on
+   * an unanswered sibling) by the pending-interaction predicate.
+   */
+  private _hasArmedContinuation(): boolean {
+    return (
+      this._continuation.pending !== null &&
+      !this._continuation.pending.pastCoalesce &&
+      this._autoContinuation.isArmed()
+    );
+  }
+
+  /**
+   * Run the continuation turn for the current `continuation.pending`. Invoked
+   * by the barrier once the parallel batch is complete and no stream is active.
+   */
+  private _fireAutoContinuation() {
+    const pending = this._continuation.pending;
+    if (!pending) return;
+    const requestId = pending.requestId;
+
     const epoch = this._turnQueue.generation;
+    // `_runExclusiveChatTurn` must be called synchronously so the turn queue is
+    // set up immediately — otherwise idle waiters can resolve before the
+    // continuation starts. `keepAlive()` runs inside the turn.
     this._runExclusiveChatTurn(
       requestId,
       async () => {
         const dispose = await this.keepAlive();
         try {
-          const applied =
-            await this._awaitPendingAutoContinuationPrerequisite();
-          if (!applied) {
-            this._clearAllAutoContinuationState(true);
-            return;
-          }
           const connection = this._continuation.pending
             ?.connection as Connection | null;
           if (!connection) {
@@ -1839,10 +1906,19 @@ export class AGUIChatAgent<
                       }
                     );
                     if (response) {
-                      await this._reply(requestId, response, [], {
-                        continuation: true,
-                        chatMessageId: requestId
-                      });
+                      const replyResult = await this._reply(
+                        requestId,
+                        response,
+                        [],
+                        {
+                          continuation: true,
+                          chatMessageId: requestId
+                        }
+                      );
+                      if (replyResult.status === "error") {
+                        this._clearAllAutoContinuationState(true);
+                        return;
+                      }
                       this._activateDeferredAutoContinuation();
                     } else {
                       this._clearPendingAutoContinuation(true);
@@ -1919,6 +1995,13 @@ export class AGUIChatAgent<
         this._streamingAssistantId =
           seed.find((m): m is AssistantMessage => m.role === "assistant")?.id ??
           null;
+
+        // Stream-active gate for the auto-continuation barrier (#1650): while
+        // this assistant turn is streaming, the parallel tool batch can still
+        // grow, so no completeness check is meaningful. Cleared by
+        // `_onStreamingTurnFinalized` once `_reply` settles — AFTER the streamed
+        // messages are persisted — so the re-armed check sees the whole batch.
+        this._streamingTurnActive = true;
 
         const streamCompleted = { value: false };
         let streamResult: StreamResultStatus = { status: "completed" };
@@ -2045,7 +2128,13 @@ export class AGUIChatAgent<
         });
         return streamResult;
       })
-    );
+    ).finally(() => {
+      // The streamed messages (with all their tool calls) are now persisted:
+      // clear the stream-active gate and re-run the auto-continuation barrier
+      // for a continuation it held (#1650). Skipped on the no-body early return,
+      // which never armed the gate.
+      if (this._streamingTurnActive) this._onStreamingTurnFinalized();
+    });
   }
 
   /**
@@ -2602,13 +2691,15 @@ export class AGUIChatAgent<
       }
 
       if (!hasPendingInteraction()) {
-        if (!this._continuation.pending && !this._continuation.deferred) {
+        if (!this._hasArmedContinuation()) {
           return true;
         }
-        // An auto-continuation is armed — wait for it to enqueue, then re-check.
+        // An auto-continuation is armed (#1650) — not stable yet. Wait for it
+        // to fire (enqueuing a turn the outer loop then drains) or park, then
+        // re-check.
         if (
           (await awaitWithDeadline(
-            sleep(AGUIChatAgent.AUTO_CONTINUATION_COALESCE_MS),
+            sleep(AutoContinuationController.COALESCE_MS),
             deadline
           )) === TIMED_OUT
         ) {

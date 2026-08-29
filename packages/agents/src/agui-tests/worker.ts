@@ -87,6 +87,29 @@ function hangingSSEResponse(messageId: string): Response {
   });
 }
 
+/** An SSE body that opens a run and then throws — a provider failing mid-stream. */
+function errorAfterStartSSEResponse(message: string): Response {
+  const encoder = new TextEncoder();
+  let started = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!started) {
+        started = true;
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({ type: "RUN_STARTED", threadId: "t1", runId: "r1" })}\n\n`
+          )
+        );
+        return;
+      }
+      throw new Error(message);
+    }
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream" }
+  });
+}
+
 function textRunEvents(messageId: string, deltas: string[]): AGUIEvent[] {
   return [
     { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
@@ -311,6 +334,166 @@ export class SaveMessagesAguiAgent extends AGUIChatAgent<Env> {
       return Response.json(result);
     }
     return super.onRequest(request);
+  }
+}
+
+/**
+ * Auto-continuation fixture (#1649 / #1650). Streams a configurable number of
+ * deltas so a turn can be held open while tool results arrive, records every
+ * request id that entered `onChatMessage`, and exposes the barrier's internal
+ * state so the ported suite can assert on park / fire / defer transitions.
+ *
+ * Body knobs (sent on the chat request, replayed into continuations via
+ * `_lastBody`): `streamChunks`, `streamDelayMs`, `continuationStreamError`.
+ */
+export class AutoContinueAguiAgent extends AGUIChatAgent<Env> {
+  private _startedRequestIds: string[] = [];
+
+  async onChatMessage(
+    _onFinish: (result: unknown) => void | Promise<void>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    this._startedRequestIds.push(options?.requestId ?? "unknown");
+    const body = options?.body as
+      | {
+          streamChunks?: number;
+          streamDelayMs?: number;
+          responseDelayMs?: number;
+          streamToolCallIds?: string[];
+          continuationStreamError?: string;
+        }
+      | undefined;
+
+    if (options?.continuation && body?.continuationStreamError) {
+      return errorAfterStartSSEResponse(body.continuationStreamError);
+    }
+
+    // Hold the turn accepted-but-not-yet-streaming so a test can land a sibling
+    // result after the barrier fired but before `_startStream` consumes the
+    // pending continuation — the window where a result must be DEFERRED.
+    if (body?.responseDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, body.responseDelayMs));
+    }
+
+    const messageId = `assistant-${this._startedRequestIds.length}`;
+
+    // Fan out tool calls one at a time (first turn only, so a continuation
+    // doesn't re-issue them): the client can answer the first while its
+    // siblings have not been streamed yet — the #1650 signature.
+    if (body?.streamToolCallIds?.length && !options?.continuation) {
+      const events: AGUIEvent[] = [
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+        { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
+        ...body.streamToolCallIds.flatMap((toolCallId): AGUIEvent[] => [
+          {
+            type: "TOOL_CALL_START",
+            toolCallId,
+            toolCallName: "testTool",
+            parentMessageId: messageId
+          },
+          { type: "TOOL_CALL_ARGS", toolCallId, delta: "{}" },
+          { type: "TOOL_CALL_END", toolCallId }
+        ]),
+        { type: "TEXT_MESSAGE_END", messageId },
+        { type: "RUN_FINISHED", threadId: "t1", runId: "r1" }
+      ];
+      return sseResponse(events, { delayMs: body.streamDelayMs ?? 100 });
+    }
+
+    const deltas = Array(body?.streamChunks ?? 1).fill("tick ");
+    return sseResponse(textRunEvents(messageId, deltas), {
+      delayMs: body?.streamDelayMs ?? 0
+    });
+  }
+
+  getStartedRequestIds(): string[] {
+    return [...this._startedRequestIds];
+  }
+
+  getPersistedMessages(): AGUIMessage[] {
+    return this.messages;
+  }
+
+  /** Seed one assistant message fanning out `toolCallIds` unanswered calls. */
+  async persistParallelToolCallsForTest(
+    messageId: string,
+    toolCallIds: string[]
+  ): Promise<void> {
+    await this.persistMessages([
+      { id: `user-${messageId}`, role: "user", content: "do both" },
+      {
+        id: messageId,
+        role: "assistant",
+        toolCalls: toolCallIds.map((id) => ({
+          id,
+          type: "function" as const,
+          function: { name: "testTool", arguments: "{}" }
+        }))
+      }
+    ]);
+  }
+
+  /** Barrier + continuation state, flattened for RPC. */
+  getContinuationStateForTest(): {
+    hasPending: boolean;
+    hasDeferred: boolean;
+    pastCoalesce: boolean;
+    armed: boolean;
+    activeRequestId: string | null;
+  } {
+    const internal = this as unknown as {
+      _continuation: {
+        pending: { pastCoalesce: boolean } | null;
+        deferred: unknown | null;
+        activeRequestId: string | null;
+      };
+      _autoContinuation: { isArmed(): boolean };
+    };
+    return {
+      hasPending: internal._continuation.pending !== null,
+      hasDeferred: internal._continuation.deferred !== null,
+      pastCoalesce: internal._continuation.pending?.pastCoalesce ?? false,
+      armed: internal._autoContinuation.isArmed(),
+      activeRequestId: internal._continuation.activeRequestId
+    };
+  }
+
+  hasPendingInteractionForTest(): boolean {
+    return this.hasPendingInteraction();
+  }
+
+  /** Turns waiting behind the active one — a continuation the barrier fired. */
+  getQueuedTurnCountForTest(): number {
+    return (
+      this as unknown as { _turnQueue: { queuedCount(): number } }
+    )._turnQueue.queuedCount();
+  }
+
+  waitUntilStableForTest(timeout?: number): Promise<boolean> {
+    return this.waitUntilStable(timeout != null ? { timeout } : undefined);
+  }
+
+  resetTurnStateForTest(): void {
+    this.resetTurnState();
+  }
+
+  /**
+   * Two read-modify-writes with an await between read and write. Unserialized
+   * they clobber (result 1); serialized behind the apply chain both land (2).
+   */
+  async testInteractionApplySerialization(): Promise<number> {
+    let shared = 0;
+    const rmw = (delayMs: number) => async () => {
+      const read = shared;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      shared = read + 1;
+      return true;
+    };
+    await Promise.all([
+      this._enqueueInteractionApply(rmw(30)),
+      this._enqueueInteractionApply(rmw(0))
+    ]);
+    return shared;
   }
 }
 
@@ -963,6 +1146,7 @@ export type Env = {
   RecoveryAguiAgent: DurableObjectNamespace<RecoveryAguiAgent>;
   PreStreamAguiAgent: DurableObjectNamespace<PreStreamAguiAgent>;
   PreStreamLatestAguiAgent: DurableObjectNamespace<PreStreamLatestAguiAgent>;
+  AutoContinueAguiAgent: DurableObjectNamespace<AutoContinueAguiAgent>;
 };
 
 export default {

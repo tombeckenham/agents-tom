@@ -32,6 +32,10 @@
       {
         "name": "PreStreamLatestAguiAgent",
         "class_name": "PreStreamLatestAguiAgent"
+      },
+      {
+        "name": "AutoContinueAguiAgent",
+        "class_name": "AutoContinueAguiAgent"
       }
     ]
   },
@@ -50,7 +54,8 @@
         "SaveMessagesAguiAgent",
         "RecoveryAguiAgent",
         "PreStreamAguiAgent",
-        "PreStreamLatestAguiAgent"
+        "PreStreamLatestAguiAgent",
+        "AutoContinueAguiAgent"
       ]
     }
   ]
