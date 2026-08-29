@@ -142,10 +142,9 @@ wall of spurious "Cannot find module" cascades.
    break the sidecar rule this branch has followed throughout, and would
    remove the last in-repo proof that the legacy `AIChatAgent` path still
    works. It belongs in the cutover step, not here.
-3. **Cutover planning**. Everything so far is strictly sidecar — nothing in
-   the existing `AIChatAgent` path has been modified. Decide when
-   `AGUIChatAgent` becomes the default and what the deprecation window for
-   `AIChatAgent` looks like.
+3. **Cutover planning**. ✅ Done — see [`ag-ui-plan.md`](./ag-ui-plan.md):
+   one engine on AG-UI, `AIChatAgent` reimplemented as a projection layer,
+   legacy shape modules deleted, gated by a differential conformance harness.
 4. **Upstream drift**. Re-merge `cloudflare/agents` main periodically; the
    surface that actually collides is small (`packages/agents/package.json`
    exports, `scripts/build.ts` entries, `src/mcp/client.ts` imports).
