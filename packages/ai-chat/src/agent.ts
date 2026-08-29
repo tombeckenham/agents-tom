@@ -16,17 +16,15 @@
  *   `sanitizeMessageForPersistence`) keep their legacy shapes; the engine's
  *   dispatch seams project in and out.
  *
- * Persisted rows are AG-UI (`_v` marker); legacy rows migrate on load. This
- * file is a Phase-3 sidecar: `src/index.ts` (the legacy implementation) is
- * untouched until the Phase-5 differential cutover swaps it for this class.
+ * Persisted rows are AG-UI (`_v` marker); legacy rows migrate on load.
+ * `src/index.ts` re-exports this class as the package's `AIChatAgent`
+ * (the Phase-5 cutover).
  *
- * NOTE: the agent-tool child-adapter surface (`startAgentToolRun`,
+ * The agent-tool child-adapter surface (`startAgentToolRun`,
  * `tailAgentToolRun`, `reportProgress`, detached delivery, …) is inherited
- * from the AG-UI engine (Phase 3b) and works for a projected child as-is.
- * Caveat: the overridable hooks `formatAgentToolInput` / `getAgentToolOutput`
- * / `getAgentToolSummary` now speak `AGUIMessage`, not `UIMessage` — a
- * subclass migrating legacy overrides of those hooks needs a projection seam
- * here (Phase 5 conformance work).
+ * from the AG-UI engine; the overridable hooks (`formatAgentToolInput` /
+ * `getAgentToolOutput` / `getAgentToolSummary`) keep their legacy
+ * `UIMessage` vocabulary via the `_invoke*` projection seams below.
  */
 
 import type { GenerateTextOnFinishCallback, ToolSet, UIMessage } from "ai";

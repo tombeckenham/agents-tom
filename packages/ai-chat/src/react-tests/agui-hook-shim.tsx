@@ -1,9 +1,8 @@
 /**
- * Drives the existing `use-agent-chat.test.tsx` suite against the AG-UI hook.
+ * Drives the `use-agent-chat.test.tsx` suite against the AG-UI hook.
  *
- * The suite is the Phase-4 gate and must not be edited (it is also the Phase-5
- * differential baseline for the legacy hook), but every frame it dispatches
- * carries a `UIMessageChunk` body — the legacy wire. This shim is aliased in
+ * The suite predates the cutover: every frame it dispatches carries a
+ * `UIMessageChunk` body — the legacy wire. This shim is aliased in
  * for `../react` by `vitest.agui.config.ts` and wraps the agent connection so
  * inbound `CF_AGENT_USE_CHAT_RESPONSE` frames are re-framed as AG-UI events
  * (via the same `chunk-to-event` projection the server uses) before the hook
