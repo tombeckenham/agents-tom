@@ -15,7 +15,6 @@ import {
   type AgentConnection
 } from "agents/chat/agui-ws-transport";
 
-export { AGUIWebSocketTransport } from "agents/chat/agui-ws-transport";
 export type { AgentConnection } from "agents/chat/agui-ws-transport";
 
 export type WebSocketChatTransportOptions = {

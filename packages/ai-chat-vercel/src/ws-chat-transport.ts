@@ -61,7 +61,7 @@ function toChunkStream(
       }
     },
     cancel() {
-      void iterator.return?.();
+      void iterator.return?.().catch(() => {});
     }
   });
 }

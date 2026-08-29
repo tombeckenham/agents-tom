@@ -91,9 +91,31 @@ type EventStreamContext = {
    * went out.
    */
   cancelOnWire: (force?: boolean) => boolean;
+  /**
+   * The consumer walked away (external abort / early iterator exit): hang
+   * the server turn up if policy says so, and return the {@link finish}
+   * options for that outcome.
+   */
+  localTeardown: () => { keepRequestId: boolean; keepServerTurn: boolean };
   /** Terminate the stream; `null` closes it, an error rejects readers. */
-  finish: (error: Error | null, options?: { keepRequestId?: boolean }) => void;
+  finish: (
+    error: Error | null,
+    options?: {
+      /** Leave the id in `activeRequestIds` (we hung the turn up ourselves). */
+      keepRequestId?: boolean;
+      /**
+       * Leave the turn armed for `cancelActiveServerTurn()`. Set when only
+       * the LOCAL stream ended (socket close, client-only abort): the server
+       * is still running the turn, so a later `stop()` must still be able to
+       * cancel it.
+       */
+      keepServerTurn?: boolean;
+    }
+  ) => void;
 };
+
+/** Server has 5s to answer a resume probe before the client gives up. */
+const RESUME_DECISION_TIMEOUT_MS = 5000;
 
 function abortError(): Error {
   const error = new Error("Aborted");
@@ -117,8 +139,8 @@ function parseAGUIEvent(body: string): AGUIEvent | null {
 export class AGUIWebSocketTransport {
   /** Reassigned by the React layers when the connection is replaced. */
   agent: AgentConnection;
-  protected activeRequestIds?: Set<string>;
-  protected cancelOnClientAbort: boolean;
+  private activeRequestIds?: Set<string>;
+  private cancelOnClientAbort: boolean;
 
   private _resumeResolver: ((data: { id: string } | null) => void) | null =
     null;
@@ -155,7 +177,7 @@ export class AGUIWebSocketTransport {
     return cancelledRequest || cancelledToolContinuation;
   }
 
-  protected sendCancelFrame(requestId: string) {
+  private sendCancelFrame(requestId: string) {
     try {
       this.agent.send(
         JSON.stringify({
@@ -214,8 +236,10 @@ export class AGUIWebSocketTransport {
       resolveSent = resolve;
       rejectSent = reject;
     });
-    // Adapters that only read the failure off the event stream must not
-    // trip an unhandled rejection here.
+    // NOT a swallow: the failure is still delivered — the AI SDK adapter
+    // awaits `sent` and rejects `sendMessages`, TanStack reads the same
+    // error off the event stream. This handler only stops the copy nobody
+    // awaits from surfacing as an unhandled rejection.
     sent.catch(() => {});
 
     const events = this._createEventStream(requestId, (ctx) => {
@@ -229,7 +253,7 @@ export class AGUIWebSocketTransport {
       if (signal) {
         const onAbort = () => {
           if (ctx.done) return;
-          ctx.finish(abortError(), { keepRequestId: ctx.cancelOnWire() });
+          ctx.finish(abortError(), ctx.localTeardown());
         };
         if (signal.aborted) onAbort();
         else signal.addEventListener("abort", onAbort, { once: true });
@@ -277,29 +301,37 @@ export class AGUIWebSocketTransport {
         clearTimeout(timeout);
         resolve(data);
       };
-      const timeout = setTimeout(() => {
+      const giveUp = () => {
+        clearTimeout(timeout);
         if (this._resumeResolver === resolver) this._resumeResolver = null;
         resolve(null);
-      }, 5000);
+      };
+      const timeout = setTimeout(giveUp, RESUME_DECISION_TIMEOUT_MS);
       this._resumeResolver = resolver;
-      this.sendResumeRequest();
+      // A dead socket answers now instead of after the full timeout.
+      if (!this.sendResumeRequest()) giveUp();
     });
 
     if (!decision) return null;
 
     const requestId = decision.id;
     this.activeRequestIds?.add(requestId);
-    // Listeners are attached before the ACK so no replayed frame slips past.
-    const events = this._createEventStream(requestId, (ctx) => {
+    // The ACK goes out from inside `setup`, i.e. after the listeners are
+    // attached (no replayed frame slips past) and under its try/catch (a
+    // send that throws tears the stream down instead of leaking it).
+    return this._createEventStream(requestId, (ctx) => {
       ctx.markSent();
       this.setActiveServerTurn(requestId, () => {
         if (ctx.done) return false;
         ctx.finish(abortError(), { keepRequestId: true });
         return true;
       });
+      try {
+        this.sendResumeAck(requestId);
+      } catch {
+        ctx.finish(null); // socket died: empty replay, nothing leaked
+      }
     });
-    this.sendResumeAck(requestId);
-    return events;
   }
 
   /**
@@ -309,22 +341,26 @@ export class AGUIWebSocketTransport {
    */
   private _createToolContinuationStream(): AGUIEventStream {
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => boolean) | null = null;
+    let resolve: ((data: { id: string } | null) => void) | null = null;
     return this._createEventStream(
       null,
       (ctx) => {
         timeout = setTimeout(() => {
           if (ctx.requestId === null) ctx.finish(null);
-        }, 5000);
+        }, RESUME_DECISION_TIMEOUT_MS);
 
-        this._abortToolContinuation = () => {
+        abort = () => {
           if (ctx.done) return false;
           // A continuation always cancels the server turn it adopted,
           // regardless of the client-abort policy.
           ctx.finish(abortError(), { keepRequestId: ctx.cancelOnWire(true) });
           return true;
         };
+        this._abortToolContinuation = abort;
 
-        this._resumeResolver = (decision) => {
+        resolve = (decision) => {
+          clearTimeout(timeout);
           if (decision === null) {
             ctx.finish(null);
             return;
@@ -337,14 +373,19 @@ export class AGUIWebSocketTransport {
             ctx.finish(null);
           }
         };
+        this._resumeResolver = resolve;
 
         // A dead socket ends the continuation now instead of at the timeout.
         if (!this.sendResumeRequest()) ctx.finish(null);
       },
       () => {
         clearTimeout(timeout);
-        this._abortToolContinuation = null;
-        this._resumeResolver = null;
+        // Only drop OUR hooks — a newer resume/continuation may already own
+        // the transport-level slots.
+        if (this._abortToolContinuation === abort) {
+          this._abortToolContinuation = null;
+        }
+        if (this._resumeResolver === resolve) this._resumeResolver = null;
       }
     );
   }
@@ -450,18 +491,22 @@ export class AGUIWebSocketTransport {
       drain();
     };
 
-    const onClose = () => finish(null);
+    // The socket only closed on us — the server turn itself may still be
+    // running, so leave it armed for a later `cancelActiveServerTurn()`.
+    const onClose = () => finish(null, { keepServerTurn: true });
 
     const finish: EventStreamContext["finish"] = (error, options) => {
       if (done) return;
       done = true;
       streamError = error;
-      this.agent.removeEventListener("message", onMessage);
-      this.agent.removeEventListener("close", onClose);
+      // Detach from the socket we attached to, not from whatever
+      // `this.agent` points at now (the React layers swap it per render).
+      agent.removeEventListener("message", onMessage);
+      agent.removeEventListener("close", onClose);
       onFinish?.();
       if (requestId) {
         if (!options?.keepRequestId) this.activeRequestIds?.delete(requestId);
-        this.clearActiveServerTurn(requestId);
+        if (!options?.keepServerTurn) this.clearActiveServerTurn(requestId);
       }
       drain();
     };
@@ -486,12 +531,25 @@ export class AGUIWebSocketTransport {
         this.sendCancelFrame(requestId);
         return true;
       },
+      localTeardown: () => {
+        const cancelled = ctx.cancelOnWire();
+        // No cancel frame means the server keeps streaming for everyone
+        // else; the turn stays armed so a later stop() can still hang up.
+        return { keepRequestId: cancelled, keepServerTurn: !cancelled && live };
+      },
       finish
     };
 
-    this.agent.addEventListener("message", onMessage);
-    this.agent.addEventListener("close", onClose);
-    setup(ctx);
+    const agent = this.agent;
+    agent.addEventListener("message", onMessage);
+    agent.addEventListener("close", onClose);
+    try {
+      setup(ctx);
+    } catch (error) {
+      // A setup that throws mid-construction (dead socket) must not leave
+      // listeners, ids or an armed turn behind.
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
 
     const iterator: AsyncIterator<AGUIEvent> = {
       next: () =>
@@ -499,9 +557,8 @@ export class AGUIWebSocketTransport {
           waiters.push({ resolve, reject });
           drain();
         }),
-      // Consumer walked away: hang up the server turn if policy says so.
       return: async () => {
-        finish(null, { keepRequestId: ctx.cancelOnWire() });
+        finish(null, ctx.localTeardown());
         return { value: undefined, done: true };
       },
       throw: async (error) => {
