@@ -267,6 +267,7 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   private _stashData: unknown = null;
   private _stashResult: { success: boolean; error?: string } | null = null;
   private _emitStreamError: string | null = null;
+  private _emitStreamErrorAfterChunks = 0;
   private _forceStableTimeout = false;
 
   // eslint-disable-next-line @typescript-eslint/require-await
@@ -295,18 +296,38 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
     }
 
     if (this._emitStreamError) {
-      // Surface a terminal stream error (the way a provider 500 arrives).
+      // Surface a terminal stream error (the way a provider 500 arrives),
+      // optionally after `_emitStreamErrorAfterChunks` text deltas so the
+      // errored stream carries partial content to replay (#1575).
       const message = this._emitStreamError;
+      const messageId = "assistant-partial";
+      const prelude: AGUIEvent[] = [
+        { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+        ...(this._emitStreamErrorAfterChunks > 0
+          ? [
+              {
+                type: "TEXT_MESSAGE_START" as const,
+                messageId,
+                role: "assistant" as const
+              },
+              ...Array.from(
+                { length: this._emitStreamErrorAfterChunks },
+                (_, i): AGUIEvent => ({
+                  type: "TEXT_MESSAGE_CONTENT",
+                  messageId,
+                  delta: `partial-${i} `
+                })
+              )
+            ]
+          : [])
+      ];
       const encoder = new TextEncoder();
-      let pulled = false;
+      let index = 0;
       const stream = new ReadableStream<Uint8Array>({
         pull(controller) {
-          if (!pulled) {
-            pulled = true;
+          if (index < prelude.length) {
             controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({ type: "RUN_STARTED", threadId: "t1", runId: "r1" })}\n\n`
-              )
+              encoder.encode(`data: ${JSON.stringify(prelude[index++])}\n\n`)
             );
             return;
           }
@@ -780,10 +801,13 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
     return result.status;
   }
 
+  /** Drive a server-side turn whose stream errors after `afterChunks` deltas. */
   async driveErroredTurnForTest(
-    message: string
+    message: string,
+    afterChunks = 0
   ): Promise<SaveMessagesResult["status"]> {
     this._emitStreamError = message;
+    this._emitStreamErrorAfterChunks = afterChunks;
     try {
       const result = await this.saveMessages([
         { id: `u-${crypto.randomUUID()}`, role: "user", content: "hello" }
@@ -791,6 +815,7 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
       return result.status;
     } finally {
       this._emitStreamError = null;
+      this._emitStreamErrorAfterChunks = 0;
     }
   }
 

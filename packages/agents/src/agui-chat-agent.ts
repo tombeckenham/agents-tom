@@ -111,8 +111,12 @@ import type {
   SaveMessagesOptions,
   SaveMessagesResult
 } from "./chat/lifecycle";
-import { CHAT_MESSAGE_TYPES } from "./chat/protocol";
+import {
+  CHAT_MESSAGE_TYPES,
+  type StreamResumeNoneReason
+} from "./chat/protocol";
 import { ResumableStream } from "./chat/resumable-stream";
+import { ResumeHandshake } from "./chat/resume-handshake";
 import {
   type SubmitConcurrencyDecision,
   SubmitConcurrencyController
@@ -145,12 +149,25 @@ type OutgoingAGUIMessage =
       replay?: boolean;
       replayComplete?: boolean;
     }
-  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUMING; id: string }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUMING;
+      id: string;
+      probeId?: string;
+    }
   | {
       type: typeof CHAT_MESSAGE_TYPES.MESSAGE_UPDATED;
       message: AGUIMessage;
     }
-  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE };
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.STREAM_PENDING;
+      id?: string;
+      probeId?: string;
+    }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE;
+      reason?: StreamResumeNoneReason;
+      probeId?: string;
+    };
 
 /**
  * Incoming wire envelope mirroring `IncomingMessage` from `ai-chat/types.ts`
@@ -182,7 +199,11 @@ type IncomingAGUIMessage =
     }
   | { type: typeof CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL; id: string }
   | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK; id: string }
-  | { type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST }
+  | {
+      type: typeof CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST;
+      /** Opaque id the server echoes so the client can match the response. */
+      probeId?: string;
+    }
   | {
       type: typeof CHAT_MESSAGE_TYPES.TOOL_RESULT;
       toolCallId: string;
@@ -406,7 +427,8 @@ export class AGUIChatAgent<
   });
 
   private _pendingResumeConnections: Set<string> = new Set();
-  private _continuation = new ContinuationState();
+  private _continuation = new ContinuationState<Connection>();
+  private _resumeHandshakeInstance: ResumeHandshake | null = null;
 
   private _agentToolForwarders = new Map<
     string,
@@ -645,9 +667,14 @@ export class AGUIChatAgent<
         this._emit("message:cancel", { requestId: data.id });
         return true;
       case CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST:
-        return this._handleResumeRequest(connection);
+        await this._resumeHandshake().handleResumeRequest(
+          connection,
+          data.probeId
+        );
+        return true;
       case CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK:
-        return this._handleResumeAck(connection, data.id);
+        await this._resumeHandshake().handleResumeAck(connection, data.id);
+        return true;
       case CHAT_MESSAGE_TYPES.TOOL_RESULT:
         return this._handleToolResult(connection, data);
       case CHAT_MESSAGE_TYPES.TOOL_APPROVAL:
@@ -891,74 +918,30 @@ export class AGUIChatAgent<
     return true;
   }
 
-  private _handleResumeRequest(connection: Connection): boolean {
-    if (this._resumableStream.hasActiveStream()) {
-      if (
-        this._continuation.activeRequestId ===
-          this._resumableStream.activeRequestId &&
-        this._continuation.activeConnectionId !== null &&
-        this._continuation.activeConnectionId !== connection.id
-      ) {
-        sendIfOpen(
-          connection,
-          JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE })
-        );
-      } else {
-        this._notifyStreamResuming(connection);
-      }
-    } else if (
-      this._continuation.pending !== null &&
-      this._continuation.pending.connectionId === connection.id
-    ) {
-      this._continuation.awaitingConnections.set(connection.id, connection);
-    } else {
-      sendIfOpen(
-        connection,
-        JSON.stringify({ type: CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE })
-      );
-    }
-    return true;
+  /**
+   * The shared resume-handshake driver (Tier-2), lazily built. The
+   * `ResumableStream` / `ContinuationState` / pending set are stable after the
+   * constructor, so one instance threads them for the agent's lifetime.
+   * `preStream` is deliberately absent: the AG-UI engine does not track a
+   * pre-stream window yet, and the seam is optional.
+   */
+  private _resumeHandshake(): ResumeHandshake {
+    return (this._resumeHandshakeInstance ??= new ResumeHandshake({
+      responseMessageType: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      resumableStream: this._resumableStream,
+      continuation: this._continuation,
+      pendingResumeConnections: this._pendingResumeConnections,
+      pendingChatTerminal: () => this._pendingChatTerminal(),
+      persistOrphanedStream: (streamId) =>
+        this._persistOrphanedStream(streamId),
+      isConnectionPresent: (connectionId) =>
+        this._isConnectionPresent(connectionId)
+    }));
   }
 
-  private _handleResumeAck(connection: Connection, requestId: string): boolean {
-    this._pendingResumeConnections.delete(connection.id);
-    if (
-      this._resumableStream.hasActiveStream() &&
-      this._resumableStream.activeRequestId === requestId
-    ) {
-      const orphanedStreamId = this._resumableStream.replayChunks(
-        connection,
-        this._resumableStream.activeRequestId
-      );
-      if (orphanedStreamId) {
-        // Fire-and-forget; the ACK handler does not await.
-        this._persistOrphanedStream(orphanedStreamId).catch((err) =>
-          console.error(
-            "[AGUIChatAgent] _persistOrphanedStream persist failed",
-            err
-          )
-        );
-      }
-    } else if (this._resumableStream.hasActiveStream()) {
-      // Ignore ACKs for a different active stream
-    } else if (
-      !this._resumableStream.replayCompletedChunksByRequestId(
-        connection,
-        requestId
-      )
-    ) {
-      sendIfOpen(
-        connection,
-        JSON.stringify({
-          body: "",
-          done: true,
-          id: requestId,
-          type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
-          replay: true
-        })
-      );
-    }
-    return true;
+  /** Whether a connection with this id is still attached. */
+  private _isConnectionPresent(connectionId: string): boolean {
+    return this.getConnection(connectionId) !== undefined;
   }
 
   private _handleToolResult(
@@ -1384,18 +1367,14 @@ export class AGUIChatAgent<
     return merged;
   }
 
+  /**
+   * Proactively offer an active stream for resume — delegates to the shared
+   * {@link ResumeHandshake}. Kept as a thin method because onConnect and the
+   * continuation flush both call it. See the driver for the #1733 double-send
+   * contract.
+   */
   private _notifyStreamResuming(connection: Connection) {
-    if (!this._resumableStream.hasActiveStream()) return;
-    const sent = sendIfOpen(
-      connection,
-      JSON.stringify({
-        type: CHAT_MESSAGE_TYPES.STREAM_RESUMING,
-        id: this._resumableStream.activeRequestId
-      })
-    );
-    if (sent) {
-      this._pendingResumeConnections.add(connection.id);
-    }
+    this._resumeHandshake().notifyStreamResuming(connection);
   }
 
   // ──────────────────────────────────────────────────────────────────

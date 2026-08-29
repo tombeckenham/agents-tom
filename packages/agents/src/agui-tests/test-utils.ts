@@ -16,6 +16,10 @@ export type WireFrame = {
   error?: boolean;
   replay?: boolean;
   replayComplete?: boolean;
+  /** Echoed back on resume responses so a client can match its probe. */
+  probeId?: string;
+  /** Why a STREAM_RESUME_NONE was sent (`idle` / `continuation-owned`). */
+  reason?: string;
   messages?: AGUIMessage[];
   message?: AGUIMessage;
 };
