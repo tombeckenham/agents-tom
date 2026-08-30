@@ -274,12 +274,15 @@ export class ForeverChatAgent extends AIChatAgent<Env, AgentState> {
       // Can't use _persistOrphanedStream here — if the DO was evicted
       // before the chunk buffer (10 chunks) was flushed to SQLite,
       // getStreamChunks() returns [] and _persistOrphanedStream is a no-op.
-      this.messages.push({
-        id: crypto.randomUUID(),
-        role: "assistant" as const,
-        parts: [{ type: "text" as const, text }]
-      });
-      await this.persistMessages([...this.messages]);
+      // `this.messages` is a frozen projection — append via persistMessages.
+      await this.persistMessages([
+        ...this.messages,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant" as const,
+          parts: [{ type: "text" as const, text }]
+        }
+      ]);
 
       return { persist: false, continue: false };
     } catch (e) {
@@ -369,12 +372,15 @@ export class ForeverChatAgent extends AIChatAgent<Env, AgentState> {
         // message to continue from. Without this, continueLastTurn skips
         // (it requires a last assistant message). The buffer replay will
         // fill this message with the actual content via _reply().
-        this.messages.push({
-          id: crypto.randomUUID(),
-          role: "assistant" as const,
-          parts: []
-        });
-        await this.persistMessages([...this.messages]);
+        // `this.messages` is a frozen projection — append via persistMessages.
+        await this.persistMessages([
+          ...this.messages,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            parts: []
+          }
+        ]);
 
         this._pendingBufferReplay = bufferId;
         return { persist: false, continue: true };
@@ -404,12 +410,15 @@ export class ForeverChatAgent extends AIChatAgent<Env, AgentState> {
           `${parsed.text.length} chars, ${parsed.toolCalls.length} tool calls — scheduling continuation`
       );
 
-      this.messages.push({
-        id: crypto.randomUUID(),
-        role: "assistant" as const,
-        parts: parts.messageParts as UIMessage["parts"]
-      });
-      await this.persistMessages([...this.messages]);
+      // `this.messages` is a frozen projection — append via persistMessages.
+      await this.persistMessages([
+        ...this.messages,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant" as const,
+          parts: parts.messageParts as UIMessage["parts"]
+        }
+      ]);
 
       this._lastBody = { ...this._lastBody, recovering: true };
       return { persist: false, continue: true };

@@ -78,7 +78,7 @@ function parseJSON(value: string | undefined): unknown {
 
 /**
  * AI SDK chat agent, projected onto the AG-UI engine. Public API matches the
- * legacy `AIChatAgent` in `src/index.ts`.
+ * pre-cutover `AIChatAgent` (pinned by the conformance goldens).
  */
 export class AIChatAgent<
   Env extends Cloudflare.Env = Cloudflare.Env,
@@ -132,14 +132,14 @@ export class AIChatAgent<
     );
   }
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override onChatResponse(
     // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
     _result: ChatResponseResult
   ): void | Promise<void> {}
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override sanitizeMessageForPersistence(
     // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
@@ -148,7 +148,7 @@ export class AIChatAgent<
     return message;
   }
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override async onChatRecovery(
     // oxlint-disable-next-line @typescript-eslint/no-unused-vars -- overridable hook
