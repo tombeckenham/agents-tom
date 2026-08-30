@@ -144,23 +144,45 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           } as UIPart);
         }
         pendingReasoning = [];
-        for (const extra of message.extraParts ?? []) {
-          parts.push(extra as unknown as UIPart);
-        }
+        // Build each part keyed by its `partOrder` token, then emit in the
+        // recorded order (falling back to canonical extras → tools → text).
+        // Tokens missing from `partOrder` (sanitizer dropped a part, or a
+        // producer predates the field) append in canonical order.
+        const keyed: Array<[string, UIPart]> = [];
+        (message.extraParts ?? []).forEach((extra, i) => {
+          keyed.push([`extra:${i}`, extra as unknown as UIPart]);
+        });
         for (const call of message.toolCalls ?? []) {
           const part = toolCallToPart(call, message.toolApprovals?.[call.id]);
           pendingToolParts.set(call.id, part);
-          parts.push(part as unknown as UIPart);
+          keyed.push([`tool:${call.id}`, part as unknown as UIPart]);
         }
         if (message.content) {
-          parts.push({
-            type: "text",
-            text: message.content,
-            state: partState(message.partial),
-            ...(message.contentProviderMetadata !== undefined && {
-              providerMetadata: message.contentProviderMetadata
-            })
-          } as UIPart);
+          keyed.push([
+            "text",
+            {
+              type: "text",
+              text: message.content,
+              state: partState(message.partial),
+              ...(message.contentProviderMetadata !== undefined && {
+                providerMetadata: message.contentProviderMetadata
+              })
+            } as UIPart
+          ]);
+        }
+        if (message.partOrder) {
+          const byToken = new Map(keyed);
+          for (const token of message.partOrder) {
+            const part = byToken.get(token);
+            if (part === undefined) continue; // dangling token: tolerate
+            parts.push(part);
+            byToken.delete(token);
+          }
+          for (const [token, part] of keyed) {
+            if (byToken.has(token)) parts.push(part);
+          }
+        } else {
+          for (const [, part] of keyed) parts.push(part);
         }
         if (parts.length) {
           const assistant = {

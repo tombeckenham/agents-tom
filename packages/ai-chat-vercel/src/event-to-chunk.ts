@@ -72,6 +72,11 @@ export class EventToChunkProjector {
   // an id to attach.
   private runStartedBuffered = false;
   private leadingStartEmitted = false;
+  // Assistant message id from RUN_STARTED's CF `messageId` extension. When
+  // present it outranks the first content event's id for the leading `start`
+  // chunk — a reasoning-first run's first content id is the REASONING row id,
+  // not the assistant the server will persist.
+  private runMessageId: string | null = null;
   // STEP_STARTED events that arrived before the leading `start` was emitted:
   // legacy order is `start` then `start-step`, but AG-UI's STEP_STARTED can
   // precede the first content event that carries the start's messageId.
@@ -98,7 +103,13 @@ export class EventToChunkProjector {
     // later server snapshot; the fix is for the producer to send
     // `parentMessageId`, which `chunk-to-event` now does.
     this.leadingStartEmitted = true;
-    return [{ type: "start" }, ...this.flushPendingStepStarts(), ...chunks];
+    return [
+      this.runMessageId != null
+        ? { type: "start", messageId: this.runMessageId }
+        : { type: "start" },
+      ...this.flushPendingStepStarts(),
+      ...chunks
+    ];
   }
 
   private flushPendingStepStarts(): UIMessageChunk[] {
@@ -113,6 +124,8 @@ export class EventToChunkProjector {
     switch (event.type) {
       case "RUN_STARTED":
         this.runStartedBuffered = true;
+        this.runMessageId =
+          (event as { messageId?: string }).messageId ?? this.runMessageId;
         return [];
 
       case "RUN_FINISHED": {
@@ -327,8 +340,11 @@ export class EventToChunkProjector {
     // only assigns an id / writes when `messageId` or `messageMetadata` is
     // present) — it is emitted for the consumers that key off the chunk
     // itself, notably `broadcast-state`'s replay-reset marker.
+    const startId = this.runMessageId ?? messageId;
     return [
-      messageId != null ? { type: "start", messageId } : { type: "start" },
+      startId != null
+        ? { type: "start", messageId: startId }
+        : { type: "start" },
       ...this.flushPendingStepStarts()
     ];
   }

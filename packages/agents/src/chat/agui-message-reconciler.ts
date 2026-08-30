@@ -130,17 +130,38 @@ function mergeServerToolResults(
   server: readonly AGUIMessage[]
 ): AGUIMessage[] {
   const serverToolMessages = new Map<string, ToolMessage>();
+  // Assistants carrying approval state: decisions are recorded server-side
+  // (the approval frame never reaches this path), so a stale client copy
+  // without them must not erase a recorded denial on an exact-id write-back.
+  const serverApprovals = new Map<string, AssistantMessage>();
   for (const msg of server) {
     if (!isWellFormed(msg)) continue;
     if (msg.role === "tool") {
       serverToolMessages.set(msg.toolCallId, msg);
+    } else if (msg.role === "assistant" && msg.toolApprovals) {
+      serverApprovals.set(msg.id, msg);
     }
   }
 
-  if (serverToolMessages.size === 0) return incoming;
+  if (serverToolMessages.size === 0 && serverApprovals.size === 0) {
+    return incoming;
+  }
 
   return incoming.map((msg) => {
     if (!isWellFormed(msg)) return msg;
+    if (msg.role === "assistant") {
+      const serverAssistant = serverApprovals.get(msg.id);
+      if (!serverAssistant?.toolApprovals) return msg;
+      // Server entries win per toolCallId; incoming entries for calls the
+      // server has no record of are kept.
+      return {
+        ...msg,
+        toolApprovals: {
+          ...msg.toolApprovals,
+          ...serverAssistant.toolApprovals
+        }
+      };
+    }
     if (msg.role !== "tool") return msg;
     const serverTool = serverToolMessages.get(msg.toolCallId);
     if (!serverTool) return msg;

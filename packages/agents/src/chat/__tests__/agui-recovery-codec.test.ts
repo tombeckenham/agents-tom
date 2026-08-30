@@ -258,7 +258,9 @@ describe("AGUIRecoveryCodec.toRecoveryPartial", () => {
             type: "function",
             function: { name: "getWeather", arguments: '{"city":"Sydney"}' }
           }
-        ]
+        ],
+        // The text stream opened before the tool call — order is recorded.
+        partOrder: ["text", "tool:tc-1"]
       },
       {
         id: "tool-1",

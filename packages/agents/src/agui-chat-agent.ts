@@ -1347,8 +1347,17 @@ export class AGUIChatAgent<
       });
       if (toolMessage.error !== undefined) {
         // The reducer builds a bare ToolMessage; carry the error text across.
+        // Resolve by toolCallId, not position: the reducer's first-result-wins
+        // dedupe may not have pushed anything, and `.at(-1)` would then pin
+        // this error on a DIFFERENT parallel tool's row.
         const added = streaming.messages.at(-1);
-        if (added?.role === "tool") added.error = toolMessage.error;
+        if (
+          added?.role === "tool" &&
+          added.toolCallId === toolCallId &&
+          added.error === undefined
+        ) {
+          added.error = toolMessage.error;
+        }
       }
       this._streamingMessages = [...streaming.messages];
       this._broadcastChatMessage({
@@ -2261,15 +2270,23 @@ export class AGUIChatAgent<
           return { status: "completed" };
         }
 
-        const streamId = this._startStream(id, { continuation });
-        const reader = response.body.getReader();
-
         // Seed the accumulator from the last assistant message when this
         // turn is a continuation — matches the legacy class's cloning
-        // behavior.
+        // behavior. Computed BEFORE the stream starts so the seed assistant
+        // id lands in the stream's metadata row: a continuation's events
+        // never re-announce that id, so the `_consumeSSELine` backfill would
+        // leave `message_id` NULL and a crash mid-continuation would
+        // reconstruct via the pre-#1691 fallback instead.
         const seed: AGUIMessage[] = continuation
           ? this._continuationSeed()
           : [];
+        const streamId = this._startStream(id, {
+          continuation,
+          messageId: seed.find(
+            (m): m is AssistantMessage => m.role === "assistant"
+          )?.id
+        });
+        const reader = response.body.getReader();
         const accumulator = new AGUIStreamAccumulator({
           existingMessages: seed
         });
@@ -3001,7 +3018,18 @@ export class AGUIChatAgent<
 
     const partial = replaced ? cm.partial : (existing.partial ?? cm.partial);
 
-    return {
+    // `partOrder` tokens index into extras/toolCalls, so it only survives the
+    // merge when one side's arrays survived intact; a concat/union invalidates
+    // both sides' indices and falls back to canonical projection order.
+    const partOrder =
+      extraParts === cmExtras && toolCalls.length === cmCalls.length
+        ? cm.partOrder
+        : extraParts === rowExtras &&
+            toolCalls.length === (existing.toolCalls?.length ?? 0)
+          ? existing.partOrder
+          : undefined;
+
+    const merged: AssistantMessage = {
       ...existing,
       ...(content !== "" ? { content } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
@@ -3012,6 +3040,9 @@ export class AGUIChatAgent<
       ...(metadata !== undefined ? { metadata } : {}),
       ...(partial ? { partial: true as const } : {})
     };
+    if (partOrder) merged.partOrder = partOrder;
+    else delete merged.partOrder;
+    return merged;
   }
 
   // ── Resumable stream delegates (parity with AIChatAgent) ───────────

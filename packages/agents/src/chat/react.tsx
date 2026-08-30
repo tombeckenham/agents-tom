@@ -10,6 +10,8 @@ import type {
 import { nanoid } from "nanoid";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OutgoingMessage } from "./wire-types";
+import { autoTransformAGUIMessages } from "./agui-migration";
+import { toUIMessages } from "./agui-to-ui-messages";
 import { STREAM_RESUME_NONE_REASONS } from "./protocol";
 import { MessageType } from "./wire-types";
 import {
@@ -283,7 +285,11 @@ export async function getAgentMessages<M extends UIMessage = UIMessage>(
     const text = await response.text();
     if (!text.trim()) return [];
 
-    return JSON.parse(text) as M[];
+    // `/get-messages` serves persisted AG-UI rows (`_v`-marked) — project
+    // them to the UIMessage shape this hook speaks.
+    return toUIMessages(
+      autoTransformAGUIMessages(JSON.parse(text) as unknown[])
+    ) as M[];
   } catch (error) {
     console.warn("[getAgentMessages] Fetch error:", error);
     return [];
@@ -860,7 +866,11 @@ export function useAgentChat<
     }
 
     try {
-      return JSON.parse(text) as ChatMessage[];
+      // `/get-messages` serves persisted AG-UI rows (`_v`-marked) — project
+      // them to the UIMessage shape this hook speaks.
+      return toUIMessages(
+        autoTransformAGUIMessages(JSON.parse(text) as unknown[])
+      ) as ChatMessage[];
     } catch (error) {
       console.warn("Failed to parse initial messages JSON:", error);
       return [];

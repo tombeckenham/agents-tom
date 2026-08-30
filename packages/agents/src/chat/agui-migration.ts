@@ -80,8 +80,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 export function isPersistedAGUIMessage(value: unknown): boolean {
   if (!isObject(value)) return false;
   if (value._v !== PERSISTED_MESSAGE_SCHEMA_VERSION) return false;
-  if (typeof value.id !== "string") return false;
-  if (typeof value.role !== "string") return false;
+  if (typeof value.id !== "string" || value.id.length === 0) return false;
+  // Validate the role like the sibling guards: a `_v` row with a bogus role
+  // would pass the /get-messages filter and then vanish silently inside
+  // `toUIMessages` — and a dropped assistant orphans its tool rows.
+  if (typeof value.role !== "string" || !AGUI_ROLES.has(value.role as AGUIRole))
+    return false;
   return true;
 }
 
@@ -545,6 +549,50 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     }
   }
 
+  // Record the original part order when it differs from the canonical
+  // projection order (extras → tools → text) so `toUIMessages` can restore
+  // interleavings like [step-start, tool, step-start, text]. Token indices
+  // follow the walk order used to build `extraParts`/`toolCalls` above.
+  const partOrder: string[] = [];
+  let extraIndex = 0;
+  const seenToolIds = new Set<string>();
+  let textSeen = false;
+  for (const part of msg.parts) {
+    if (isTextPart(part)) {
+      if (!textSeen && textContent) {
+        partOrder.push("text");
+        textSeen = true;
+      }
+      continue;
+    }
+    if (isToolPart(part)) {
+      const toolCallId = part.toolCallId;
+      if (
+        typeof toolCallId === "string" &&
+        !seenToolIds.has(toolCallId) &&
+        toolCalls.some((call) => call.id === toolCallId)
+      ) {
+        seenToolIds.add(toolCallId);
+        partOrder.push(`tool:${toolCallId}`);
+      }
+      continue;
+    }
+    if (
+      (isDataPart(part) && part.type !== "data-cf.activity") ||
+      isExtraAssistantPart(part)
+    ) {
+      partOrder.push(`extra:${extraIndex++}`);
+    }
+  }
+  const canonicalOrder = [
+    ...extraParts.map((_, i) => `extra:${i}`),
+    ...toolCalls.map((call) => `tool:${call.id}`),
+    ...(textContent ? ["text"] : [])
+  ];
+  const orderDiffers =
+    partOrder.length !== canonicalOrder.length ||
+    partOrder.some((token, i) => token !== canonicalOrder[i]);
+
   const streamingText = msg.parts.some(
     (part) => isTextPart(part) && part.state === "streaming"
   );
@@ -560,6 +608,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(Object.keys(toolApprovals).length ? { toolApprovals } : {}),
     ...(extraParts.length ? { extraParts } : {}),
+    ...(orderDiffers ? { partOrder } : {}),
     ...(streamingText && { partial: true as const }),
     ...(contentProviderMetadata !== undefined && { contentProviderMetadata }),
     ...(msg.metadata !== undefined && { metadata: msg.metadata })

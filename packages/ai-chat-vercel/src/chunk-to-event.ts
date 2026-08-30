@@ -395,10 +395,19 @@ export class ChunkToEventProjector {
   private textMessageId(partId: string): string {
     const known = this.textPartMessageIds.get(partId);
     if (known) return known;
+    // Later parts mint a fresh id rather than passing the part id through:
+    // AI SDK part ids are POSITIONAL ("0", "1", … reset per response), so a
+    // verbatim id collides with the previous turn's second text part and
+    // overwrites its persisted row. Same fix as `reasoningMessageId`. With
+    // no run anchor at all (a mid-stream fragment translated without its
+    // RUN_STARTED, e.g. resume replay) the part id passes through so frames
+    // stay correlated with the stream's earlier, untranslated frames.
     const messageId =
-      this.runMessageId != null && this.textPartMessageIds.size === 0
-        ? this.runMessageId
-        : partId;
+      this.runMessageId == null
+        ? partId
+        : this.textPartMessageIds.size === 0
+          ? this.runMessageId
+          : nanoid();
     this.textPartMessageIds.set(partId, messageId);
     return messageId;
   }
@@ -434,8 +443,17 @@ export class ChunkToEventProjector {
     // persisted assistant row, and a tool+text turn would split into two
     // assistant messages.
     this.runMessageId ??= nanoid();
+    // CF extension: carry the run's assistant id so a client projection can
+    // open its leading `start` chunk with the SAME id the server persists,
+    // even when the run's first content is not text (reasoning-first,
+    // metadata-first turns).
     return [
-      { type: "RUN_STARTED", threadId: this.threadId, runId: this.runId }
+      {
+        type: "RUN_STARTED",
+        threadId: this.threadId,
+        runId: this.runId,
+        messageId: this.runMessageId
+      }
     ];
   }
 

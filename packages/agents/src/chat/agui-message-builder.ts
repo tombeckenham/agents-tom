@@ -75,6 +75,12 @@ export type SnapshotState = {
   readonly pendingExtraParts: AssistantExtraPart[];
   /** message metadata that arrived before any assistant exists. */
   pendingMetadata?: unknown;
+  /**
+   * `messages.length` at snapshot creation / last RUN_STARTED — everything
+   * below this index pre-exists the current run (settled prefix or
+   * continuation seed).
+   */
+  runStartCount: number;
   threadId?: string;
   runId?: string;
   state?: unknown;
@@ -95,7 +101,8 @@ export function createInitialSnapshot(
     toolBuffers: new Map(),
     pendingApprovals: new Map(),
     customEvents: [],
-    pendingExtraParts: []
+    pendingExtraParts: [],
+    runStartCount: messages.length
   };
 }
 
@@ -213,6 +220,11 @@ function handleRunStarted(
   }
   state.threadId = event.threadId;
   state.runId = event.runId;
+  state.runStartCount = state.messages.length;
+  // A new run supersedes a previous run's error on this stream — without
+  // this a multi-run stream would terminalize as error after a later
+  // successful run.
+  delete state.lastError;
   return true;
 }
 
@@ -260,6 +272,7 @@ function handleTextStart(
   if (existing) {
     if (existing.content === undefined) {
       existing.content = "";
+      notePartOrder(existing, "text", false);
     }
     existing.partial = true;
     state.textStreams.set(event.messageId, existing);
@@ -334,6 +347,13 @@ function handleToolStart(
     type: "function",
     function: { name: event.toolCallName, arguments: "" }
   };
+  // A tool call landing after the text slot opened is out of canonical
+  // order (tools project before text) — record the true order.
+  notePartOrder(
+    assistant,
+    `tool:${event.toolCallId}`,
+    assistant.content !== undefined
+  );
   if (!assistant.toolCalls) {
     assistant.toolCalls = [];
   }
@@ -431,11 +451,16 @@ function handleReasoningStart(
     partial: true
   };
   // AG-UI convention: reasoning precedes the assistant it relates to. When
-  // the run's assistant is already open (continuation seed, or reasoning
-  // arriving mid-turn), insert before it so the projection folds the
-  // reasoning onto that assistant instead of stranding it after.
+  // the trailing assistant PRE-EXISTS this run (continuation seed), insert
+  // before it so the projection folds the reasoning onto that assistant
+  // instead of stranding it after. An assistant created by THIS run keeps
+  // reasoning after it — mid-turn reasoning follows the text it trails.
   const last = state.messages[state.messages.length - 1];
-  if (last && last.role === "assistant") {
+  if (
+    last &&
+    last.role === "assistant" &&
+    state.messages.length <= state.runStartCount
+  ) {
     state.messages.splice(state.messages.length - 1, 0, reasoning);
   } else {
     state.messages.push(reasoning);
@@ -546,6 +571,7 @@ function handleMessagesSnapshot(
     return false;
   }
   state.messages = [...event.messages];
+  state.runStartCount = state.messages.length;
   clearInFlight(state);
   return true;
 }
@@ -823,10 +849,44 @@ function isDataWrapper(
 function attachExtraPart(state: SnapshotState, part: AssistantExtraPart): void {
   const assistant = lastAssistant(state);
   if (assistant) {
+    notePartOrder(
+      assistant,
+      `extra:${assistant.extraParts?.length ?? 0}`,
+      (assistant.toolCalls?.length ?? 0) > 0 || assistant.content !== undefined
+    );
     (assistant.extraParts ??= []).push(part);
   } else {
     state.pendingExtraParts.push(part);
   }
+}
+
+/**
+ * Record `token` in the assistant's `partOrder` (see the CF extension on
+ * `AssistantMessage`). The field only materializes on the first
+ * out-of-canonical-order attach — until then the canonical projection order
+ * (extras → tools → text) IS the arrival order, so nothing is stored and
+ * settled rows stay byte-stable.
+ */
+function notePartOrder(
+  assistant: AssistantMessage,
+  token: string,
+  outOfOrder: boolean
+): void {
+  if (assistant.partOrder) {
+    if (!assistant.partOrder.includes(token)) assistant.partOrder.push(token);
+    return;
+  }
+  if (!outOfOrder) return;
+  // Everything attached so far arrived in canonical order (else partOrder
+  // would already exist) — materialize that prefix, then the new token.
+  const order: string[] = [];
+  for (let i = 0; i < (assistant.extraParts?.length ?? 0); i++) {
+    order.push(`extra:${i}`);
+  }
+  for (const tc of assistant.toolCalls ?? []) order.push(`tool:${tc.id}`);
+  if (assistant.content !== undefined) order.push("text");
+  order.push(token);
+  assistant.partOrder = order;
 }
 
 /** Attach message metadata to the current/next assistant. Object metadata

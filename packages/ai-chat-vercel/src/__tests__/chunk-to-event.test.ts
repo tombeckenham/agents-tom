@@ -33,7 +33,10 @@ describe("ChunkToEventProjector — lifecycle", () => {
     expect(events[0]).toEqual({
       type: "RUN_STARTED",
       threadId: "thread-1",
-      runId: "run-1"
+      runId: "run-1",
+      // CF extension: the run's assistant id rides RUN_STARTED so the
+      // client projection opens `start` with the id the server persists.
+      messageId: "m1"
     });
     expect(events[1]).toEqual({
       type: "TEXT_MESSAGE_START",
@@ -104,6 +107,49 @@ describe("ChunkToEventProjector — text", () => {
       "TEXT_MESSAGE_END",
       "RUN_FINISHED"
     ]);
+  });
+
+  it("later text parts mint fresh message ids (positional part ids must not collide across turns)", () => {
+    // AI SDK text part ids are positional ("0", "1", … reset per response):
+    // a text→tool→text turn's second part is "1" in EVERY turn, so passing
+    // it through verbatim overwrites the previous turn's row on persist.
+    const events = project([
+      { type: "start", messageId: "assistant-1" },
+      { type: "text-start", id: "0" },
+      { type: "text-end", id: "0" },
+      { type: "tool-input-start", toolCallId: "tc-1", toolName: "t" },
+      {
+        type: "tool-input-available",
+        toolCallId: "tc-1",
+        toolName: "t",
+        input: {}
+      },
+      { type: "text-start", id: "1" },
+      { type: "text-delta", id: "1", delta: "after tool" },
+      { type: "text-end", id: "1" }
+    ] as UIMessageChunk[]);
+    const textStarts = events.filter((e) => e.type === "TEXT_MESSAGE_START");
+    expect(textStarts).toHaveLength(2);
+    const [first, second] = textStarts as Array<{ messageId: string }>;
+    expect(first.messageId).toBe("assistant-1");
+    expect(second.messageId).not.toBe("1");
+    expect(second.messageId).not.toBe(first.messageId);
+    // Deltas follow their part's minted id.
+    const delta = events.find((e) => e.type === "TEXT_MESSAGE_CONTENT") as {
+      messageId: string;
+    };
+    expect(delta.messageId).toBe(second.messageId);
+  });
+
+  it("RUN_STARTED carries the run message id (CF extension)", () => {
+    const events = project([
+      { type: "start", messageId: "assistant-1" },
+      { type: "text-start", id: "0" }
+    ] as UIMessageChunk[]);
+    const runStarted = events.find((e) => e.type === "RUN_STARTED") as {
+      messageId?: string;
+    };
+    expect(runStarted.messageId).toBe("assistant-1");
   });
 });
 

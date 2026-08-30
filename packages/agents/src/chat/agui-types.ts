@@ -209,6 +209,17 @@ export type AssistantMessage = BaseMessage & {
   partial?: true;
   /** CF extension: the legacy text part's providerMetadata. */
   contentProviderMetadata?: unknown;
+  /**
+   * CF extension: original part order within the assistant turn, present only
+   * when it differs from the canonical projection order (extraParts →
+   * toolCalls → text). Tokens: `"text"` (the `content` slot),
+   * `"tool:<toolCallId>"`, `"extra:<index into extraParts>"`. `toUIMessages`
+   * rebuilds parts in this order; without it a turn like
+   * [step-start, tool, step-start, text] would be reordered — and
+   * `convertToModelMessages` splits on step-start, so the model would see the
+   * post-tool answer before the tool result.
+   */
+  partOrder?: string[];
 };
 
 /**
@@ -366,6 +377,15 @@ export type RunStartedEvent = BaseAGUIEvent & {
   readonly runId: string;
   readonly parentRunId?: string;
   readonly input?: unknown;
+  /**
+   * CF extension: the assistant message id this run will stream into, when
+   * the producer knows it up front. Lets a client projection emit its leading
+   * `start` chunk with the SAME id the server persists even when the run's
+   * first content is not text (reasoning-first, metadata-first turns) —
+   * without it the client mints an id and the streamed message can never
+   * reconcile with the persisted row.
+   */
+  readonly messageId?: string;
 };
 
 /**
