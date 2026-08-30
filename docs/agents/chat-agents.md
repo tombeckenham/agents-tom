@@ -127,6 +127,8 @@ The `new_sqlite_classes` migration is required — `AIChatAgent` uses SQLite for
 4. Chunks stream back over WebSocket in real-time
 5. When the stream completes, the final message is persisted and broadcast to all connections
 
+`AIChatAgent` is a projection layer over `AGUIChatAgent` — the AG-UI canonical chat engine that ships in the `agents` package (hence the `agents >= 0.21.0` peer dependency). The engine owns turns, persistence, streaming, recovery, and transport; `AIChatAgent` keeps the AI SDK surface on top of it, projecting `UIMessageChunk` streams to AG-UI events on the way out and AG-UI rows to `UIMessage` on the way in. The API above is unaffected. Where it does show through — persisted row shape, `maxPersistedMessages` counting, the raw rows on broadcast frames — it is called out in the relevant section, and collected in [Migrating to the AG-UI engine](./migration-to-agui-engine.md).
+
 ## Server API
 
 ### `AIChatAgent`
@@ -202,15 +204,29 @@ async onChatMessage(_onFinish, options) {
 
 The current conversation history, loaded from SQLite. This is an array of `UIMessage` objects from the AI SDK. Messages are automatically persisted after each interaction.
 
+The array is a **frozen projection** of the persisted AG-UI rows (see [Persisted row format](#persisted-row-format)), rebuilt on each read. Mutating it in place throws a `TypeError`:
+
+```typescript
+// Throws — the projection is frozen
+this.messages.push(newMessage);
+
+// Do this instead
+await this.saveMessages([...this.messages, newMessage]);
+```
+
 ### `maxPersistedMessages`
 
-Cap the number of messages stored in SQLite. When the limit is exceeded, the oldest messages are deleted. This controls storage only — it does not affect what is sent to the LLM.
+Cap the number of **rows** stored in SQLite. When the limit is exceeded, the oldest rows are deleted. This controls storage only — it does not affect what is sent to the LLM.
 
 ```typescript
 export class ChatAgent extends AIChatAgent {
   maxPersistedMessages = 200;
 }
 ```
+
+A row is not the same thing as a `UIMessage`. Tool results are stored as their own rows rather than folded onto the assistant turn that issued the call, so a turn that calls one tool costs three rows (user, assistant, tool), not two. At small limits this changes which turns survive — trimming to 2 keeps `[assistant, tool]` where a `UIMessage`-counting limit would have kept `[user, assistant]`, dropping the user's own turn out of persisted history and out of `/get-messages`.
+
+Budget roughly one extra row per expected tool call. The default is generous enough that this only matters if you set a deliberately small limit.
 
 To control what is sent to the model, use the AI SDK's `pruneMessages()`:
 
@@ -1307,6 +1323,31 @@ For more details, see [Resumable Streaming](./resumable-streaming.md).
 
 ## Storage Management
 
+### Persisted row format
+
+`AIChatAgent` stores conversations as AG-UI rows, marked with `_v: "v6_agui_message"`. This is an implementation detail for most applications — `this.messages`, `onChatResponse`, and `useAgentChat` all speak `UIMessage` — but it is visible if you read the table directly, and it differs from the `UIMessage` rows written by releases before `@cloudflare/ai-chat` v1.
+
+Two consequences follow from the row shape:
+
+- **Tool results are separate rows** with `role: "tool"`, matched to their call by `toolCallId`. `UIMessage` folds them onto the assistant turn instead. This is what makes `maxPersistedMessages` count differently — see [`maxPersistedMessages`](#maxpersistedmessages).
+- **Legacy rows migrate on first load**, one way. The first time an agent with pre-v1 rows loads its history, those rows are rewritten in the AG-UI shape. There is no automatic path back.
+
+To read persisted rows as `UIMessage[]` yourself, project them with `toUIMessages`:
+
+```typescript
+import { toUIMessages } from "@cloudflare/ai-chat";
+import type { AGUIMessage } from "agents/chat/agui-types";
+
+const rows =
+  this.sql`select message from cf_ai_chat_agent_messages order by created_at` ??
+  [];
+const messages = toUIMessages(
+  rows.map((row) => JSON.parse(row.message as string) as AGUIMessage)
+);
+```
+
+Activity messages have no `UIMessage` counterpart and are dropped by this projection. That is the one lossy edge.
+
 ### Row Size Protection
 
 SQLite rows have a maximum size of 2 MB. When a message approaches this limit (for example, a tool returning a very large output), `AIChatAgent` automatically compacts the message:
@@ -1657,11 +1698,13 @@ The originating client receives the streaming response. All other clients receiv
 
 ### Exports
 
-| Import path                 | Exports                                                                                                                                                                         |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@cloudflare/ai-chat`       | `AIChatAgent`, `createToolsFromClientSchemas`, `ChatRecoveryContext`, `ChatRecoveryOptions`, `ChatRecoveryConfig`, `ChatRecoveryExhaustedContext`, `ResolvedChatRecoveryConfig` |
-| `@cloudflare/ai-chat/react` | `useAgentChat`                                                                                                                                                                  |
-| `@cloudflare/ai-chat/types` | `MessageType`, `OutgoingMessage`, `IncomingMessage`                                                                                                                             |
+| Import path                 | Exports                                                                                                                                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@cloudflare/ai-chat`       | `AIChatAgent`, `createToolsFromClientSchemas`, `toAGUIResponse`, `toUIMessages`, `ChatRecoveryContext`, `ChatRecoveryOptions`, `ChatRecoveryConfig`, `ChatRecoveryExhaustedContext`, `ResolvedChatRecoveryConfig` |
+| `@cloudflare/ai-chat/react` | `useAgentChat`                                                                                                                                                                                                    |
+| `@cloudflare/ai-chat/types` | `MessageType`, `OutgoingMessage`, `IncomingMessage`                                                                                                                                                               |
+
+`toAGUIResponse` and `toUIMessages` are for applications that extend `AGUIChatAgent` (from `agents`) directly but still build their streams with the AI SDK. `AIChatAgent` applies both internally — you do not need them when extending it.
 
 ### WebSocket Protocol
 
@@ -1680,6 +1723,16 @@ The chat protocol uses typed JSON messages over WebSocket:
 | `CF_AGENT_STREAM_RESUMING`       | Server → Client | Notify of stream resumption |
 | `CF_AGENT_STREAM_RESUME_REQUEST` | Client → Server | Request stream resume check |
 
+`CF_AGENT_MESSAGE_UPDATED` and `CF_AGENT_CHAT_MESSAGES` carry **raw AG-UI rows**, not `UIMessage` objects. A row can have `role: "tool"`, which is not a valid `UIMessage` role. `useAgentChat` handles this for you. If you consume these frames directly — a custom client, a bridge, an analytics listener — project them first:
+
+```typescript
+import { toUIMessages } from "@cloudflare/ai-chat";
+import { autoTransformAGUIMessages } from "agents/chat";
+
+// autoTransformAGUIMessages also migrates any legacy rows it is handed
+const messages = toUIMessages(autoTransformAGUIMessages(frame.messages));
+```
+
 ## Examples
 
 - [AI Chat Example](https://github.com/cloudflare/agents/tree/main/examples/ai-chat) — Modern example with server tools, client tools, and approval
@@ -1696,4 +1749,5 @@ The chat protocol uses typed JSON messages over WebSocket:
 - [Human in the Loop](./human-in-the-loop.md) — Approval flows and manual intervention patterns
 - [Resumable Streaming](./resumable-streaming.md) — How stream resumption works
 - [Client Tools Continuation](./client-tools-continuation.md) — Advanced client-side tool patterns
+- [Migrating to the AG-UI engine](./migration-to-agui-engine.md) — Upgrading to `@cloudflare/ai-chat` v1
 - [Migration to AI SDK v6](./migration-to-ai-sdk-v6.md) — Upgrading from AI SDK v5

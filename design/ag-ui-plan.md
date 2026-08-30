@@ -13,11 +13,17 @@ the legacy Vercel-shaped modules are deleted.**
 
 ## End state
 
-- `packages/agents/src/chat/` contains one set of shape modules: the `agui-*`
+- ~~`packages/agents/src/chat/` contains one set of shape modules: the `agui-*`
   ones. `message-builder.ts`, `stream-accumulator.ts`, `sanitize.ts`,
   `message-reconciler.ts`, `broadcast-state.ts`, `agent-tools.ts` (chat),
-  `repair-transcript.ts`, and the other Vercel-shaped chat modules are gone.
-- `grep -r 'from "ai"' packages/agents/src/chat/` returns nothing.
+  `repair-transcript.ts`, and the other Vercel-shaped chat modules are gone.~~
+- ~~`grep -r 'from "ai"' packages/agents/src/chat/` returns nothing.~~
+  **Both amended in Phase 7** — see "Why the original `grep` gate was
+  dropped" under Phase 6. The chat directory sheds every module whose only
+  consumer was the deleted legacy class; the Vercel-shaped modules that
+  remain are held alive by `packages/think`, and a handful of `ai` imports
+  are load-bearing for the AG-UI stack itself. Retiring the rest is a named
+  follow-up, not part of this cutover.
 - `AIChatAgent` in `@cloudflare/ai-chat` extends `AGUIChatAgent`. Its public
   API is unchanged (`onChatMessage` returns an AI SDK stream Response,
   `this.messages` is `UIMessage[]`, hooks keep their signatures), but every
@@ -180,8 +186,57 @@ until Phase 5 so the harness can run both.
 - Execute the package-layout decision (fold or publish `ai-chat-vercel`).
 - Rewrite changesets: `@cloudflare/ai-chat` major with migration notes;
   `agents` minor.
-- **Exit gate:** `grep -r 'from "ai"' packages/agents/src/chat/` empty;
-  `pnpm test && pnpm run check` green; `changeset status` correct.
+- ~~**Exit gate:** `grep -r 'from "ai"' packages/agents/src/chat/` empty;
+  `pnpm test && pnpm run check` green; `changeset status` correct.~~
+  **Amended in Phase 7 — the `grep` clause was unachievable as written.**
+  See below.
+- **Exit gate (amended):** the importer-driven sweep reaches fixpoint with no
+  module left in `packages/agents/src/chat/` whose only consumer was the
+  deleted legacy `AIChatAgent`; `pnpm test && pnpm run check` green;
+  `changeset status` correct.
+
+#### Why the original `grep` gate was dropped
+
+Written before Phase 1, the gate assumed every `from "ai"` import under
+`packages/agents/src/chat/` belonged to the legacy Vercel path. Two things
+falsify that, both discovered while executing the phase:
+
+1. **Several `ai` imports are load-bearing for the AG-UI stack itself.**
+   `agui-to-ui-messages.ts` produces `UIMessage` by definition — importing
+   the type is the whole point of the module. `lifecycle.ts` and
+   `client-tools.ts` are imported directly by `AGUIChatAgent`
+   (`packages/agents/src/agui-chat-agent.ts`). And `broadcast-state.ts` —
+   which pulls in `stream-accumulator.ts` and `message-builder.ts` — backs
+   the live cross-tab observer path that `packages/ai-chat/src/react-agui.tsx`
+   reaches through `agents/chat/react`. Deleting these would delete the
+   engine, not the legacy layer.
+2. **`agents/chat/react` is not Think-only.** `react-agui.tsx` imports
+   `UseAgentChatOptions`, `extractClientToolSchemas` and the tool-part
+   helpers from it, and re-exports them rather than redeclaring them,
+   deliberately — it is the mechanism that stops the AG-UI hook's public
+   surface from drifting away from the legacy hook's.
+
+What Phase 6 could and did achieve is the fixpoint sweep: every module whose
+last production consumer was the deleted class is gone (`agui-broadcast-state`,
+`isReplayChunk`, `reconcileOrphanPartial`, the dead barrel aliases). The
+Vercel-shaped modules that remain are alive because `packages/think` imports
+`agents/chat` and `agents/chat/react` (34 import sites), not because the
+cutover missed them.
+
+#### Follow-ups this defers (not blockers for this PR)
+
+- **Migrate Think off the Vercel-shaped chat modules.** `packages/think` is
+  now the sole reason `message-builder`, `stream-accumulator`,
+  `broadcast-state`, `sanitize`, `message-reconciler`, `repair-transcript`,
+  `orphan-persist`, `orphan-store`, `wire-types`, the legacy
+  `ws-chat-transport` and `chat/react.tsx` survive. Porting Think to the
+  AG-UI engine retires all of them in one sweep, and only then does an
+  `ai`-free `agents/chat` become meaningful.
+- **Cut `@cloudflare/ai-chat`'s dependency on `agents/chat/react`.** The
+  re-export coupling in `react-agui.tsx` was an anti-drift device for the
+  cutover, and it has served that purpose. Once Think is migrated, move the
+  option types and tool-part helpers into `@cloudflare/ai-chat` and let
+  `agents/chat/react` go with the rest.
 
 ### Phase 7 — Examples, docs, PR
 
