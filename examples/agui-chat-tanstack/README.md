@@ -1,7 +1,7 @@
 # AG-UI Chat — TanStack AI adapter
 
-The same agent as [`examples/agui-chat-vercel`](../agui-chat-vercel), driven
-by [`@tanstack/ai`](https://tanstack.com/ai) through
+The [`examples/ai-chat`](../ai-chat) agent, driven by
+[`@tanstack/ai`](https://tanstack.com/ai) through
 [`@cloudflare/ai-chat-tanstack`](../../packages/ai-chat-tanstack).
 
 This is the example that motivates the RFC. TanStack's `chat()` already
@@ -13,14 +13,15 @@ const stream = chat({ adapter, stream: true, messages, systemPrompts });
 return toAGUIResponse(stream);
 ```
 
-Compare with the Vercel example, where `toAGUIResponse()` has to translate a
-`UIMessageChunk` stream into AG-UI events first. Same agent, same wire
+Compare with the AI SDK path (`examples/ai-chat`, and the `AGUIChatAgent`
+variant documented in its README), where `toAGUIResponse()` has to translate
+a `UIMessageChunk` stream into AG-UI events first. Same agent, same wire
 format, same persisted rows — the adapter absorbs the difference.
 
 The message projection tells the same story. `toModelMessages()` here is a
 field rename and a role fold, because TanStack's `ModelMessage` already
 carries `role` / `content` / `toolCalls` / `toolCallId` with AG-UI's
-meanings. `toUIMessages()` in the Vercel adapter has to reshape tool results
+meanings. `toUIMessages()` on the AI SDK path has to reshape tool results
 onto the assistant turn that issued them.
 
 ## Client

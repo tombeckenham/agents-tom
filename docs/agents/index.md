@@ -137,6 +137,7 @@ The differentiator is not "we have durable state" — it is what happens when a 
 
 - [Migration to AI SDK v5](./migration-to-ai-sdk-v5.md)
 - [Migration to AI SDK v6](./migration-to-ai-sdk-v6.md)
+- [Migrating to the AG-UI engine](./migration-to-agui-engine.md) - Upgrading to `@cloudflare/ai-chat` v1
 
 ## Reference
 
