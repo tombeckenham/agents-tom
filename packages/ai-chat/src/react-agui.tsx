@@ -1,8 +1,8 @@
 /**
  * `useAgentChat` reimplemented as a projection layer over the AG-UI wire.
  *
- * Phase-4 sidecar: `src/react.tsx` (which re-exports the legacy hook from
- * `agents/chat/react`) is untouched until the Phase-5 differential cutover.
+ * `src/react.tsx` re-exports this module; it is the only `useAgentChat`
+ * implementation the package ships.
  *
  * The public API is the legacy one, verbatim — the options type, the pure
  * helpers (`extractClientToolSchemas`, `getToolPartState`, …) and the return
@@ -12,8 +12,8 @@
  *
  * - the transport is the shared `AGUIWebSocketTransport`
  *   (`agents/chat/agui-ws-transport`) wearing the AI SDK's `ChatTransport`
- *   shape via `event-to-chunk` — i.e. `@cloudflare/ai-chat-vercel`'s
- *   `WebSocketChatTransport`, whose React hook this file absorbs;
+ *   shape via `./event-to-chunk` — i.e. this package's
+ *   `WebSocketChatTransport`;
  * - `CF_AGENT_USE_CHAT_RESPONSE` bodies carry AG-UI events, not
  *   `UIMessageChunk`s, so the cross-tab/resume observer path projects each
  *   frame through a per-request `EventToChunkProjector` before feeding the
@@ -44,8 +44,8 @@ import type {
   AGUIMessage,
   ToolMessage
 } from "agents/chat/agui-types";
-import { EventToChunkProjector } from "@cloudflare/ai-chat-vercel";
-import { WebSocketChatTransport } from "@cloudflare/ai-chat-vercel/react";
+import { EventToChunkProjector } from "./event-to-chunk";
+import { WebSocketChatTransport } from "./ws-chat-transport";
 import {
   extractClientToolSchemas,
   type UseAgentChatOptions
@@ -75,7 +75,7 @@ export type {
 export {
   WebSocketChatTransport,
   type AgentConnection
-} from "@cloudflare/ai-chat-vercel/react";
+} from "./ws-chat-transport";
 
 type AnyAgent = UseAgentChatOptions<unknown, UIMessage>["agent"];
 type AgentConnectionErrorLike = NonNullable<AnyAgent["connectionError"]>;

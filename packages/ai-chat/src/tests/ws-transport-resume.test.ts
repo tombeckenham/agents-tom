@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { UIMessage as ChatMessage, UIMessageChunk } from "ai";
-import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+import { ChunkToEventProjector } from "../chunk-to-event";
 import { autoTransformAGUIMessages } from "agents/chat";
 import { WebSocketChatTransport } from "../ws-chat-transport";
 import { MessageType } from "../types";

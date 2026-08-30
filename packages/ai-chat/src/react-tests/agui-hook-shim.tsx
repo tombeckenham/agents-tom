@@ -13,7 +13,7 @@
  */
 
 import type { UIMessage, UIMessageChunk } from "ai";
-import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+import { ChunkToEventProjector } from "../chunk-to-event";
 import { autoTransformAGUIMessages } from "agents/chat";
 import {
   useAgentChat as useAGUIAgentChat,

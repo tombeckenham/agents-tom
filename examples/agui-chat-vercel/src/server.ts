@@ -4,7 +4,7 @@ import {
   AGUIChatAgent,
   type OnChatMessageOptions
 } from "agents/agui-chat-agent";
-import { toAGUIResponse, toUIMessages } from "@cloudflare/ai-chat-vercel";
+import { toAGUIResponse, toUIMessages } from "@cloudflare/ai-chat";
 import { streamText, convertToModelMessages, tool, isStepCount } from "ai";
 import { z } from "zod";
 

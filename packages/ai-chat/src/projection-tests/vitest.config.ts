@@ -15,7 +15,7 @@ export default defineConfig({
     })
   ],
   test: {
-    name: "workers",
+    name: "projection",
     include: [path.join(testsDir, "**/*.test.ts")],
     testTimeout: 10000,
     deps: {

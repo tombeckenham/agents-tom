@@ -16,3 +16,5 @@ Adds `agents/chat/agui-ws-transport`: the shared client-side WebSocket transport
 - **Auto-continuation** — tool results/approvals flagged `autoContinue` schedule a continuation through the shared barrier: siblings coalesce into one turn, and the turn fires only once the whole parallel tool batch is answered and no stream is in flight.
 
 Also adds `getServerTools()` to the MCP client (`agents/mcp/tanstack-ai`), projecting MCP tools into TanStack AI `ServerTool`s.
+
+Three `agents/chat` exports whose only consumer was the pre-cutover `AIChatAgent` are removed: `isReplayChunk`, `reconcileOrphanPartial`, and the `BroadcastTransitionResult` type alias. `agents/chat` is sibling-package support for `@cloudflare/ai-chat` and `@cloudflare/think` rather than a documented public API, and neither uses them; the AG-UI reducer (`agents/chat/agui-message-builder`) has its own replay detection and idempotent orphan reconstruction.

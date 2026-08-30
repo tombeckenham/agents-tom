@@ -5,7 +5,7 @@
  *
  * Pure structural TypeScript: no runtime, no imports, no Zod. Shapes are
  * intentionally assignable to `@ag-ui/core@0.0.53`'s runtime types so
- * adapter packages (`@cloudflare/ai-chat-vercel`,
+ * adapter packages (`@cloudflare/ai-chat`,
  * `@cloudflare/ai-chat-tanstack`, ...) can pass values straight through to
  * AG-UI validators / encoders without remapping.
  *

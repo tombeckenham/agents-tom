@@ -1,7 +1,7 @@
 /**
  * Wire envelope types for `@cloudflare/ai-chat-tanstack`.
  *
- * The CF_AGENT_* framing is identical to `@cloudflare/ai-chat-vercel`; the
+ * The CF_AGENT_* framing is identical to `@cloudflare/ai-chat`; the
  * body of `CF_AGENT_USE_CHAT_RESPONSE` is raw `JSON.stringify(event)` (no
  * `data: ` prefix — that prefix only appears inside server-side AG-UI SSE
  * bodies). Since TanStack AI is AG-UI-native, the transport parses each

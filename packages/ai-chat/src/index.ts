@@ -36,3 +36,11 @@ export type {
 } from "agents/chat";
 
 export { createToolsFromClientSchemas } from "agents/chat";
+
+// For consumers who extend `AGUIChatAgent` (from `agents`) directly but still
+// build their streams with the AI SDK: `toAGUIResponse` wraps a
+// `streamText().toUIMessageStreamResponse()` into AG-UI SSE, and
+// `toUIMessages` projects canonical AG-UI rows back to `UIMessage[]` for
+// `convertToModelMessages()`.
+export { toAGUIResponse } from "./to-agui-response";
+export { toUIMessages } from "agents/chat";

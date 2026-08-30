@@ -1,17 +1,17 @@
 # AG-UI Chat — Vercel AI SDK adapter
 
 The `examples/ai-chat` agent, moved onto the AG-UI canonical path via
-[`@cloudflare/ai-chat-vercel`](../../packages/ai-chat-vercel).
+[`@cloudflare/ai-chat`](../../packages/ai-chat).
 
 The point of this example is how little changes. Against the legacy
-version, the diff is three lines on the server and one on the client.
+version, the diff is three lines on the server and none on the client.
 
 ## Server
 
 ```diff
 -import { AIChatAgent } from "@cloudflare/ai-chat";
 +import { AGUIChatAgent } from "agents/agui-chat-agent";
-+import { toAGUIResponse, toUIMessages } from "@cloudflare/ai-chat-vercel";
++import { toAGUIResponse, toUIMessages } from "@cloudflare/ai-chat";
 
 -export class ChatAgent extends AIChatAgent<Env> {
 +export class ChatAgent extends AGUIChatAgent<Env> {
@@ -33,14 +33,11 @@ before the AI SDK sees it. `toAGUIResponse()` projects the outgoing
 
 ## Client
 
-```diff
--import { useAgentChat } from "@cloudflare/ai-chat/react";
-+import { useAgentChat } from "@cloudflare/ai-chat-vercel/react";
-```
-
-The hook's surface — `messages`, `sendMessage`, `clearHistory`, `stop`,
-`isStreaming`, `onToolCall`/`addToolOutput` — is deliberately unchanged, so
-the rest of the component is identical to the legacy example.
+Unchanged — `useAgentChat` from `@cloudflare/ai-chat/react` speaks AG-UI on
+the wire whichever base class the server extends. Its surface (`messages`,
+`sendMessage`, `clearHistory`, `stop`, `isStreaming`,
+`onToolCall`/`addToolOutput`) is the same as in the legacy example, so the
+component is byte-identical.
 
 ## What it demonstrates
 
