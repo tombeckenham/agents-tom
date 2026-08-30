@@ -42,5 +42,8 @@ export { createToolsFromClientSchemas } from "agents/chat";
 // `streamText().toUIMessageStreamResponse()` into AG-UI SSE, and
 // `toUIMessages` projects canonical AG-UI rows back to `UIMessage[]` for
 // `convertToModelMessages()`.
+// The projectors themselves (`ChunkToEventProjector`, `EventToChunkProjector`,
+// `projectChunkStreamToAGUISSE`) stay package-internal on purpose — no consumer
+// needs them. Promote them if someone extending `AGUIChatAgent` directly asks.
 export { toAGUIResponse } from "./to-agui-response";
 export { toUIMessages } from "agents/chat";
