@@ -1,37 +1,12 @@
 /**
- * `@cloudflare/ai-chat-vercel` — server entry.
+ * `toAGUIResponse` — wrap a Vercel AI SDK `UIMessageChunk` SSE response so its
+ * body becomes AG-UI SSE, for an `AGUIChatAgent.onChatMessage` override that
+ * builds its stream with `streamText()`.
  *
- * Provides {@link toAGUIResponse}: wrap a Vercel
- * `streamText().toUIMessageStreamResponse()` so the body becomes AG-UI SSE
- * that an {@link AGUIChatAgent.onChatMessage} override can return directly.
- *
- * The legacy `AIChatAgent`-shape compatibility class is deferred to a
- * future minor; the helper alone covers the `streamText` integration case
- * documented in `design/rfc-ag-ui-canonical.md` §§ Migration.
+ * `AIChatAgent` (./agent.ts) uses the same `chunk-to-event` projector
+ * internally; this helper is the standalone entry point for consumers who
+ * extend `AGUIChatAgent` from the `agents` package directly.
  */
-
-export {
-  ChunkToEventProjector,
-  projectChunkStreamToAGUISSE,
-  type ChunkToEventProjectorOptions
-} from "./chunk-to-event";
-
-export {
-  EventToChunkProjector,
-  type ProjectorAssistantMessage,
-  type ProjectorReasoningMessage,
-  type ProjectorToolMessage,
-  type ProjectorUserMessage
-} from "./event-to-chunk";
-
-export {
-  MessageType,
-  type IncomingAGUIWireMessage,
-  type MessageTypeValue,
-  type OutgoingAGUIWireMessage
-} from "./types";
-
-export { toUIMessages } from "./to-ui-messages";
 
 import {
   projectChunkStreamToAGUISSE,

@@ -27,7 +27,7 @@ import type {
   ChatRecoveryOptions
 } from "../";
 import { ResumableStream, toUIMessages } from "agents/chat";
-import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+import { ChunkToEventProjector } from "../chunk-to-event";
 
 /**
  * Stateful translator: legacy AI SDK chunk bodies (often without part ids)

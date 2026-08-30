@@ -6,8 +6,8 @@
  *
  * Two layers are exercised:
  *
- * 1. The server's `_streamSSEReply` filters replay tool-input-* chunks
- *    via `isReplayChunk` so they are neither broadcast to clients nor
+ * 1. The server filters replay tool-input-* events via the AG-UI reducer's
+ *    replay detection so they are neither broadcast to clients nor
  *    persisted in the resumable-stream chunk store. (The downstream
  *    AI SDK on the client mutates an existing tool part in place when a
  *    chunk arrives with a matching toolCallId, which would clobber an

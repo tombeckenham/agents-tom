@@ -5,7 +5,7 @@
  * and yields the `AGUIEvent`s carried in
  * `CF_AGENT_USE_CHAT_RESPONSE.body` as an `AsyncIterable`. Client adapters
  * layer their own shape on top: `@cloudflare/ai-chat-tanstack` consumes the
- * events directly (identity), `@cloudflare/ai-chat-vercel` pipes them
+ * events directly (identity), `@cloudflare/ai-chat` pipes them
  * through its `event-to-chunk` projection into a `ReadableStream`.
  *
  * The three stream flavours — request, resume replay and tool

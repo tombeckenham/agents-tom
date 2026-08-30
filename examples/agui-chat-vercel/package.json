@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.0",
-    "@cloudflare/ai-chat-vercel": "*",
+    "@cloudflare/ai-chat": "*",
     "agents": "*",
     "ai": "^7.0.0",
     "react": "^19.2.7",

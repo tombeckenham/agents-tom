@@ -35,3 +35,9 @@ implementation — but the following are breaking:
 `useAgentChat` and `WebSocketChatTransport` speak AG-UI on the wire and
 project to `UIMessageChunk` client-side; the browser-visible API is
 unchanged.
+
+New exports for consumers who extend `AGUIChatAgent` (from `agents`) directly
+but still build their streams with the AI SDK: `toAGUIResponse(response)`
+wraps a `streamText().toUIMessageStreamResponse()` into AG-UI SSE, and
+`toUIMessages(rows)` projects canonical AG-UI rows back to `UIMessage[]` for
+`convertToModelMessages()`.

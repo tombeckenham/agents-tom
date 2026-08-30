@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AGUIMessage } from "agents/chat/agui-types";
-import { toUIMessages } from "../to-ui-messages";
+import { toUIMessages } from "agents/chat";
 
 function partsOf(message: { parts: unknown[] }) {
   return message.parts as Array<Record<string, unknown>>;

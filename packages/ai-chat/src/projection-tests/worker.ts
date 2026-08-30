@@ -1,5 +1,5 @@
 /**
- * Test worker for `@cloudflare/ai-chat-vercel` integration tests.
+ * Test worker for the AG-UI ⇄ AI SDK projection integration tests.
  *
  * Exposes two `AGUIChatAgent` subclasses that emit known AG-UI SSE streams.
  * The `WebSocketChatTransport` is connected via a programmatic WS pair
