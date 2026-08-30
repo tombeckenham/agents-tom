@@ -110,6 +110,7 @@ import { AGUIStreamAccumulator } from "./chat/agui-stream-accumulator";
 import {
   type AGUIEvent,
   type AGUIMessage,
+  type AssistantExtraPart,
   type AssistantMessage,
   CF_TOOL_APPROVAL_DECISION,
   type CFToolApprovalDecisionValue,
