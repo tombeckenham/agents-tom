@@ -90,7 +90,6 @@ import {
 import {
   applyEventToSnapshot,
   createInitialSnapshot,
-  isReplayEvent,
   type SnapshotState
 } from "./chat/agui-message-builder";
 import {
@@ -753,15 +752,22 @@ export class AGUIChatAgent<
         const url = new URL(request.url);
         if (url.pathname.split("/").pop() === "get-messages") {
           // Structural validation on read (legacy parity): unrecognized rows
-          // are skipped; recognized rows are served verbatim (including the
-          // `_v` marker) — consumers run the migration themselves.
+          // are skipped with a warning; recognized rows are served verbatim
+          // (including the `_v` marker) — consumers run the migration.
           return Response.json(
-            this._loadMessagesFromDb().filter(
-              (row) =>
+            this._loadMessagesFromDb().filter((row) => {
+              const recognized =
                 isPersistedAGUIMessage(row) ||
                 isLegacyUIMessage(row) ||
-                isCleanAGUIMessage(row)
-            )
+                isCleanAGUIMessage(row);
+              if (!recognized) {
+                console.warn(
+                  "[AGUIChatAgent] Skipping malformed persisted message row on /get-messages",
+                  row
+                );
+              }
+              return recognized;
+            })
           );
         }
         return _onRequest(request);
@@ -1285,13 +1291,21 @@ export class AGUIChatAgent<
       return true;
     }
     // A DENIED call never runs: a late result for it is dropped rather than
-    // resurrecting the tool as output-available (legacy parity).
-    const deniedOwner = this._aguiMessages.find(
-      (m) =>
-        m.role === "assistant" &&
-        m.toolApprovals?.[toolCallId]?.approved === false
-    );
-    if (deniedOwner) return true;
+    // resurrecting the tool as output-available (legacy parity). The denial
+    // may still live only on the streaming accumulator (the persist race
+    // `_recordApprovalDecisionOnRow` covers) — check both tiers.
+    const hasDenial = (list: readonly AGUIMessage[] | undefined | null) =>
+      !!list?.some(
+        (m) =>
+          m.role === "assistant" &&
+          m.toolApprovals?.[toolCallId]?.approved === false
+      );
+    if (
+      hasDenial(this._aguiMessages) ||
+      hasDenial(this._streamingAccumulator?.messages)
+    ) {
+      return true;
+    }
     // A real result supersedes any approval-decision placeholder for this call.
     this._decidedApprovals.delete(toolCallId);
 
@@ -2368,9 +2382,12 @@ export class AGUIChatAgent<
           if (chatMessageId) {
             this._abortRegistry.remove(chatMessageId);
             if (streamCompleted && !stallRouted) {
-              // An in-band RUN_ERROR is a terminal error, not a response.
+              // An in-band RUN_ERROR is a terminal error, not a response —
+              // but only when this attempt actually terminalizes as one
+              // (same condition as the streamResult override below; an
+              // aborted attempt stays an abort for hooks AND events).
               const inBandError = accumulator.lastError;
-              if (inBandError) {
+              if (inBandError && streamResult.status === "completed") {
                 this._emit("message:error", { error: inBandError.message });
               } else {
                 this._emit("message:response");
@@ -2433,12 +2450,10 @@ export class AGUIChatAgent<
       return -1;
     })();
     if (lastAssistantIdx === -1) {
-      return [
-        {
-          id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-          role: "assistant"
-        }
-      ];
+      // No prior assistant to extend: seed nothing. Minting an empty
+      // assistant here would persist a bogus empty row (the chunk projection
+      // generates its own run message id when unanchored).
+      return [];
     }
     return this._aguiMessages
       .slice(lastAssistantIdx)
@@ -2794,7 +2809,8 @@ export class AGUIChatAgent<
     // server-wins for assistants on an exact id match, so a continuation
     // extending an existing assistant would otherwise be reconciled back to
     // its own stale row (legacy updated `this.messages` first for the same
-    // reason).
+    // reason). No rollback: a failed SQL write leaves memory ahead of
+    // storage until the next persist converges them.
     this._aguiMessages = merged;
     await this.persistMessages(merged, excludeBroadcastIds);
   }
@@ -2806,93 +2822,195 @@ export class AGUIChatAgent<
   protected async _persistOrphanedStream(streamId: string): Promise<void> {
     const chunks = this._resumableStream.getStreamChunks(streamId);
     if (!chunks.length) return;
-    // Seed with the persisted rows so an orphaned CONTINUATION (its events
-    // anchored on an existing assistant id) extends that message — tool
-    // calls and metadata intact — instead of rebuilding a bare replacement.
-    const snapshot: SnapshotState = createInitialSnapshot(
-      structuredClone(this._aguiMessages)
-    );
-    const seededCount = snapshot.messages.length;
-    let applied = false;
+
+    // Replay into a FRESH snapshot: the stream's own contribution,
+    // independent of what is already persisted. This function is NOT
+    // one-shot — it runs on every resume ACK plus (twice) from the recovery
+    // engine, and an approval snapshot may have persisted part of the same
+    // stream mid-flight — so applying the contribution must be idempotent.
+    const snapshot: SnapshotState = createInitialSnapshot();
     for (const chunk of chunks) {
       try {
         const event = JSON.parse(chunk.body) as AGUIEvent;
-        // An early persist (tool approval snapshot) may already hold this
-        // run's tool call/result — replaying it would duplicate the part.
-        if (
-          (event.type === "TOOL_CALL_START" ||
-            event.type === "TOOL_CALL_RESULT") &&
-          isReplayEvent(snapshot, event)
-        ) {
-          continue;
-        }
-        if (applyEventToSnapshot(snapshot, event)) applied = true;
+        applyEventToSnapshot(snapshot, event);
       } catch {
         // skip malformed chunks
       }
     }
-    // Nothing replayed onto the snapshot: no new rows AND no event landed.
-    if (!applied && snapshot.messages.length === seededCount) return;
     if (snapshot.messages.length === 0) return;
+    const contribution = snapshot.messages;
 
-    // #1691: the events' ids are authoritative (live-path parity — the
-    // producer's id, or the anchored one chunk-to-event injected). The one
+    // #1691: the events' ids are authoritative (live-path parity). The one
     // exception is a legacy stream row with NO metadata message_id whose
     // events opened a fresh generated id: pre-#1691 rows always continued
-    // the last assistant, so merge the replayed run onto it.
-    const seededIds = new Set(this._aguiMessages.map((m) => m.id));
-    const newAssistants = snapshot.messages.filter(
+    // the last assistant — rename the contribution's assistant onto it and
+    // let the idempotent merge below extend that row.
+    const existingIds = new Set(this._aguiMessages.map((m) => m.id));
+    const newAssistants = contribution.filter(
       (m): m is AssistantMessage =>
-        m.role === "assistant" && !seededIds.has(m.id)
+        m.role === "assistant" && !existingIds.has(m.id)
     );
     if (
       newAssistants.length === 1 &&
       this._resumableStream.getStreamMessageId(streamId) === null
     ) {
-      const orphan = newAssistants[0];
-      const target = [...snapshot.messages]
+      const lastExisting = [...this._aguiMessages]
         .reverse()
-        .find(
-          (m): m is AssistantMessage =>
-            m.role === "assistant" && seededIds.has(m.id)
-        );
-      if (target && target !== orphan) {
-        target.content = (target.content ?? "") + (orphan.content ?? "");
-        if (orphan.toolCalls?.length) {
-          (target.toolCalls ??= []).push(...orphan.toolCalls);
-        }
-        if (orphan.extraParts?.length) {
-          (target.extraParts ??= []).push(...orphan.extraParts);
-        }
-        if (orphan.partial) target.partial = true;
-        if (orphan.metadata !== undefined) {
-          target.metadata =
-            typeof target.metadata === "object" &&
-            target.metadata !== null &&
-            typeof orphan.metadata === "object" &&
-            orphan.metadata !== null
-              ? { ...target.metadata, ...orphan.metadata }
-              : orphan.metadata;
-        }
-        snapshot.messages.splice(snapshot.messages.indexOf(orphan), 1);
+        .find((m): m is AssistantMessage => m.role === "assistant");
+      if (lastExisting) {
+        (newAssistants[0] as { id: string }).id = lastExisting.id;
       }
     }
 
-    const merged: AGUIMessage[] = [];
-    for (const m of this._aguiMessages) {
-      const replacement = snapshot.messages.find((sm) => sm.id === m.id);
-      merged.push(replacement ?? m);
+    // Merge the contribution into the persisted list, preserving the
+    // contribution's internal order (reverse cursor, as in
+    // `_persistStreamResult`).
+    const merged: AGUIMessage[] = [...this._aguiMessages];
+    let insertPos = merged.length;
+    for (let i = contribution.length - 1; i >= 0; i--) {
+      const cm = contribution[i];
+      const idx = merged.findIndex((m) => m.id === cm.id);
+      if (idx !== -1) {
+        merged[idx] = AGUIChatAgent._mergeOrphanMessage(merged[idx], cm);
+        insertPos = idx;
+        continue;
+      }
+      if (
+        cm.role === "tool" &&
+        merged.some((m) => m.role === "tool" && m.toolCallId === cm.toolCallId)
+      ) {
+        // First result wins — an approval snapshot or earlier replay
+        // already answered this call.
+        continue;
+      }
+      merged.splice(insertPos, 0, cm);
+      insertPos = merged.indexOf(cm);
     }
-    for (const sm of snapshot.messages) {
-      if (!this._aguiMessages.some((m) => m.id === sm.id)) merged.push(sm);
-    }
+
     // Adopt before persisting — the reconciler is server-wins on exact
-    // assistant id match (see `_persistStreamResult`).
+    // assistant id match (see `_persistStreamResult`). No rollback: if the
+    // SQL write below fails, memory is ahead of storage until the next
+    // persist converges them.
     this._aguiMessages = merged;
     // NOTE: progress is bumped at production time in `_storeStreamChunk`
     // (#1637), NOT here — a recovery/reconnect re-persist must not be
     // miscounted as new forward progress.
     await this.persistMessages(merged);
+
+    // A stream that ended on an in-band RUN_ERROR terminalized as an error
+    // live; the reconstruction must reach the same outcome, not a clean
+    // completion (a disconnected client learns the failure on reconnect).
+    if (snapshot.lastError) {
+      const requestId = this._resumableStream.getStreamRequestId(streamId);
+      if (requestId) {
+        await this._recordChatTerminal(requestId, snapshot.lastError.message);
+      }
+    }
+  }
+
+  /**
+   * Fold one replayed message onto the row that already holds its id, such
+   * that re-applying the same stream is a no-op (see
+   * `_persistOrphanedStream`). For assistants the text rule is three-way:
+   * the replay's text REPLACES row text it is a superset of (fresh
+   * re-creation, or an approval snapshot's partial), is SKIPPED when the row
+   * already ends with it (repeat after a continuation extend), and APPENDS
+   * otherwise (first application of a continuation onto prior-turn text).
+   */
+  private static _mergeOrphanMessage(
+    existing: AGUIMessage,
+    cm: AGUIMessage
+  ): AGUIMessage {
+    if (existing.role !== cm.role) return cm;
+    if (cm.role === "tool") {
+      // First result wins.
+      return existing;
+    }
+    if (cm.role === "reasoning" && existing.role === "reasoning") {
+      // The replay is authoritative for its own reasoning row — a stale
+      // seeded copy must not shadow the replayed content.
+      return {
+        ...existing,
+        content: cm.content ?? existing.content,
+        ...(cm.encryptedValue !== undefined && {
+          encryptedValue: cm.encryptedValue
+        }),
+        ...(cm.partial ? { partial: true as const } : {})
+      };
+    }
+    if (cm.role !== "assistant" || existing.role !== "assistant") {
+      return existing;
+    }
+
+    const rowText = existing.content ?? "";
+    const cmText = cm.content ?? "";
+    let content: string;
+    let replaced = false;
+    if (cmText === "") {
+      content = rowText;
+    } else if (cmText.startsWith(rowText)) {
+      content = cmText;
+      replaced = true;
+    } else if (rowText.endsWith(cmText)) {
+      content = rowText;
+    } else {
+      content = rowText + cmText;
+    }
+
+    // Union tool calls by id; the replay's version wins for its own calls
+    // (a mid-stream approval snapshot may hold partially streamed args).
+    const cmCalls = cm.toolCalls ?? [];
+    const toolCalls = [
+      ...(existing.toolCalls ?? []).filter(
+        (rc) => !cmCalls.some((cc) => cc.id === rc.id)
+      ),
+      ...cmCalls
+    ];
+
+    // ponytail: extras dedupe by JSON-suffix — a prior turn ending with an
+    // identical extra (e.g. step-start) is indistinguishable from an
+    // already-applied replay; upgrade to per-extra provenance if it matters.
+    const rowExtras = existing.extraParts ?? [];
+    const cmExtras = cm.extraParts ?? [];
+    let extraParts: AssistantExtraPart[];
+    if (replaced || rowExtras.length === 0) {
+      extraParts = cmExtras.length > 0 ? cmExtras : rowExtras;
+    } else if (cmExtras.length === 0) {
+      extraParts = rowExtras;
+    } else {
+      const tail = rowExtras
+        .slice(-cmExtras.length)
+        .map((e) => JSON.stringify(e));
+      const cmJson = cmExtras.map((e) => JSON.stringify(e));
+      extraParts =
+        tail.length === cmJson.length && tail.every((v, i) => v === cmJson[i])
+          ? rowExtras
+          : [...rowExtras, ...cmExtras];
+    }
+
+    const metadata =
+      cm.metadata === undefined
+        ? existing.metadata
+        : typeof existing.metadata === "object" &&
+            existing.metadata !== null &&
+            typeof cm.metadata === "object" &&
+            cm.metadata !== null
+          ? { ...existing.metadata, ...cm.metadata }
+          : cm.metadata;
+
+    const partial = replaced ? cm.partial : (existing.partial ?? cm.partial);
+
+    return {
+      ...existing,
+      ...(content !== "" ? { content } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      ...(extraParts.length > 0 ? { extraParts } : {}),
+      ...(cm.toolApprovals || existing.toolApprovals
+        ? { toolApprovals: { ...existing.toolApprovals, ...cm.toolApprovals } }
+        : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(partial ? { partial: true as const } : {})
+    };
   }
 
   // ── Resumable stream delegates (parity with AIChatAgent) ───────────

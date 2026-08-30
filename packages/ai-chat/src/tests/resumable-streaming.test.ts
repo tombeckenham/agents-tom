@@ -1313,6 +1313,77 @@ describe("Resumable Streaming", () => {
       ws2.close(1000);
     });
 
+    it("re-running the orphan reconstruction is idempotent (repeat ACK / recovery / approval overlap)", async () => {
+      // The reconstruction is NOT one-shot: it runs from resume ACKs and
+      // (twice) from the recovery engine, and an approval snapshot may have
+      // persisted part of the same stream already. Applying it repeatedly
+      // must not duplicate text, extras, or reasoning — and replayed
+      // reasoning content must survive.
+      const room = crypto.randomUUID();
+      const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+      await new Promise((r) => setTimeout(r, 50));
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+      await agentStub.persistMessages([
+        {
+          id: "user-idem",
+          role: "user",
+          parts: [{ type: "text", text: "go" }]
+        }
+      ]);
+
+      const streamId = await agentStub.testStartStream("req-idem");
+      for (const body of [
+        '{"type":"start","messageId":"assistant-idem"}',
+        '{"type":"start-step"}',
+        '{"type":"reasoning-start","id":"r-idem"}',
+        '{"type":"reasoning-delta","id":"r-idem","delta":"thinking hard"}',
+        '{"type":"reasoning-end","id":"r-idem"}',
+        '{"type":"tool-input-available","toolCallId":"tc-idem","toolName":"lookup","input":{"q":1}}',
+        '{"type":"tool-output-available","toolCallId":"tc-idem","output":{"a":2}}',
+        '{"type":"text-start","id":"t-idem"}',
+        '{"type":"text-delta","id":"t-idem","delta":"partial answer"}'
+        // interrupted: no text-end / finish
+      ]) {
+        await agentStub.testStoreStreamChunk(streamId, body);
+      }
+      await agentStub.testFlushChunkBuffer();
+
+      const snapshotOf = async () => {
+        const persisted =
+          (await agentStub.getPersistedMessages()) as unknown as Array<{
+            id: string;
+            role: string;
+            parts: Array<{ type: string; text?: string }>;
+          }>;
+        const assistant = persisted.find((m) => m.role === "assistant");
+        return { persisted, assistant };
+      };
+
+      await agentStub.testPersistOrphanedStream(streamId);
+      const first = await snapshotOf();
+      expect(first.assistant).toBeDefined();
+
+      // Re-apply twice more (repeat ACK / second recovery pass).
+      await agentStub.testPersistOrphanedStream(streamId);
+      await agentStub.testPersistOrphanedStream(streamId);
+      const after = await snapshotOf();
+
+      // Identical outcome — nothing duplicated.
+      expect(after.persisted).toEqual(first.persisted);
+      const parts = after.assistant!.parts;
+      expect(parts.filter((p) => p.type === "step-start")).toHaveLength(1);
+      const reasoningParts = parts.filter((p) => p.type === "reasoning");
+      expect(reasoningParts).toHaveLength(1);
+      expect(reasoningParts[0].text).toBe("thinking hard");
+      const textParts = parts.filter((p) => p.type === "text");
+      expect(textParts).toHaveLength(1);
+      expect(textParts[0].text).toBe("partial answer");
+      expect(parts.filter((p) => p.type === "tool-lookup")).toHaveLength(1);
+
+      ws.close(1000);
+    });
+
     it("orphaned stream with tool call parts reconstructs correctly", async () => {
       const room = crypto.randomUUID();
 

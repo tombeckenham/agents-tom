@@ -994,6 +994,11 @@ export class TestChatAgent extends AIChatAgent<Env> {
    * _activeStreamId, but _isLive remains false (no live LLM reader).
    * This mimics the DO constructor running after eviction.
    */
+  /** Drive the orphan reconstruction directly (idempotency coverage). */
+  async testPersistOrphanedStream(streamId: string): Promise<void> {
+    await this._persistOrphanedStream(streamId);
+  }
+
   testSimulateHibernationWake(): void {
     this._resumableStream = new ResumableStream(this.sql.bind(this));
   }
