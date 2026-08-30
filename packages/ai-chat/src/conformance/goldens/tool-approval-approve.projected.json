@@ -118,9 +118,6 @@
                   "type": "step-start"
                 },
                 {
-                  "type": "step-start"
-                },
-                {
                   "type": "tool-riskyTool",
                   "toolCallId": "id-3",
                   "toolName": "riskyTool",
@@ -137,6 +134,9 @@
                   }
                 },
                 {
+                  "type": "step-start"
+                },
+                {
                   "type": "text",
                   "text": "approved and ran",
                   "state": "done"
@@ -148,7 +148,8 @@
         },
         {
           "body": {
-            "type": "start"
+            "type": "start",
+            "messageId": "id-1"
           },
           "done": false,
           "id": "id-6",
@@ -276,9 +277,6 @@
             "type": "step-start"
           },
           {
-            "type": "step-start"
-          },
-          {
             "type": "tool-riskyTool",
             "toolCallId": "id-3",
             "toolName": "riskyTool",
@@ -293,6 +291,9 @@
             "output": {
               "ran": true
             }
+          },
+          {
+            "type": "step-start"
           },
           {
             "type": "text",
@@ -323,9 +324,6 @@
           "type": "step-start"
         },
         {
-          "type": "step-start"
-        },
-        {
           "type": "tool-riskyTool",
           "toolCallId": "id-3",
           "toolName": "riskyTool",
@@ -340,6 +338,9 @@
           "output": {
             "ran": true
           }
+        },
+        {
+          "type": "step-start"
         },
         {
           "type": "text",
