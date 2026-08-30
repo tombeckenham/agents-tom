@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { MessageType } from "../types";
 import type { UIMessage as ChatMessage } from "ai";
-import { connectChatWS } from "./test-utils";
+import { connectChatWS, wrapLegacyWireWS } from "./test-utils";
 import { getAgentByName } from "agents";
 
 // Type helper for tool call parts - extracts ToolUIPart from ChatMessage parts
@@ -121,10 +121,12 @@ describe("Chat Agent Persistence", () => {
     );
     expect(assistantMessages.length).toBeGreaterThanOrEqual(2);
 
-    // check that assistant messages have content
+    // check that assistant messages have content — /get-messages serves
+    // AG-UI rows post-cutover (content string, not parts).
     assistantMessages.forEach((msg) => {
-      expect(msg.parts).toBeDefined();
-      expect(msg.parts.length).toBeGreaterThan(0);
+      const content = (msg as unknown as { content?: string }).content;
+      expect(typeof content).toBe("string");
+      expect((content as string).length).toBeGreaterThan(0);
     });
   });
 
@@ -193,7 +195,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -245,7 +247,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -345,7 +347,7 @@ describe("Chat Agent Persistence", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);

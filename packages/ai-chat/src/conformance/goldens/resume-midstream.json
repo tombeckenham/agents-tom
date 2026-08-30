@@ -16,7 +16,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-3"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -25,7 +25,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-3",
+            "id": "part-1",
             "delta": "before-gate "
           },
           "done": false,
@@ -35,7 +35,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-3",
+            "id": "part-1",
             "delta": "after-gate"
           },
           "done": false,
@@ -45,7 +45,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-3"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -87,7 +87,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-3"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -97,7 +97,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-3",
+            "id": "part-1",
             "delta": "before-gate "
           },
           "done": false,
@@ -116,7 +116,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-3",
+            "id": "part-1",
             "delta": "after-gate"
           },
           "done": false,
@@ -126,7 +126,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-3"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -149,7 +149,7 @@
         {
           "messages": [
             {
-              "id": "id-4",
+              "id": "id-3",
               "role": "user",
               "parts": [
                 {
@@ -186,9 +186,9 @@
   ],
   "persistedRows": [
     {
-      "id": "id-4",
+      "id": "id-3",
       "message": {
-        "id": "id-4",
+        "id": "id-3",
         "role": "user",
         "parts": [
           {
@@ -217,7 +217,7 @@
   ],
   "clientView": [
     {
-      "id": "id-4",
+      "id": "id-3",
       "role": "user",
       "parts": [
         {

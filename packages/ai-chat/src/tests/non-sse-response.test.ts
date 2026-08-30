@@ -81,18 +81,21 @@ describe("Non-SSE Response Handling - PR #761", () => {
     // Check for text-start event
     const textStartEvent = eventTypes.find((e) => e.type === "text-start");
     expect(textStartEvent).toBeDefined();
-    expect(textStartEvent.id).toBe("req1");
+    // Post-cutover the text id is the allocated assistant message id
+    // (opaque), consistent across the lifecycle — not the request id.
+    expect(typeof textStartEvent.id).toBe("string");
+    expect(textStartEvent.id.length).toBeGreaterThan(0);
 
     // Check for text-delta event with content
     const textDeltaEvent = eventTypes.find((e) => e.type === "text-delta");
     expect(textDeltaEvent).toBeDefined();
-    expect(textDeltaEvent.id).toBe("req1");
+    expect(textDeltaEvent.id).toBe(textStartEvent.id);
     expect(textDeltaEvent.delta).toBe("Hello from chat agent!");
 
     // Check for text-end event
     const textEndEvent = eventTypes.find((e) => e.type === "text-end");
     expect(textEndEvent).toBeDefined();
-    expect(textEndEvent.id).toBe("req1");
+    expect(textEndEvent.id).toBe(textStartEvent.id);
 
     // Verify order: text-start comes before text-delta, text-delta comes before text-end
     const startIndex = eventTypes.findIndex((e) => e.type === "text-start");
@@ -177,8 +180,11 @@ describe("Non-SSE Response Handling - PR #761", () => {
     );
 
     expect(textEvents.length).toBeGreaterThanOrEqual(3);
+    // Opaque but consistent id across the whole lifecycle.
+    const streamTextId = textEvents[0].id;
+    expect(typeof streamTextId).toBe("string");
     for (const event of textEvents) {
-      expect(event.id).toBe(requestId);
+      expect(event.id).toBe(streamTextId);
     }
 
     ws.close(1000);

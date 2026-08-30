@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { UIMessage as ChatMessage, UIMessageChunk } from "ai";
+import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+import { autoTransformAGUIMessages } from "agents/chat";
 import { WebSocketChatTransport } from "../ws-chat-transport";
 import { MessageType } from "../types";
 
@@ -7,9 +9,49 @@ import { MessageType } from "../types";
  * Minimal mock of the AgentConnection interface.
  * Supports both addEventListener listeners AND direct handleStreamResuming calls.
  */
+function translateMockFrame(
+  projectors: Map<string, ChunkToEventProjector>,
+  frame: Record<string, unknown>
+): Array<Record<string, unknown>> {
+  if (
+    frame.type === MessageType.CF_AGENT_CHAT_MESSAGES &&
+    Array.isArray(frame.messages)
+  ) {
+    return [{ ...frame, messages: autoTransformAGUIMessages(frame.messages) }];
+  }
+  if (
+    frame.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE ||
+    typeof frame.body !== "string" ||
+    frame.body.length === 0
+  ) {
+    return [frame];
+  }
+  let chunk: { type?: string };
+  try {
+    chunk = JSON.parse(frame.body) as { type?: string };
+  } catch {
+    return [frame];
+  }
+  if (
+    typeof chunk.type !== "string" ||
+    chunk.type === chunk.type.toUpperCase()
+  ) {
+    return [frame];
+  }
+  const key = String(frame.id ?? "");
+  if (chunk.type === "start" || !projectors.has(key)) {
+    projectors.set(key, new ChunkToEventProjector());
+  }
+  const projector = projectors.get(key) as ChunkToEventProjector;
+  return projector
+    .project(chunk as never)
+    .map((event) => ({ ...frame, body: JSON.stringify(event) }));
+}
+
 function createMockAgent() {
   const sent: string[] = [];
   const target = new EventTarget();
+  const projectors = new Map<string, ChunkToEventProjector>();
 
   return {
     sent,
@@ -27,11 +69,16 @@ function createMockAgent() {
     removeEventListener(type: string, listener: (event: MessageEvent) => void) {
       target.removeEventListener(type, listener as EventListener);
     },
-    /** Simulate a message arriving from the server */
+    /** Simulate a message arriving from the server. The suite's frames
+     * predate the cutover and carry legacy UIMessageChunk bodies /
+     * UIMessage lists; translate them to the AG-UI wire the transport now
+     * speaks (one stateful projector per request id, reset on `start`). */
     dispatch(data: Record<string, unknown>) {
-      target.dispatchEvent(
-        new MessageEvent("message", { data: JSON.stringify(data) })
-      );
+      for (const frame of translateMockFrame(projectors, data)) {
+        target.dispatchEvent(
+          new MessageEvent("message", { data: JSON.stringify(frame) })
+        );
+      }
     },
     /** Simulate the underlying WebSocket closing */
     close() {
@@ -467,9 +514,15 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
       done: false
     });
 
-    await expect(reader.read()).resolves.toEqual({
+    // Post-cutover a leading `start` precedes the text chunks, and part ids
+    // are opaque (AG-UI keys them to the run's message id).
+    await expect(reader.read()).resolves.toMatchObject({
       done: false,
-      value: { type: "text-start", id: "t1" }
+      value: { type: "start" }
+    });
+    await expect(reader.read()).resolves.toMatchObject({
+      done: false,
+      value: { type: "text-start" }
     });
 
     agent.close();
@@ -704,6 +757,10 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
       replay: true
     });
 
+    // Leading `start` precedes the text chunk post-cutover.
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect((first.value as UIMessageChunk).type).toBe("start");
     const { value, done } = await reader.read();
     expect(done).toBe(false);
     expect((value as UIMessageChunk).type).toBe("text-start");
@@ -743,9 +800,10 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
       chunks.push(value);
     }
 
-    expect(chunks).toHaveLength(2);
-    expect(chunks[0].type).toBe("text-start");
-    expect(chunks[1].type).toBe("text-delta");
+    expect(chunks).toHaveLength(3);
+    expect(chunks[0].type).toBe("start");
+    expect(chunks[1].type).toBe("text-start");
+    expect(chunks[2].type).toBe("text-delta");
   });
 
   it("removes requestId from activeRequestIds when stream completes", async () => {
@@ -786,9 +844,15 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
       done: false
     });
 
-    await expect(reader.read()).resolves.toEqual({
+    // Post-cutover a leading `start` precedes the text chunks, and part ids
+    // are opaque (AG-UI keys them to the run's message id).
+    await expect(reader.read()).resolves.toMatchObject({
       done: false,
-      value: { type: "text-start", id: "t1" }
+      value: { type: "start" }
+    });
+    await expect(reader.read()).resolves.toMatchObject({
+      done: false,
+      value: { type: "text-start" }
     });
 
     agent.close();
@@ -1060,9 +1124,10 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
       chunks.push(value);
     }
 
-    expect(chunks).toHaveLength(2);
-    expect(chunks[0].type).toBe("text-start");
-    expect(chunks[1].type).toBe("text-delta");
+    expect(chunks).toHaveLength(3);
+    expect(chunks[0].type).toBe("start");
+    expect(chunks[1].type).toBe("text-start");
+    expect(chunks[2].type).toBe("text-delta");
 
     // 6. Request ID cleaned up
     expect(activeRequestIds.has("req-full")).toBe(false);
@@ -1170,9 +1235,14 @@ describe("WebSocketChatTransport STREAM_PENDING keep-waiting (#1784)", () => {
         body: '{"type":"text-start","id":"t1"}',
         done: false
       });
-      await expect(reader.read()).resolves.toEqual({
+      // Leading `start` precedes text chunks post-cutover; part ids opaque.
+      await expect(reader.read()).resolves.toMatchObject({
         done: false,
-        value: { type: "text-start", id: "t1" }
+        value: { type: "start" }
+      });
+      await expect(reader.read()).resolves.toMatchObject({
+        done: false,
+        value: { type: "text-start" }
       });
     } finally {
       vi.useRealTimers();

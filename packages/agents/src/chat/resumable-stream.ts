@@ -310,6 +310,32 @@ export class ResumableStream {
     return rows[0].message_id ?? null;
   }
 
+  /** The request id a stream row was created for; null when the row is gone. */
+  getStreamRequestId(streamId: string): string | null {
+    const rows = this.sql<{ request_id: string | null }>`
+      select request_id from cf_ai_chat_stream_metadata
+      where id = ${streamId}
+    `;
+    if (!rows || rows.length === 0) return null;
+    return rows[0].request_id ?? null;
+  }
+
+  /**
+   * Backfill the assistant message id once the stream reveals it (#1691) —
+   * the AG-UI engine learns the id from the first message-start event, after
+   * `start()` has already written the metadata row.
+   */
+  setMessageId(streamId: string, messageId: string): void {
+    try {
+      this.sql`
+        update cf_ai_chat_stream_metadata
+        set message_id = ${messageId} where id = ${streamId}
+      `;
+    } catch (error) {
+      if (!isMissingMetadataColumnError(error)) throw error;
+    }
+  }
+
   /**
    * Mark a stream as completed and flush any pending chunks.
    * @param streamId - The stream to mark as completed

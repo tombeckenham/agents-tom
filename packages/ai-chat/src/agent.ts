@@ -16,17 +16,15 @@
  *   `sanitizeMessageForPersistence`) keep their legacy shapes; the engine's
  *   dispatch seams project in and out.
  *
- * Persisted rows are AG-UI (`_v` marker); legacy rows migrate on load. This
- * file is a Phase-3 sidecar: `src/index.ts` (the legacy implementation) is
- * untouched until the Phase-5 differential cutover swaps it for this class.
+ * Persisted rows are AG-UI (`_v` marker); legacy rows migrate on load.
+ * `src/index.ts` re-exports this class as the package's `AIChatAgent`
+ * (the Phase-5 cutover).
  *
- * NOTE: the agent-tool child-adapter surface (`startAgentToolRun`,
+ * The agent-tool child-adapter surface (`startAgentToolRun`,
  * `tailAgentToolRun`, `reportProgress`, detached delivery, …) is inherited
- * from the AG-UI engine (Phase 3b) and works for a projected child as-is.
- * Caveat: the overridable hooks `formatAgentToolInput` / `getAgentToolOutput`
- * / `getAgentToolSummary` now speak `AGUIMessage`, not `UIMessage` — a
- * subclass migrating legacy overrides of those hooks needs a projection seam
- * here (Phase 5 conformance work).
+ * from the AG-UI engine; the overridable hooks (`formatAgentToolInput` /
+ * `getAgentToolOutput` / `getAgentToolSummary`) keep their legacy
+ * `UIMessage` vocabulary via the `_invoke*` projection seams below.
  */
 
 import type { GenerateTextOnFinishCallback, ToolSet, UIMessage } from "ai";
@@ -36,6 +34,7 @@ import {
   type AGUIChatResponseResult,
   type AGUIMessage,
   type OnChatMessageOptions,
+  type ProjectHandlerContext,
   type ToolMessage
 } from "agents/agui-chat-agent";
 import {
@@ -79,7 +78,7 @@ function parseJSON(value: string | undefined): unknown {
 
 /**
  * AI SDK chat agent, projected onto the AG-UI engine. Public API matches the
- * legacy `AIChatAgent` in `src/index.ts`.
+ * pre-cutover `AIChatAgent` (pinned by the conformance goldens).
  */
 export class AIChatAgent<
   Env extends Cloudflare.Env = Cloudflare.Env,
@@ -133,14 +132,14 @@ export class AIChatAgent<
     );
   }
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override onChatResponse(
     // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
     _result: ChatResponseResult
   ): void | Promise<void> {}
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override sanitizeMessageForPersistence(
     // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
@@ -149,7 +148,7 @@ export class AIChatAgent<
     return message;
   }
 
-  /** Same contract as the legacy hook; see `src/index.ts`. */
+  /** Same contract as the pre-cutover hook. */
   // @ts-expect-error TS2416 — intentional projection: legacy hook shape
   protected override async onChatRecovery(
     // oxlint-disable-next-line @typescript-eslint/no-unused-vars -- overridable hook
@@ -164,12 +163,26 @@ export class AIChatAgent<
 
   /** UIMessageChunk SSE → AG-UI SSE; plaintext/empty pass through. */
   protected override _projectHandlerResponse(
-    response: Response | undefined
+    response: Response | undefined,
+    context?: ProjectHandlerContext
   ): Response | undefined {
     if (!response?.body) return response;
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("text/event-stream")) return response;
-    return toAGUIResponse(response);
+    // A continuation anchors streamed text on the seed assistant so it
+    // extends that message (legacy cloning behavior) instead of opening a
+    // second assistant row.
+    return toAGUIResponse(
+      response,
+      context?.seedAssistantId !== undefined
+        ? {
+            messageId: context.seedAssistantId,
+            // #1229: the continuation must extend the seed assistant even if
+            // the provider mints a fresh start.messageId.
+            messageIdAuthoritative: true
+          }
+        : undefined
+    );
   }
 
   protected override _invokeChatResponseHook(
@@ -209,6 +222,109 @@ export class AIChatAgent<
         (m) => m.parts
       ) as MessagePart[]
     });
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Agent-tool hook projection (legacy UIMessage vocabulary)
+  // ──────────────────────────────────────────────────────────────────
+
+  /** Same contract as the legacy hook: build the synthetic user message
+   * (UIMessage) that starts a headless child turn. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override formatAgentToolInput(
+    input: unknown,
+    request: { runId: string }
+  ): ChatMessage {
+    let text: string;
+    try {
+      text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+    } catch {
+      text = String(input);
+    }
+    return {
+      id: `agent-tool-${request.runId}-input`,
+      role: "user",
+      parts: [{ type: "text", text }]
+    };
+  }
+
+  /** Same contract as the legacy hook; `messagesAfterStart` is `UIMessage[]`. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override getAgentToolOutput(
+    _request: { runId: string; input: unknown },
+    messagesAfterStart: readonly ChatMessage[]
+  ): unknown {
+    return AIChatAgent._latestAssistantText(messagesAfterStart);
+  }
+
+  /** Same contract as the legacy hook; `messagesAfterStart` is `UIMessage[]`. */
+  // @ts-expect-error TS2416 — intentional projection: legacy hook shape
+  protected override getAgentToolSummary(
+    _request: { runId: string; input: unknown },
+    output: unknown,
+    messagesAfterStart: readonly ChatMessage[]
+  ): string {
+    if (typeof output === "string") return output;
+    if (output === undefined) {
+      return AIChatAgent._latestAssistantText(messagesAfterStart) ?? "";
+    }
+    try {
+      return JSON.stringify(output);
+    } catch {
+      return String(output);
+    }
+  }
+
+  private static _latestAssistantText(
+    messages: readonly ChatMessage[]
+  ): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== "assistant") continue;
+      const text = message.parts
+        .filter(
+          (part): part is Extract<typeof part, { type: "text" }> =>
+            part.type === "text"
+        )
+        .map((part) => part.text)
+        .join("");
+      if (text) return text;
+    }
+    return undefined;
+  }
+
+  protected override _invokeFormatAgentToolInput(
+    input: unknown,
+    request: { runId: string }
+  ): AGUIMessage {
+    const legacy = this.formatAgentToolInput(input, request);
+    const migrated = autoTransformAGUIMessages([legacy]);
+    const row = migrated[0];
+    if (!row) {
+      throw new Error(
+        "[AIChatAgent] formatAgentToolInput returned a message that cannot be persisted"
+      );
+    }
+    return row;
+  }
+
+  protected override _invokeGetAgentToolOutput(
+    request: { runId: string; input: unknown },
+    messagesAfterStart: readonly AGUIMessage[]
+  ): unknown {
+    return this.getAgentToolOutput(request, toUIMessages(messagesAfterStart));
+  }
+
+  protected override _invokeGetAgentToolSummary(
+    request: { runId: string; input: unknown },
+    output: unknown,
+    messagesAfterStart: readonly AGUIMessage[]
+  ): string {
+    return this.getAgentToolSummary(
+      request,
+      output,
+      toUIMessages(messagesAfterStart)
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────

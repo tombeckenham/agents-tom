@@ -75,6 +75,12 @@ export type SnapshotState = {
   readonly pendingExtraParts: AssistantExtraPart[];
   /** message metadata that arrived before any assistant exists. */
   pendingMetadata?: unknown;
+  /**
+   * `messages.length` at snapshot creation / last RUN_STARTED — everything
+   * below this index pre-exists the current run (settled prefix or
+   * continuation seed).
+   */
+  runStartCount: number;
   threadId?: string;
   runId?: string;
   state?: unknown;
@@ -95,7 +101,8 @@ export function createInitialSnapshot(
     toolBuffers: new Map(),
     pendingApprovals: new Map(),
     customEvents: [],
-    pendingExtraParts: []
+    pendingExtraParts: [],
+    runStartCount: messages.length
   };
 }
 
@@ -121,6 +128,11 @@ export function applyEventToSnapshot(
       return handleRunError(state, event);
 
     case "STEP_STARTED":
+      // Durable step boundary marker: the legacy engine persisted a
+      // `step-start` part per step (AI SDK message-builder behavior), so the
+      // UIMessage projection needs it in `extraParts` to match.
+      attachExtraPart(state, { type: "step-start" });
+      return true;
     case "STEP_FINISHED":
       return true;
 
@@ -208,6 +220,11 @@ function handleRunStarted(
   }
   state.threadId = event.threadId;
   state.runId = event.runId;
+  state.runStartCount = state.messages.length;
+  // A new run supersedes a previous run's error on this stream — without
+  // this a multi-run stream would terminalize as error after a later
+  // successful run.
+  delete state.lastError;
   return true;
 }
 
@@ -255,14 +272,17 @@ function handleTextStart(
   if (existing) {
     if (existing.content === undefined) {
       existing.content = "";
+      notePartOrder(existing, "text", false);
     }
+    existing.partial = true;
     state.textStreams.set(event.messageId, existing);
     return true;
   }
   const assistant: AssistantMessage = {
     id: event.messageId,
     role: "assistant",
-    content: ""
+    content: "",
+    partial: true
   };
   state.messages.push(assistant);
   flushPendingExtras(state, assistant);
@@ -295,6 +315,8 @@ function handleTextEnd(
     warn("TEXT_MESSAGE_END missing messageId", event);
     return false;
   }
+  const open = state.textStreams.get(event.messageId);
+  if (open) delete open.partial;
   state.textStreams.delete(event.messageId);
   return true;
 }
@@ -314,12 +336,24 @@ function handleToolStart(
   if (state.toolBuffers.has(event.toolCallId)) {
     return true;
   }
+  // Replay dedupe (#1404): a provider re-emitting a call that already exists
+  // on an assistant (continuation replays) must not add a duplicate.
+  if (findToolCallById(state, event.toolCallId)) {
+    return true;
+  }
   const assistant = ensureAssistantForToolCall(state, event.parentMessageId);
   const toolCall: ToolCall = {
     id: event.toolCallId,
     type: "function",
     function: { name: event.toolCallName, arguments: "" }
   };
+  // A tool call landing after the text slot opened is out of canonical
+  // order (tools project before text) — record the true order.
+  notePartOrder(
+    assistant,
+    `tool:${event.toolCallId}`,
+    assistant.content !== undefined
+  );
   if (!assistant.toolCalls) {
     assistant.toolCalls = [];
   }
@@ -379,6 +413,11 @@ function handleToolResult(
     warn("TOOL_CALL_RESULT missing required fields", event);
     return false;
   }
+  // Replay dedupe (#1404): first result wins; a re-emitted result for an
+  // already-settled call is a no-op.
+  if (findToolMessageByCallId(state, event.toolCallId)) {
+    return true;
+  }
   const toolMessage: ToolMessage = {
     id: event.messageId,
     role: "tool",
@@ -408,9 +447,24 @@ function handleReasoningStart(
   const reasoning: ReasoningMessage = {
     id: event.messageId,
     role: "reasoning",
-    content: ""
+    content: "",
+    partial: true
   };
-  state.messages.push(reasoning);
+  // AG-UI convention: reasoning precedes the assistant it relates to. When
+  // the trailing assistant PRE-EXISTS this run (continuation seed), insert
+  // before it so the projection folds the reasoning onto that assistant
+  // instead of stranding it after. An assistant created by THIS run keeps
+  // reasoning after it — mid-turn reasoning follows the text it trails.
+  const last = state.messages[state.messages.length - 1];
+  if (
+    last &&
+    last.role === "assistant" &&
+    state.messages.length <= state.runStartCount
+  ) {
+    state.messages.splice(state.messages.length - 1, 0, reasoning);
+  } else {
+    state.messages.push(reasoning);
+  }
   state.reasoningStreams.set(event.messageId, reasoning);
   return true;
 }
@@ -440,6 +494,8 @@ function handleReasoningEnd(
     warn("REASONING_MESSAGE_END missing messageId", event);
     return false;
   }
+  const open = state.reasoningStreams.get(event.messageId);
+  if (open) delete open.partial;
   state.reasoningStreams.delete(event.messageId);
   return true;
 }
@@ -515,6 +571,7 @@ function handleMessagesSnapshot(
     return false;
   }
   state.messages = [...event.messages];
+  state.runStartCount = state.messages.length;
   clearInFlight(state);
   return true;
 }
@@ -600,12 +657,20 @@ function handleCustom(
     return true;
   }
   if (event.name.startsWith("data.")) {
-    // ponytail: the original data part id is not carried by the CUSTOM event;
-    // Phase 5's metadata golden arbitrates whether chunk-to-event must carry it.
-    attachExtraPart(state, {
-      type: `data-${event.name.slice("data.".length)}`,
-      data: event.value
-    });
+    // The value is either the raw data (older producers) or a
+    // `{ id?, data, transient? }` wrapper (chunk-to-event, so the data part
+    // round-trips with its id — pinned by the metadata conformance golden).
+    // Transient data parts are never persisted, matching the AI SDK.
+    const wrapped = isDataWrapper(event.value)
+      ? event.value
+      : { data: event.value };
+    if (!wrapped.transient) {
+      attachExtraPart(state, {
+        type: `data-${event.name.slice("data.".length)}`,
+        ...(wrapped.id !== undefined && { id: wrapped.id }),
+        data: wrapped.data
+      });
+    }
     state.customEvents.push({ name: event.name, value: event.value });
     return true;
   }
@@ -765,24 +830,82 @@ function findAssistantForToolCall(
   return undefined;
 }
 
+/** Whether a `data.*` CUSTOM value is the `{ id?, data, transient? }` wrapper. */
+function isDataWrapper(
+  value: unknown
+): value is { id?: unknown; data: unknown; transient?: boolean } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    "data" in value &&
+    Object.keys(value).every(
+      (key) => key === "id" || key === "data" || key === "transient"
+    )
+  );
+}
+
 /** Attach an extra part (file/source/data) to the current/next assistant. */
 function attachExtraPart(state: SnapshotState, part: AssistantExtraPart): void {
   const assistant = lastAssistant(state);
   if (assistant) {
+    notePartOrder(
+      assistant,
+      `extra:${assistant.extraParts?.length ?? 0}`,
+      (assistant.toolCalls?.length ?? 0) > 0 || assistant.content !== undefined
+    );
     (assistant.extraParts ??= []).push(part);
   } else {
     state.pendingExtraParts.push(part);
   }
 }
 
-/** Attach message metadata to the current/next assistant. */
+/**
+ * Record `token` in the assistant's `partOrder` (see the CF extension on
+ * `AssistantMessage`). The field only materializes on the first
+ * out-of-canonical-order attach — until then the canonical projection order
+ * (extras → tools → text) IS the arrival order, so nothing is stored and
+ * settled rows stay byte-stable.
+ */
+function notePartOrder(
+  assistant: AssistantMessage,
+  token: string,
+  outOfOrder: boolean
+): void {
+  if (assistant.partOrder) {
+    if (!assistant.partOrder.includes(token)) assistant.partOrder.push(token);
+    return;
+  }
+  if (!outOfOrder) return;
+  // Everything attached so far arrived in canonical order (else partOrder
+  // would already exist) — materialize that prefix, then the new token.
+  const order: string[] = [];
+  for (let i = 0; i < (assistant.extraParts?.length ?? 0); i++) {
+    order.push(`extra:${i}`);
+  }
+  for (const tc of assistant.toolCalls ?? []) order.push(`tool:${tc.id}`);
+  if (assistant.content !== undefined) order.push("text");
+  order.push(token);
+  assistant.partOrder = order;
+}
+
+/** Attach message metadata to the current/next assistant. Object metadata
+ * shallow-merges over what the assistant already carries — a continuation's
+ * stream metadata must extend, not erase, the seeded assistant's. */
 function attachMetadata(state: SnapshotState, metadata: unknown): void {
   const assistant = lastAssistant(state);
   if (assistant) {
-    assistant.metadata = metadata;
+    assistant.metadata =
+      isPlainObject(assistant.metadata) && isPlainObject(metadata)
+        ? { ...assistant.metadata, ...metadata }
+        : metadata;
   } else {
     state.pendingMetadata = metadata;
   }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Flush extras/metadata buffered before the first assistant existed. */

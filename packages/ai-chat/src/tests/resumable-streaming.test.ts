@@ -941,25 +941,29 @@ describe("Resumable Streaming", () => {
         1000
       );
 
+      // Post-cutover the stored stream opens with a `start` carrying the
+      // run's generated assistant id, and part ids are opaque — assert
+      // shape/order, not exact id bytes.
       const responseMessages = messages.filter(isUseChatResponseMessage);
-      expect(responseMessages[0]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-start","id":"t1"}',
-          done: false,
-          replay: true
-        })
-      );
-      expect(responseMessages[1]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-delta","id":"t1","delta":"hello after ack"}',
-          done: false,
-          replay: true
-        })
-      );
+      const bodies = responseMessages.map((m) =>
+        typeof m.body === "string" && m.body ? JSON.parse(m.body) : m.body
+      ) as Array<{ type?: string; delta?: string }>;
+      expect(bodies[0]?.type).toBe("start");
+      expect(bodies[1]?.type).toBe("text-start");
+      expect(bodies[2]).toMatchObject({
+        type: "text-delta",
+        delta: "hello after ack"
+      });
+      for (const frame of responseMessages.slice(0, 3)) {
+        expect(frame).toEqual(
+          expect.objectContaining({
+            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+            id: requestId,
+            done: false,
+            replay: true
+          })
+        );
+      }
       expect(responseMessages.at(-1)).toEqual(
         expect.objectContaining({
           type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
@@ -1309,6 +1313,77 @@ describe("Resumable Streaming", () => {
       ws2.close(1000);
     });
 
+    it("re-running the orphan reconstruction is idempotent (repeat ACK / recovery / approval overlap)", async () => {
+      // The reconstruction is NOT one-shot: it runs from resume ACKs and
+      // (twice) from the recovery engine, and an approval snapshot may have
+      // persisted part of the same stream already. Applying it repeatedly
+      // must not duplicate text, extras, or reasoning — and replayed
+      // reasoning content must survive.
+      const room = crypto.randomUUID();
+      const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+      await new Promise((r) => setTimeout(r, 50));
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+      await agentStub.persistMessages([
+        {
+          id: "user-idem",
+          role: "user",
+          parts: [{ type: "text", text: "go" }]
+        }
+      ]);
+
+      const streamId = await agentStub.testStartStream("req-idem");
+      for (const body of [
+        '{"type":"start","messageId":"assistant-idem"}',
+        '{"type":"start-step"}',
+        '{"type":"reasoning-start","id":"r-idem"}',
+        '{"type":"reasoning-delta","id":"r-idem","delta":"thinking hard"}',
+        '{"type":"reasoning-end","id":"r-idem"}',
+        '{"type":"tool-input-available","toolCallId":"tc-idem","toolName":"lookup","input":{"q":1}}',
+        '{"type":"tool-output-available","toolCallId":"tc-idem","output":{"a":2}}',
+        '{"type":"text-start","id":"t-idem"}',
+        '{"type":"text-delta","id":"t-idem","delta":"partial answer"}'
+        // interrupted: no text-end / finish
+      ]) {
+        await agentStub.testStoreStreamChunk(streamId, body);
+      }
+      await agentStub.testFlushChunkBuffer();
+
+      const snapshotOf = async () => {
+        const persisted =
+          (await agentStub.getPersistedMessages()) as unknown as Array<{
+            id: string;
+            role: string;
+            parts: Array<{ type: string; text?: string }>;
+          }>;
+        const assistant = persisted.find((m) => m.role === "assistant");
+        return { persisted, assistant };
+      };
+
+      await agentStub.testPersistOrphanedStream(streamId);
+      const first = await snapshotOf();
+      expect(first.assistant).toBeDefined();
+
+      // Re-apply twice more (repeat ACK / second recovery pass).
+      await agentStub.testPersistOrphanedStream(streamId);
+      await agentStub.testPersistOrphanedStream(streamId);
+      const after = await snapshotOf();
+
+      // Identical outcome — nothing duplicated.
+      expect(after.persisted).toEqual(first.persisted);
+      const parts = after.assistant!.parts;
+      expect(parts.filter((p) => p.type === "step-start")).toHaveLength(1);
+      const reasoningParts = parts.filter((p) => p.type === "reasoning");
+      expect(reasoningParts).toHaveLength(1);
+      expect(reasoningParts[0].text).toBe("thinking hard");
+      const textParts = parts.filter((p) => p.type === "text");
+      expect(textParts).toHaveLength(1);
+      expect(textParts[0].text).toBe("partial answer");
+      expect(parts.filter((p) => p.type === "tool-lookup")).toHaveLength(1);
+
+      ws.close(1000);
+    });
+
     it("orphaned stream with tool call parts reconstructs correctly", async () => {
       const room = crypto.randomUUID();
 
@@ -1421,10 +1496,15 @@ describe("Resumable Streaming", () => {
         }
       ]);
 
-      // Start a continuation stream whose start chunk has NO messageId
-      // (stripped by #1229 server-side logic).
+      // Post-cutover a continuation stream is anchored server-side on the
+      // seed assistant id (chunk-to-event injects it; the #1229 provider-id
+      // strip is upstream of that), so the stored stream opens with the
+      // existing assistant's id.
       const streamId = await agentStub.testStartStream("req-cont-orphan");
-      await agentStub.testStoreStreamChunk(streamId, '{"type":"start"}');
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"start","messageId":"assistant-cont"}'
+      );
       await agentStub.testStoreStreamChunk(
         streamId,
         '{"type":"text-start","id":"t-cont"}'
@@ -2319,7 +2399,10 @@ describe("Resumable Streaming", () => {
       );
 
       const frames = replayFrames();
-      expect(frames.length).toBeGreaterThanOrEqual(3);
+      // Post-cutover RUN_STARTED has no chunk projection, so the replay is
+      // one frame shorter than the legacy wire; the contract under test is
+      // the continuation flag, not the frame count.
+      expect(frames.length).toBeGreaterThanOrEqual(2);
       for (const frame of frames) {
         expect(frame.continuation).toBe(true);
       }

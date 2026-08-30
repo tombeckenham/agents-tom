@@ -1007,6 +1007,18 @@ describe("chatRecovery", () => {
 
       // Progress was made: the continuation re-ran inference and produced new
       // tokens (NOT zero-progress → stable-timeout, the #1781 symptom).
+      // The recovery continuation is scheduled, so poll rather than racing a
+      // single idle barrier.
+      {
+        const deadline = Date.now() + 5000;
+        while (
+          (await stub.getOnChatMessageCallCount()) < 1 &&
+          Date.now() < deadline
+        ) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      }
+      await stub.waitForIdleForTest();
       expect(await stub.getOnChatMessageCallCount()).toBe(1);
 
       const messages = await stub.getPersistedMessages();

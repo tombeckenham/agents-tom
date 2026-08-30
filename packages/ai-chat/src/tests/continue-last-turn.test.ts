@@ -93,16 +93,15 @@ describe("continueLastTurn", () => {
     expect(assistantMessages).toHaveLength(1);
     expect(assistantMessages[0].id).toBe("assistant-1");
 
+    // Post-cutover an assistant's text is one content string: the
+    // continuation merges into a single text part instead of appending a
+    // second one. The rendered text is identical.
     const parts = assistantMessages[0].parts;
-    expect(parts.length).toBeGreaterThan(1);
-
-    const firstTextPart = parts[0] as { type: string; text: string };
-    expect(firstTextPart.text).toBe("Once upon a time");
-
     const allText = parts
       .filter((p: ChatMessage["parts"][number]) => p.type === "text")
       .map((p: { type: string; text?: string }) => p.text ?? "")
       .join("");
+    expect(allText).toContain("Once upon a time");
     expect(allText).toContain("Continued response.");
   });
 
@@ -311,9 +310,12 @@ describe("continueLastTurn", () => {
       (p: ChatMessage["parts"][number]) => p.type === "text"
     );
 
-    expect(textParts).toHaveLength(2);
-    expect((textParts[0] as { text: string }).text).toBe("Complete response.");
-    expect((textParts[1] as { text: string }).text).toBe("Continued response.");
+    // Post-cutover the continuation always extends the single content
+    // string (legacy split into a second part when the first was complete).
+    expect(textParts).toHaveLength(1);
+    expect((textParts[0] as { text: string }).text).toBe(
+      "Complete response.Continued response."
+    );
   });
 
   it("should merge reasoning into existing reasoning part during continuation", async () => {
@@ -366,13 +368,14 @@ describe("continueLastTurn", () => {
     const reasoningParts = assistant.parts.filter(
       (p: ChatMessage["parts"][number]) => p.type === "reasoning"
     );
-    expect(reasoningParts).toHaveLength(1);
-    expect((reasoningParts[0] as { text: string }).text).toContain(
-      "Original thinking."
-    );
-    expect((reasoningParts[0] as { text: string }).text).toContain(
-      "Thinking about continuation."
-    );
+    // Post-cutover each reasoning segment is its own AG-UI row, so the
+    // continuation's reasoning projects as a second part rather than
+    // merging into the first.
+    const reasoningText = reasoningParts
+      .map((p) => (p as { text: string }).text)
+      .join("");
+    expect(reasoningText).toContain("Original thinking.");
+    expect(reasoningText).toContain("Thinking about continuation.");
 
     const textParts = assistant.parts.filter(
       (p: ChatMessage["parts"][number]) => p.type === "text"

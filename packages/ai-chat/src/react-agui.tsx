@@ -31,6 +31,7 @@ import type { UIMessage, UIMessageChunk } from "ai";
 import { nanoid } from "nanoid";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  autoTransformAGUIMessages,
   broadcastTransition,
   MessageType,
   STREAM_RESUME_NONE_REASONS,
@@ -469,7 +470,12 @@ export function useAgentChat<
     if (!text.trim()) return [];
 
     try {
-      return JSON.parse(text) as ChatMessage[];
+      // `/get-messages` serves persisted rows verbatim: AG-UI rows (with the
+      // `_v` marker), legacy `UIMessage` rows from an unmigrated store, or a
+      // mix. Normalize to AG-UI, then project to the hook's UIMessage shape.
+      return toChatMessages<ChatMessage>(
+        autoTransformAGUIMessages(JSON.parse(text) as unknown[])
+      );
     } catch (error) {
       console.warn("Failed to parse initial messages JSON:", error);
       return [];
@@ -1496,10 +1502,13 @@ export function useAgentChat<
         case MessageType.CF_AGENT_USE_CHAT_RESPONSE: {
           if (localRequestIdsRef.current.has(data.id)) {
             // The transport owns this stream's chunks; the hook only needs the
-            // run's message id for tail protection and replay resets.
-            const startChunk = findStartChunk(
-              frameProjectors.project(data.id, data.body)
-            );
+            // run's message id for tail protection and replay resets. Done and
+            // error frames carry no AG-UI event body (an error frame's body is
+            // raw error text) — skip the projector rather than warn on them.
+            const startChunk =
+              data.done || data.error
+                ? undefined
+                : findStartChunk(frameProjectors.project(data.id, data.body));
             if (startChunk) {
               localResponseIds.set(data.id, startChunk.messageId);
               // `protectStreamingAssistantTail` runs at send time, before the

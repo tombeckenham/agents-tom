@@ -70,7 +70,9 @@ export function isEmptyReasoningMessage(message: AGUIMessage): boolean {
   const encrypted =
     typeof message.encryptedValue === "string" &&
     message.encryptedValue.length > 0;
-  return content === "" && !encrypted;
+  // Provider metadata (e.g. Anthropic redacted_thinking blocks) makes an
+  // empty-text reasoning row worth keeping: it round-trips to the provider.
+  return content === "" && !encrypted && message.providerMetadata === undefined;
 }
 
 export function enforceRowSizeLimit(message: AGUIMessage): AGUIMessage {
@@ -122,7 +124,62 @@ function sanitizeReasoning(message: ReasoningMessage): ReasoningMessage {
 }
 
 function sanitizeTool(message: ToolMessage): ToolMessage {
-  return stripEphemeralKeys(message);
+  const stripped = stripEphemeralKeys(message);
+  // Provider-executed payloads (code_execution, text_editor, …) can be
+  // 200KB+ and are dead weight once the model consumed the result: truncate
+  // long strings, keeping opaque `encrypted*` fields verbatim.
+  if (!stripped.providerExecuted) return stripped;
+  const parsed = parseForTruncation(stripped.content);
+  const truncated = truncateLargeStrings(parsed);
+  const content =
+    typeof truncated === "string" ? truncated : JSON.stringify(truncated);
+  if (content === stripped.content) return stripped;
+  return { ...stripped, content };
+}
+
+function parseForTruncation(content: string): unknown {
+  try {
+    return JSON.parse(content);
+  } catch {
+    return content;
+  }
+}
+
+/**
+ * Recursively truncate strings over `PROVIDER_TOOL_MAX_STRING_LENGTH`,
+ * appending a size marker; strings under opaque `encrypted*` keys are
+ * preserved verbatim. Idempotent (marker included within the cap).
+ */
+function truncateLargeStrings(
+  value: unknown,
+  preserveOpaqueStrings = false
+): unknown {
+  if (typeof value === "string") {
+    if (preserveOpaqueStrings) return value;
+    if (value.length > PROVIDER_TOOL_MAX_STRING_LENGTH) {
+      const marker = `… [truncated, original length: ${value.length}]`;
+      const contentLength = Math.max(
+        0,
+        PROVIDER_TOOL_MAX_STRING_LENGTH - marker.length
+      );
+      return value.slice(0, contentLength) + marker;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => truncateLargeStrings(v, preserveOpaqueStrings));
+  }
+  if (value !== null && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = truncateLargeStrings(
+        v,
+        preserveOpaqueStrings || k.startsWith("encrypted")
+      );
+    }
+    return result;
+  }
+  return value;
 }
 
 function sanitizeAssistant(message: AssistantMessage): AssistantMessage {
@@ -131,7 +188,28 @@ function sanitizeAssistant(message: AssistantMessage): AssistantMessage {
 
   let mutated = stripped !== message;
   const cleanedCalls: ToolCall[] = stripped.toolCalls.map((call) => {
-    const cleaned = stripEphemeralKeys(call);
+    let cleaned = stripEphemeralKeys(call);
+    // Provider-executed calls (marked via partExtras) get their argument
+    // payload truncated, mirroring the result-row truncation.
+    if (
+      cleaned.partExtras?.providerExecuted === true &&
+      cleaned.function.name !== "web_search" &&
+      cleaned.function.name !== "web_fetch"
+    ) {
+      const truncatedArgs = truncateLargeStrings(
+        parseForTruncation(cleaned.function.arguments)
+      );
+      const argsJson =
+        typeof truncatedArgs === "string"
+          ? truncatedArgs
+          : JSON.stringify(truncatedArgs);
+      if (argsJson !== cleaned.function.arguments) {
+        cleaned = {
+          ...cleaned,
+          function: { ...cleaned.function, arguments: argsJson }
+        };
+      }
+    }
     if (cleaned !== call) mutated = true;
     return cleaned;
   });
@@ -139,6 +217,15 @@ function sanitizeAssistant(message: AssistantMessage): AssistantMessage {
   if (!mutated) return message;
   return { ...stripped, toolCalls: cleanedCalls };
 }
+
+// Metadata containers whose EMPTY husks (after ephemeral-key stripping)
+// should be pruned entirely — legacy `sanitizeMessage` removed e.g. a
+// `providerMetadata.openai` that only held an `itemId`.
+const METADATA_CONTAINER_KEYS = new Set([
+  "providerMetadata",
+  "callProviderMetadata",
+  "contentProviderMetadata"
+]);
 
 function stripEphemeralKeys<T extends object>(value: T): T {
   let mutated = false;
@@ -150,7 +237,16 @@ function stripEphemeralKeys<T extends object>(value: T): T {
       continue;
     }
     if (val && typeof val === "object" && !Array.isArray(val)) {
-      const recursed = stripEphemeralKeys(val as Record<string, unknown>);
+      let recursed: unknown = stripEphemeralKeys(
+        val as Record<string, unknown>
+      );
+      if (METADATA_CONTAINER_KEYS.has(key)) {
+        recursed = pruneEmptyObjects(recursed as Record<string, unknown>);
+        if (recursed === undefined) {
+          mutated = true;
+          continue;
+        }
+      }
       if (recursed !== val) mutated = true;
       result[key] = recursed;
     } else {
@@ -162,20 +258,46 @@ function stripEphemeralKeys<T extends object>(value: T): T {
   return result as T;
 }
 
+/** Drop empty nested objects; returns undefined when nothing remains. */
+function pruneEmptyObjects(
+  value: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const pruned = pruneEmptyObjects(val as Record<string, unknown>);
+      if (pruned !== undefined) result[key] = pruned;
+    } else {
+      result[key] = val;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 function truncateToolMessage(message: ToolMessage): ToolMessage {
   const truncated = truncateToolMessageContent(message.content);
   if (truncated === message.content) return message;
-  return { ...message, content: truncated };
+  // Record the compaction (legacy parity): the projection folds this onto
+  // the owning assistant's `metadata.compactedToolOutputs`.
+  const metadata = {
+    ...(typeof message.metadata === "object" &&
+    message.metadata !== null &&
+    !Array.isArray(message.metadata)
+      ? (message.metadata as Record<string, unknown>)
+      : {}),
+    compactedToolOutputs: [message.toolCallId]
+  };
+  return { ...message, content: truncated, metadata };
 }
 
 function compactAssistantToolArgs(message: AssistantMessage): AssistantMessage {
   if (!message.toolCalls || message.toolCalls.length === 0) return message;
 
-  let mutated = false;
+  const compactedIds: string[] = [];
   const compactedCalls: ToolCall[] = message.toolCalls.map((call) => {
     const args = call.function.arguments;
     if (args.length <= PROVIDER_TOOL_MAX_STRING_LENGTH) return call;
-    mutated = true;
+    compactedIds.push(call.id);
     const truncated = truncateToolMessageContent(args);
     return {
       ...call,
@@ -183,8 +305,18 @@ function compactAssistantToolArgs(message: AssistantMessage): AssistantMessage {
     };
   });
 
-  if (!mutated) return message;
-  return { ...message, toolCalls: compactedCalls };
+  if (compactedIds.length === 0) return message;
+  // Record which calls were compacted (legacy parity: consumers can detect
+  // that tool payloads were truncated to fit the row cap).
+  const metadata = {
+    ...(typeof message.metadata === "object" &&
+    message.metadata !== null &&
+    !Array.isArray(message.metadata)
+      ? (message.metadata as Record<string, unknown>)
+      : {}),
+    compactedToolOutputs: compactedIds
+  };
+  return { ...message, toolCalls: compactedCalls, metadata };
 }
 
 function truncateAssistantContent(message: AssistantMessage): AssistantMessage {

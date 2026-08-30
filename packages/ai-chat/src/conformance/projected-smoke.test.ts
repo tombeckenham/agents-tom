@@ -72,7 +72,7 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
       { id: "u-1", role: "user", parts: [{ type: "text", text: "hello" }] },
       expect.objectContaining({
         role: "assistant",
-        parts: [{ type: "text", text: "Hello world" }]
+        parts: [{ type: "text", text: "Hello world", state: "done" }]
       })
     ]);
 
@@ -122,7 +122,11 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
         output: { temp: 21 }
       })
     );
-    expect(parts).toContainEqual({ type: "text", text: "It is 21C" });
+    expect(parts).toContainEqual({
+      type: "text",
+      text: "It is 21C",
+      state: "done"
+    });
 
     client.close();
   });
@@ -145,8 +149,8 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
     expect(ui).toHaveLength(2);
     expect(ui[1].role).toBe("assistant");
     expect(ui[1].parts).toEqual([
-      { type: "reasoning", text: "thinking about it" },
-      { type: "text", text: "reasoned answer" }
+      { type: "reasoning", text: "thinking about it", state: "done" },
+      { type: "text", text: "reasoned answer", state: "done" }
     ]);
 
     // The hook's folded message carries the reasoning part too.
@@ -264,7 +268,11 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
         approval: expect.objectContaining({ approved: true })
       })
     );
-    expect(parts).toContainEqual({ type: "text", text: "approved and ran" });
+    expect(parts).toContainEqual({
+      type: "text",
+      text: "approved and ran",
+      state: "done"
+    });
 
     client.close();
   });
@@ -292,7 +300,8 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
     );
     expect(parts).toContainEqual({
       type: "text",
-      text: "denied — riskyTool not run"
+      text: "denied — riskyTool not run",
+      state: "done"
     });
     // No tool result row for a denied call.
     const rows = (await stub.rows()) as Array<{
@@ -343,7 +352,8 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
     ]);
     expect(assistant?.parts.at(-1)).toEqual({
       type: "text",
-      text: "with extras"
+      text: "with extras",
+      state: "done"
     });
 
     client.close();

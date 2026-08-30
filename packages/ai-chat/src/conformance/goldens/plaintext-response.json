@@ -7,7 +7,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-1"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-1",
@@ -16,7 +16,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-1",
+            "id": "part-1",
             "delta": "plain reply"
           },
           "done": false,
@@ -26,7 +26,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-1"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-1",

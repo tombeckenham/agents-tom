@@ -57,7 +57,7 @@ describe("toUIMessages", () => {
       state: "input-available",
       input: { city: "Sydney" }
     });
-    expect(parts[1]).toEqual({ type: "text", text: "checking" });
+    expect(parts[1]).toEqual({ type: "text", text: "checking", state: "done" });
   });
 
   it("emits a tool-only assistant turn with no text part", () => {
@@ -244,8 +244,8 @@ describe("toUIMessages", () => {
         id: "a1",
         role: "assistant",
         parts: [
-          { type: "reasoning", text: "thinking" },
-          { type: "text", text: "answer" }
+          { type: "reasoning", text: "thinking", state: "done" },
+          { type: "text", text: "answer", state: "done" }
         ]
       }
     ]);
@@ -259,7 +259,7 @@ describe("toUIMessages", () => {
     expect(ui[0]).toEqual({
       id: "r1",
       role: "assistant",
-      parts: [{ type: "reasoning", text: "thinking" }]
+      parts: [{ type: "reasoning", text: "thinking", state: "done" }]
     });
   });
 

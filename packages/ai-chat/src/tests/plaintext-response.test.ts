@@ -76,7 +76,10 @@ describe("Plain text response handling", () => {
     const bodies = nonEmptyResponses.map((m) => JSON.parse(m.body as string));
     const types = bodies.map((b) => b.type);
 
-    expect(types[0]).toBe("text-start");
+    // Post-cutover a leading `start` (with the allocated message id)
+    // precedes the text lifecycle.
+    expect(types[0]).toBe("start");
+    expect(types[1]).toBe("text-start");
     expect(types[types.length - 1]).toBe("text-end");
     expect(
       types.filter((t: string) => t === "text-delta").length

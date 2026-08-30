@@ -1,21 +1,3 @@
-export {
-  useAgentChat,
-  extractClientToolSchemas,
-  detectToolsRequiringConfirmation,
-  getToolPartState,
-  getToolCallId,
-  getToolInput,
-  getToolOutput,
-  getToolApproval,
-  getAgentMessages
-} from "agents/chat/react";
-
-export type {
-  JSONSchemaType,
-  AITool,
-  ClientToolSchema,
-  UseAgentChatOptions,
-  PrepareSendMessagesRequestOptions,
-  PrepareSendMessagesRequestResult,
-  OnToolCallCallback
-} from "agents/chat/react";
+// The React client, rebased on the shared AG-UI transport (Phase 4/5 cutover).
+// Public surface is unchanged; see ./react-agui.tsx.
+export * from "./react-agui";

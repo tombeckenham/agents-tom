@@ -19,6 +19,7 @@ import type {
   ToolSet
 } from "ai";
 import { Agent, routeAgentRequest, type RunAgentToolResult } from "agents";
+import type { ChatResponseResult as EngineChatResponseResult } from "agents/chat";
 
 type ToolPart = Extract<
   ChatMessage["parts"][number],
@@ -147,6 +148,220 @@ class ConformanceBase extends AIChatAgent<Env> {
 }
 
 /**
+ * The scripted chunk sequence per scenario — shared by the legacy and
+ * projected fixture classes so both stacks run byte-identical scripts.
+ */
+function scriptedResponse(
+  scenario: string,
+  continuation: boolean,
+  findToolPart: (toolCallId: string) => ToolPart | undefined
+): Response | undefined {
+  switch (scenario) {
+    case "pre-throw":
+      throw new Error("boom before response");
+
+    case "plaintext":
+      return new Response("plain reply", {
+        headers: { "Content-Type": "text/plain" }
+      });
+
+    // Truly no response — exercises the "No response was generated" branch.
+    case "no-response":
+      return undefined;
+
+    // A Response with an empty body — a different legacy branch.
+    case "empty-response-body":
+      return new Response(null);
+
+    case "reasoning":
+      return sse([
+        { type: "start" },
+        { type: "reasoning-start", id: "r-1" },
+        { type: "reasoning-delta", id: "r-1", delta: "thinking about it" },
+        { type: "reasoning-end", id: "r-1" },
+        { type: "text-start", id: "t-1" },
+        { type: "text-delta", id: "t-1", delta: "reasoned answer" },
+        { type: "text-end", id: "t-1" },
+        { type: "finish" }
+      ]);
+
+    case "tool-single":
+      return sse([
+        { type: "start" },
+        { type: "start-step" },
+        {
+          type: "tool-input-start",
+          toolCallId: "call-weather-1",
+          toolName: "getWeather"
+        },
+        {
+          type: "tool-input-delta",
+          toolCallId: "call-weather-1",
+          inputTextDelta: '{"city":"Sydney"}'
+        },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-weather-1",
+          toolName: "getWeather",
+          input: { city: "Sydney" }
+        },
+        {
+          type: "tool-output-available",
+          toolCallId: "call-weather-1",
+          output: { temp: 21 }
+        },
+        { type: "finish-step" },
+        { type: "text-start", id: "t-1" },
+        { type: "text-delta", id: "t-1", delta: "It is 21C" },
+        { type: "text-end", id: "t-1" },
+        { type: "finish" }
+      ]);
+
+    case "tool-parallel":
+      return sse([
+        { type: "start" },
+        { type: "start-step" },
+        {
+          type: "tool-input-start",
+          toolCallId: "call-a",
+          toolName: "getWeather"
+        },
+        {
+          type: "tool-input-start",
+          toolCallId: "call-b",
+          toolName: "getTime"
+        },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-a",
+          toolName: "getWeather",
+          input: { city: "Sydney" }
+        },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-b",
+          toolName: "getTime",
+          input: { zone: "AEST" }
+        },
+        {
+          type: "tool-output-available",
+          toolCallId: "call-a",
+          output: { temp: 21 }
+        },
+        {
+          type: "tool-output-available",
+          toolCallId: "call-b",
+          output: { time: "09:00" }
+        },
+        { type: "finish-step" },
+        { type: "text-start", id: "t-1" },
+        { type: "text-delta", id: "t-1", delta: "21C at 09:00" },
+        { type: "text-end", id: "t-1" },
+        { type: "finish" }
+      ]);
+
+    case "client-tool":
+      if (continuation) {
+        return sse(textRun("t-cont", ["client tool handled"]));
+      }
+      return sse([
+        { type: "start" },
+        { type: "start-step" },
+        {
+          type: "tool-input-start",
+          toolCallId: "call-client-1",
+          toolName: "clientEcho"
+        },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-client-1",
+          toolName: "clientEcho",
+          input: { text: "hi" }
+        },
+        { type: "finish-step" },
+        { type: "finish", finishReason: "tool-calls" }
+      ]);
+
+    case "approval": {
+      if (continuation) {
+        const part = findToolPart("call-approval-1");
+        if (part?.state === "approval-responded") {
+          return sse([
+            { type: "start" },
+            { type: "start-step" },
+            {
+              type: "tool-output-available",
+              toolCallId: "call-approval-1",
+              output: { ran: true }
+            },
+            { type: "text-start", id: "t-appr" },
+            { type: "text-delta", id: "t-appr", delta: "approved and ran" },
+            { type: "text-end", id: "t-appr" },
+            { type: "finish" }
+          ]);
+        }
+        return sse(textRun("t-deny", ["denied — riskyTool not run"]));
+      }
+      return sse([
+        { type: "start" },
+        { type: "start-step" },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-approval-1",
+          toolName: "riskyTool",
+          input: { level: 9 }
+        },
+        {
+          type: "tool-approval-request",
+          toolCallId: "call-approval-1",
+          approvalId: "approval-1"
+        }
+      ]);
+    }
+
+    case "error-mid":
+      return sse([
+        { type: "start" },
+        { type: "text-start", id: "t-err" },
+        { type: "text-delta", id: "t-err", delta: "partial " },
+        { type: "error", errorText: "scripted mid-stream failure" }
+      ]);
+
+    case "metadata":
+      return sse([
+        { type: "start" },
+        {
+          type: "message-metadata",
+          messageMetadata: { model: "fixture-model" }
+        },
+        {
+          type: "data-weather",
+          id: "data-1",
+          data: { city: "Sydney", temp: 21 }
+        },
+        {
+          type: "file",
+          url: "data:text/plain;base64,aGk=",
+          mediaType: "text/plain"
+        },
+        {
+          type: "source-url",
+          sourceId: "src-1",
+          url: "https://example.com/doc",
+          title: "Doc"
+        },
+        { type: "text-start", id: "t-1" },
+        { type: "text-delta", id: "t-1", delta: "with extras" },
+        { type: "text-end", id: "t-1" },
+        { type: "finish" }
+      ]);
+
+    default:
+      return sse(textRun("t-1", ["Hello ", "world"]));
+  }
+}
+
+/**
  * Body-driven fixture: `body.scenario` picks the scripted chunk sequence.
  * The body is stored by the framework and re-supplied on continuations, so
  * continuation turns branch on `options.continuation` + persisted tool state.
@@ -161,211 +376,52 @@ export class ScriptedAgent extends ConformanceBase {
     const scenario =
       (options?.body as { scenario?: string } | undefined)?.scenario ??
       "plain-text";
-
-    switch (scenario) {
-      case "pre-throw":
-        throw new Error("boom before response");
-
-      case "plaintext":
-        return new Response("plain reply", {
-          headers: { "Content-Type": "text/plain" }
-        });
-
-      // Truly no response — exercises the "No response was generated" branch.
-      case "no-response":
-        return undefined;
-
-      // A Response with an empty body — a different legacy branch.
-      case "empty-response-body":
-        return new Response(null);
-
-      case "reasoning":
-        return sse([
-          { type: "start" },
-          { type: "reasoning-start", id: "r-1" },
-          { type: "reasoning-delta", id: "r-1", delta: "thinking about it" },
-          { type: "reasoning-end", id: "r-1" },
-          { type: "text-start", id: "t-1" },
-          { type: "text-delta", id: "t-1", delta: "reasoned answer" },
-          { type: "text-end", id: "t-1" },
-          { type: "finish" }
-        ]);
-
-      case "tool-single":
-        return sse([
-          { type: "start" },
-          { type: "start-step" },
-          {
-            type: "tool-input-start",
-            toolCallId: "call-weather-1",
-            toolName: "getWeather"
-          },
-          {
-            type: "tool-input-delta",
-            toolCallId: "call-weather-1",
-            inputTextDelta: '{"city":"Sydney"}'
-          },
-          {
-            type: "tool-input-available",
-            toolCallId: "call-weather-1",
-            toolName: "getWeather",
-            input: { city: "Sydney" }
-          },
-          {
-            type: "tool-output-available",
-            toolCallId: "call-weather-1",
-            output: { temp: 21 }
-          },
-          { type: "finish-step" },
-          { type: "text-start", id: "t-1" },
-          { type: "text-delta", id: "t-1", delta: "It is 21C" },
-          { type: "text-end", id: "t-1" },
-          { type: "finish" }
-        ]);
-
-      case "tool-parallel":
-        return sse([
-          { type: "start" },
-          { type: "start-step" },
-          {
-            type: "tool-input-start",
-            toolCallId: "call-a",
-            toolName: "getWeather"
-          },
-          {
-            type: "tool-input-start",
-            toolCallId: "call-b",
-            toolName: "getTime"
-          },
-          {
-            type: "tool-input-available",
-            toolCallId: "call-a",
-            toolName: "getWeather",
-            input: { city: "Sydney" }
-          },
-          {
-            type: "tool-input-available",
-            toolCallId: "call-b",
-            toolName: "getTime",
-            input: { zone: "AEST" }
-          },
-          {
-            type: "tool-output-available",
-            toolCallId: "call-a",
-            output: { temp: 21 }
-          },
-          {
-            type: "tool-output-available",
-            toolCallId: "call-b",
-            output: { time: "09:00" }
-          },
-          { type: "finish-step" },
-          { type: "text-start", id: "t-1" },
-          { type: "text-delta", id: "t-1", delta: "21C at 09:00" },
-          { type: "text-end", id: "t-1" },
-          { type: "finish" }
-        ]);
-
-      case "client-tool":
-        if (options?.continuation) {
-          return sse(textRun("t-cont", ["client tool handled"]));
-        }
-        return sse([
-          { type: "start" },
-          { type: "start-step" },
-          {
-            type: "tool-input-start",
-            toolCallId: "call-client-1",
-            toolName: "clientEcho"
-          },
-          {
-            type: "tool-input-available",
-            toolCallId: "call-client-1",
-            toolName: "clientEcho",
-            input: { text: "hi" }
-          },
-          { type: "finish-step" },
-          { type: "finish", finishReason: "tool-calls" }
-        ]);
-
-      case "approval": {
-        if (options?.continuation) {
-          const part = this.findToolPart("call-approval-1");
-          if (part?.state === "approval-responded") {
-            return sse([
-              { type: "start" },
-              { type: "start-step" },
-              {
-                type: "tool-output-available",
-                toolCallId: "call-approval-1",
-                output: { ran: true }
-              },
-              { type: "text-start", id: "t-appr" },
-              { type: "text-delta", id: "t-appr", delta: "approved and ran" },
-              { type: "text-end", id: "t-appr" },
-              { type: "finish" }
-            ]);
-          }
-          return sse(textRun("t-deny", ["denied — riskyTool not run"]));
-        }
-        return sse([
-          { type: "start" },
-          { type: "start-step" },
-          {
-            type: "tool-input-available",
-            toolCallId: "call-approval-1",
-            toolName: "riskyTool",
-            input: { level: 9 }
-          },
-          {
-            type: "tool-approval-request",
-            toolCallId: "call-approval-1",
-            approvalId: "approval-1"
-          }
-        ]);
-      }
-
-      case "error-mid":
-        return sse([
-          { type: "start" },
-          { type: "text-start", id: "t-err" },
-          { type: "text-delta", id: "t-err", delta: "partial " },
-          { type: "error", errorText: "scripted mid-stream failure" }
-        ]);
-
-      case "metadata":
-        return sse([
-          { type: "start" },
-          {
-            type: "message-metadata",
-            messageMetadata: { model: "fixture-model" }
-          },
-          {
-            type: "data-weather",
-            id: "data-1",
-            data: { city: "Sydney", temp: 21 }
-          },
-          {
-            type: "file",
-            url: "data:text/plain;base64,aGk=",
-            mediaType: "text/plain"
-          },
-          {
-            type: "source-url",
-            sourceId: "src-1",
-            url: "https://example.com/doc",
-            title: "Doc"
-          },
-          { type: "text-start", id: "t-1" },
-          { type: "text-delta", id: "t-1", delta: "with extras" },
-          { type: "text-end", id: "t-1" },
-          { type: "finish" }
-        ]);
-
-      default:
-        return sse(textRun("t-1", ["Hello ", "world"]));
-    }
+    return scriptedResponse(scenario, options?.continuation === true, (id) =>
+      this.findToolPart(id)
+    );
   }
+}
+
+/**
+ * The gated stream shared by legacy and projected gated fixtures: a prefix,
+ * then a hold on `gate()` until the test's `release` RPC opens it.
+ */
+function gatedResponse(
+  signal: AbortSignal | undefined,
+  gate: () => Promise<void>
+): Response {
+  const encoder = new TextEncoder();
+  const emit = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    chunk: Record<string, unknown>
+  ) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      emit(controller, { type: "start" });
+      emit(controller, { type: "text-start", id: "t-g" });
+      emit(controller, {
+        type: "text-delta",
+        id: "t-g",
+        delta: "before-gate "
+      });
+      await gate();
+      if (!signal?.aborted) {
+        emit(controller, {
+          type: "text-delta",
+          id: "t-g",
+          delta: "after-gate"
+        });
+        emit(controller, { type: "text-end", id: "t-g" });
+        emit(controller, { type: "finish" });
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    }
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream" }
+  });
 }
 
 /**
@@ -393,41 +449,7 @@ export class GatedAgent extends ConformanceBase {
     options?: OnChatMessageOptions
   ) {
     this._chatMessageCalls++;
-    const signal = options?.abortSignal;
-    const gate = () => this._gate();
-    const encoder = new TextEncoder();
-    const emit = (
-      controller: ReadableStreamDefaultController<Uint8Array>,
-      chunk: Record<string, unknown>
-    ) =>
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        emit(controller, { type: "start" });
-        emit(controller, { type: "text-start", id: "t-g" });
-        emit(controller, {
-          type: "text-delta",
-          id: "t-g",
-          delta: "before-gate "
-        });
-        await gate();
-        if (!signal?.aborted) {
-          emit(controller, {
-            type: "text-delta",
-            id: "t-g",
-            delta: "after-gate"
-          });
-          emit(controller, { type: "text-end", id: "t-g" });
-          emit(controller, { type: "finish" });
-        }
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      }
-    });
-    return new Response(stream, {
-      headers: { "Content-Type": "text/event-stream" }
-    });
+    return gatedResponse(options?.abortSignal, () => this._gate());
   }
 }
 
@@ -450,6 +472,157 @@ export class DebounceGatedAgent extends GatedAgent {
 }
 
 export class MaxPersistedAgent extends ScriptedAgent {
+  maxPersistedMessages = 2;
+}
+
+// ── Projected mirrors (Phase 5 differential) ─────────────────────────
+//
+// One fixture per legacy fixture, extending the PROJECTED `AIChatAgent`
+// (`../agent.ts` — AG-UI engine under the legacy AI SDK surface) and running
+// the same scripted scenarios via `scriptedResponse` / `gatedResponse`.
+
+/** RPC surface mirror of {@link ConformanceBase} on the projected class. */
+class ProjectedConformanceBase extends ProjectedAIChatAgent<Env> {
+  protected _chatMessageCalls = 0;
+  private _hookCalls: Array<Record<string, unknown>> = [];
+
+  async stable(timeout = 8000): Promise<boolean> {
+    return this.waitUntilStable({ timeout });
+  }
+
+  calls(): number {
+    return this._chatMessageCalls;
+  }
+
+  hooks(): Array<Record<string, unknown>> {
+    return this._hookCalls;
+  }
+
+  queueDepth(): number {
+    return (
+      this as unknown as { _turnQueue: { queuedCount(): number } }
+    )._turnQueue.queuedCount();
+  }
+
+  protected override onChatResponse(result: EngineChatResponseResult): void {
+    this._hookCalls.push({
+      hook: "onChatResponse",
+      requestId: result.requestId,
+      status: result.status,
+      continuation: result.continuation,
+      ...(result.error !== undefined && { error: result.error }),
+      messageId: result.message.id
+    });
+  }
+
+  onError(connectionOrError: unknown, error?: unknown): void {
+    this._hookCalls.push({
+      hook: "onError",
+      error: String(error ?? connectionOrError)
+    });
+  }
+
+  overlapping(): number {
+    return (
+      this as unknown as {
+        _submitConcurrency: { overlappingSubmitCount: number };
+      }
+    )._submitConcurrency.overlappingSubmitCount;
+  }
+
+  /** Raw persisted rows — AG-UI shape; the harness projects them for diffing. */
+  rows(): Array<{ id: string; message: unknown; created_at: string }> {
+    return (
+      this.sql<{ id: string; message: string; created_at: string }>`
+        select id, message, created_at
+        from cf_ai_chat_agent_messages order by created_at, rowid
+      ` || []
+    ).map((row) => ({
+      id: row.id,
+      message: JSON.parse(row.message),
+      created_at: row.created_at
+    }));
+  }
+
+  async programmaticTurn(text: string) {
+    return this.saveMessages([
+      ...this.messages,
+      {
+        id: "prog-user-1",
+        role: "user",
+        parts: [{ type: "text", text }]
+      }
+    ]);
+  }
+
+  protected findToolPart(toolCallId: string): ToolPart | undefined {
+    const lastAssistant = [...this.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    return lastAssistant?.parts.find(
+      (part): part is ToolPart =>
+        "toolCallId" in part && part.toolCallId === toolCallId
+    );
+  }
+}
+
+export class ProjectedScriptedAgent extends ProjectedConformanceBase {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ): Promise<Response | undefined> {
+    this._chatMessageCalls++;
+    const scenario =
+      (options?.body as { scenario?: string } | undefined)?.scenario ??
+      "plain-text";
+    return scriptedResponse(scenario, options?.continuation === true, (id) =>
+      this.findToolPart(id)
+    );
+  }
+}
+
+export class ProjectedGatedAgent extends ProjectedConformanceBase {
+  private _gateOpen = false;
+  private _waiters: Array<() => void> = [];
+
+  release(): void {
+    this._gateOpen = true;
+    for (const waiter of this._waiters.splice(0)) waiter();
+  }
+
+  private _gate(): Promise<void> {
+    if (this._gateOpen) return Promise.resolve();
+    return new Promise((resolve) => this._waiters.push(resolve));
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async onChatMessage(
+    _onFinish: GenerateTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ) {
+    this._chatMessageCalls++;
+    return gatedResponse(options?.abortSignal, () => this._gate());
+  }
+}
+
+export class ProjectedLatestGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "latest" as const;
+}
+
+export class ProjectedDropGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "drop" as const;
+}
+
+export class ProjectedMergeGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = "merge" as const;
+}
+
+export class ProjectedDebounceGatedAgent extends ProjectedGatedAgent {
+  messageConcurrency = { strategy: "debounce", debounceMs: 1 } as const;
+}
+
+export class ProjectedMaxPersistedAgent extends ProjectedScriptedAgent {
   maxPersistedMessages = 2;
 }
 
@@ -720,6 +893,13 @@ export type Env = {
   MergeGatedAgent: DurableObjectNamespace<MergeGatedAgent>;
   DebounceGatedAgent: DurableObjectNamespace<DebounceGatedAgent>;
   MaxPersistedAgent: DurableObjectNamespace<MaxPersistedAgent>;
+  ProjectedScriptedAgent: DurableObjectNamespace<ProjectedScriptedAgent>;
+  ProjectedGatedAgent: DurableObjectNamespace<ProjectedGatedAgent>;
+  ProjectedLatestGatedAgent: DurableObjectNamespace<ProjectedLatestGatedAgent>;
+  ProjectedDropGatedAgent: DurableObjectNamespace<ProjectedDropGatedAgent>;
+  ProjectedMergeGatedAgent: DurableObjectNamespace<ProjectedMergeGatedAgent>;
+  ProjectedDebounceGatedAgent: DurableObjectNamespace<ProjectedDebounceGatedAgent>;
+  ProjectedMaxPersistedAgent: DurableObjectNamespace<ProjectedMaxPersistedAgent>;
   ProjectedAgent: DurableObjectNamespace<ProjectedAgent>;
   ProjectedChildAgent: DurableObjectNamespace<ProjectedChildAgent>;
   ProjectedToolParent: DurableObjectNamespace<ProjectedToolParent>;

@@ -84,7 +84,14 @@ describe("AIChatAgent recovery after forced Durable Object eviction", () => {
     await evictDurableObject(stub);
 
     const restored = (await stub.getMessagesForTest()) as ChatMessage[];
-    expect(restored).toEqual(messages);
+    // Post-cutover the projected assistant text part carries state: "done".
+    expect(restored).toEqual([
+      messages[0],
+      {
+        ...messages[1],
+        parts: [{ type: "text", text: "I will be restored", state: "done" }]
+      }
+    ]);
     expect(await stub.getPersistedMessages()).toEqual(restored);
   });
 

@@ -31,7 +31,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-4"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-3",
@@ -40,7 +40,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-4",
+            "id": "part-1",
             "delta": "Hello "
           },
           "done": false,
@@ -50,7 +50,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-4",
+            "id": "part-1",
             "delta": "world"
           },
           "done": false,
@@ -60,7 +60,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-4"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-3",
