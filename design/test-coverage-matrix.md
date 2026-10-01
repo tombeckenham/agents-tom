@@ -87,9 +87,13 @@ for scenario counts and expected-failure rationale.
 
 - **Chat recovery orphan-persist (c) tool-approval dedup:** no real-SIGKILL L4
   e2e by design. The behavior is covered at L1/2 and L3 via
-  `reconcileOrphanPartial` unit coverage and `durable-chat-recovery.test.ts`;
-  the RFC progress log records the L4 gap as accepted because marginal value is
-  low and harness cost is high.
+  `durable-chat-recovery.test.ts` (both
+  `packages/ai-chat/src/tests/` and `packages/agents/src/agui-tests/`); the RFC
+  progress log records the L4 gap as accepted because marginal value is low and
+  harness cost is high. The `reconcileOrphanPartial` unit coverage that
+  previously backed this entry no longer exists — the helper was deleted in the
+  AG-UI cutover (Phase 6), where dedup became a property of the engine's
+  idempotent orphan replay rather than a standalone merge primitive.
 
 ## Skipped & quarantined test debt
 

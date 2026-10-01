@@ -11,13 +11,13 @@ import type { AGUIEvent } from "agents/chat/agui-types";
 const MODEL = "@cf/moonshotai/kimi-k2.7-code";
 
 /**
- * The same agent as `examples/agui-chat-vercel`, driven by TanStack AI.
+ * The `examples/ai-chat` agent, driven by TanStack AI.
  *
  * This is the case the RFC is really about. TanStack's `chat()` already
  * emits AG-UI, so there is no chunk-to-event projection on this path at
- * all — `toAGUIResponse()` just frames the stream as SSE. Compare with the
- * Vercel example, where `toAGUIResponse()` has to translate a `UIMessage`
- * stream into AG-UI events first.
+ * all — `toAGUIResponse()` just frames the stream as SSE. On the AI SDK
+ * path, `toAGUIResponse()` has to translate a `UIMessage` stream into AG-UI
+ * events first.
  */
 export class ChatAgent extends AGUIChatAgent<Env> {
   maxPersistedMessages = 200;

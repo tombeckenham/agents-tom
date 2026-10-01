@@ -46,3 +46,40 @@ The Browser Run binding is configured with `remote: true`, so Kitesurf runs remo
 - Have a long conversation -- old tool calls are pruned from LLM context automatically
 
 This example uses Kitesurf as a one-shot browser and disables Quick Actions, which cannot currently select the Kitesurf engine.
+
+## Variant: building on `AGUIChatAgent` directly
+
+`AIChatAgent` is a projection layer over the AG-UI engine — it exists to keep
+the AI SDK surface (`this.messages` as `UIMessage[]`, `onChatMessage`
+returning a `UIMessageChunk` stream). If you would rather extend the engine
+class itself but still build streams with the AI SDK, three lines change on
+the server and none on the client:
+
+```diff
+-import { AIChatAgent } from "@cloudflare/ai-chat";
++import { AGUIChatAgent } from "agents/agui-chat-agent";
++import { toAGUIResponse, toUIMessages } from "@cloudflare/ai-chat";
+
+-export class ChatAgent extends AIChatAgent<Env> {
++export class ChatAgent extends AGUIChatAgent<Env> {
+   async onChatMessage(_onFinish, options) {
+     const result = streamText({
+-      messages: await convertToModelMessages(this.messages),
++      messages: await convertToModelMessages(toUIMessages(this.messages)),
+       ...
+     });
+-    return result.toUIMessageStreamResponse();
++    return toAGUIResponse(result.toUIMessageStreamResponse());
+   }
+ }
+```
+
+`AGUIChatAgent.messages` is canonical AG-UI, so it goes through
+`toUIMessages()` before the AI SDK sees it; `toAGUIResponse()` projects the
+outgoing `UIMessageChunk` stream into AG-UI SSE. The client is untouched —
+`useAgentChat` speaks AG-UI on the wire whichever base class the server
+extends.
+
+For the same agent driven by TanStack AI instead, where the server-side
+projection disappears entirely, see
+[`examples/agui-chat-tanstack`](../agui-chat-tanstack).
