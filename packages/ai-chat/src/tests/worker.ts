@@ -34,9 +34,12 @@ import type {
 import {
   CHAT_RECOVERY_TASK_NAME,
   ResumableStream,
+  autoTransformAGUIMessages,
   chatRecoveryTaskRunOptions,
+  fromSessionMessage,
   toUIMessages
 } from "agents/chat";
+import type { Session } from "agents/sessions";
 import { ChunkToEventProjector } from "../chunk-to-event";
 
 /**
@@ -115,10 +118,6 @@ type TestToolCallPart = Extract<
  * the tests that depend on them fail at runtime and stay as the porting spec.
  */
 type UnportedLegacyInternals = {
-  sessions: {
-    subscribe(listener: () => void): unknown;
-    session(): { clearMessages(): Promise<void> };
-  };
   _agentToolTerminalOnlyRuns: Set<string>;
   inspectAgentToolRun(
     runId: string,
@@ -140,18 +139,30 @@ function sessionChangeEventCount(agent: AIChatAgent): number {
   if (existing) return existing.count;
   const counter = { count: 0 };
   sessionChangeCounters.set(agent, counter);
-  unported(agent).sessions.subscribe(() => {
+  agent.sessions.subscribe(() => {
     counter.count++;
   });
   return counter.count;
 }
 
-// The engine persists its transcript in `cf_ai_chat_agent_messages`.
+/** The engine's transcript session (AG-UI rows; `_session` is protected). */
+function transcript(agent: AIChatAgent): Session {
+  return (agent as unknown as { _session: Session })._session;
+}
+
+/**
+ * The stored transcript, read back from Sessions. Rows are AG-UI
+ * post-cutover; assertions target the projected `UIMessage` contract.
+ */
+async function persistedMessages(agent: AIChatAgent): Promise<ChatMessage[]> {
+  const rows = await transcript(agent).getHistory();
+  return toUIMessages(
+    autoTransformAGUIMessages(rows.map((row) => fromSessionMessage(row)))
+  ) as ChatMessage[];
+}
+
 async function persistedMessageCount(agent: AIChatAgent): Promise<number> {
-  const rows = agent.sql<{ cnt: number }>`
-    select count(*) as cnt from cf_ai_chat_agent_messages
-  `;
-  return rows[0]?.cnt ?? 0;
+  return (await transcript(agent).getHistory()).length;
 }
 
 function makeSSEChunkResponse(chunks: ReadonlyArray<Record<string, unknown>>) {
@@ -845,13 +856,8 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return this._resumableStream.getAllStreamMetadata()[0]?.status ?? null;
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 
   async getMessagesForTest(): Promise<ChatMessage[]> {
@@ -879,7 +885,7 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   async clearSessionForTest(): Promise<void> {
-    await unported(this).sessions.session().clearMessages();
+    await this._session.clearMessages();
     this.messages = [];
   }
 
@@ -1236,6 +1242,18 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return streamId;
   }
 
+  // The engine learns the assistant id from the stream's first message-start
+  // event and backfills the metadata row, so the capture is refreshed when
+  // the producer finishes, before the cutover discards the row.
+  protected override _finishStream(streamId: string): void {
+    for (const started of this._startedStreams.values()) {
+      if (started.id === streamId) {
+        started.message_id = this._resumableStream.getStreamMessageId(streamId);
+      }
+    }
+    super._finishStream(streamId);
+  }
+
   getStartedStreamMetadata(
     requestId: string
   ): { id: string; message_id: string | null } | null {
@@ -1325,9 +1343,18 @@ export class TestChatAgent extends AIChatAgent<Env> {
    * Used to test validation of malformed/corrupt messages.
    */
   async insertRawMessage(rowId: string, rawJson: string): Promise<void> {
+    const sessionId = this._session.sessionId;
+    const parentId = (await this._session.getLatestLeaf())?.id ?? null;
     this.sql`
-      insert into cf_ai_chat_agent_messages (id, message)
-      values (${rowId}, ${rawJson})
+      INSERT INTO cf_agents_session_messages
+        (id, session_id, seq, parent_id, role, content, token_estimate,
+         created_at)
+      VALUES (
+        ${rowId}, ${sessionId},
+        (SELECT COALESCE(MAX(seq), 0) + 1
+         FROM cf_agents_session_messages WHERE session_id = ${sessionId}),
+        ${parentId}, 'user', ${rawJson}, 0, ${Date.now()}
+      )
     `;
   }
 
@@ -1407,13 +1434,8 @@ export class CustomSanitizeAgent extends AIChatAgent<Env> {
     };
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 }
 
@@ -1549,13 +1571,8 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
     return [...this._startedRequestIds];
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 
   getRequestStartTime(requestId: string): number | null {
@@ -2007,13 +2024,8 @@ export class ResponseAgent extends AIChatAgent<Env> {
     });
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 }
 
@@ -2056,13 +2068,8 @@ export class ResponseContinuationAgent extends AIChatAgent<Env> {
     this._failContinuation = value;
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 }
 
@@ -2105,13 +2112,8 @@ export class ResponseThrowingAgent extends AIChatAgent<Env> {
     return this._streamCompleted;
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 }
 
@@ -2165,13 +2167,8 @@ export class ResponseSaveMessagesAgent extends AIChatAgent<Env> {
     });
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 }
 
@@ -3379,13 +3376,8 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     this.messages = this.messages.filter((m) => m.role !== "assistant");
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 
   getPartialText(streamId?: string) {
@@ -3871,13 +3863,8 @@ export class NonChatRecoveryTestAgent extends AIChatAgent<Env> {
     return this.recoveryContexts;
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 
   getOnChatMessageCallCount(): number {
@@ -3940,13 +3927,8 @@ export class RecoveryThrowingAgent extends AIChatAgent<Env> {
     return this.onChatMessageCallCount;
   }
 
-  getPersistedMessages(): ChatMessage[] {
-    // Rows are AG-UI post-cutover; assertions target the projected contract.
-    const rows = (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
-    return toUIMessages(rows) as ChatMessage[];
+  getPersistedMessages(): Promise<ChatMessage[]> {
+    return persistedMessages(this);
   }
 
   getActiveFibers(): Array<{ id: string; name: string }> {

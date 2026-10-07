@@ -16,7 +16,9 @@
  *   `sanitizeMessageForPersistence`) keep their legacy shapes; the engine's
  *   dispatch seams project in and out.
  *
- * Persisted rows are AG-UI (`_v` marker); legacy rows migrate on load.
+ * The transcript is stored as AG-UI rows in the engine's Sessions session;
+ * legacy table rows and upstream's `UIMessage` session rows are lifted on
+ * start.
  * `src/index.ts` re-exports this class as the package's `AIChatAgent`
  * (the Phase-5 cutover).
  *
@@ -114,6 +116,13 @@ export class AIChatAgent<
   // @ts-expect-error TS2416 — intentional projection override
   override set messages(value: ChatMessage[]) {
     this._aguiMessages = toAGUIRows(value);
+  }
+
+  /** `/get-messages` serves the legacy `UIMessage[]` contract. */
+  protected override _serializeTranscript(
+    messages: readonly AGUIMessage[]
+  ): unknown[] {
+    return toUIMessages(messages);
   }
 
   /**

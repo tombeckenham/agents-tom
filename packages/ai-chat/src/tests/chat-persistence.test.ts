@@ -121,12 +121,10 @@ describe("Chat Agent Persistence", () => {
     );
     expect(assistantMessages.length).toBeGreaterThanOrEqual(2);
 
-    // check that assistant messages have content — /get-messages serves
-    // AG-UI rows post-cutover (content string, not parts).
+    // check that assistant messages have content
     assistantMessages.forEach((msg) => {
-      const content = (msg as unknown as { content?: string }).content;
-      expect(typeof content).toBe("string");
-      expect((content as string).length).toBeGreaterThan(0);
+      expect(msg.parts).toBeDefined();
+      expect(msg.parts.length).toBeGreaterThan(0);
     });
   });
 
