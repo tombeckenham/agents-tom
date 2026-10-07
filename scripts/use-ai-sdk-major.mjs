@@ -18,14 +18,21 @@ if (major !== "6" && major !== "7") {
 
 // AI SDK v7 pairs with @ai-sdk/* and workers-ai-provider v4; v6 pairs with
 // @ai-sdk/* and workers-ai-provider v3.
+//
+// ai@6.0.260 through 6.0.263 regress tool-result handling in the Workers
+// runtime. Cap compatibility coverage at the last known-good v6 release until
+// an upstream patch restores the affected client-tool and HITL behavior.
+const AI_V6_RANGE = ">=6.0.0 <6.0.260";
+
 const ranges =
   major === "6"
     ? {
-        ai: "^6.0.0",
+        ai: AI_V6_RANGE,
         "@ai-sdk/react": "^3.0.0",
         "@ai-sdk/openai": "^3.0.0",
         "@ai-sdk/anthropic": "^3.0.0",
         "@ai-sdk/google": "^3.0.0",
+        "@ai-sdk/provider": "^3.0.0",
         "workers-ai-provider": "^3.3.0"
       }
     : {
@@ -34,6 +41,7 @@ const ranges =
         "@ai-sdk/openai": "^4.0.0",
         "@ai-sdk/anthropic": "^4.0.0",
         "@ai-sdk/google": "^4.0.0",
+        "@ai-sdk/provider": "^4.0.0",
         "workers-ai-provider": "^4.0.0"
       };
 
