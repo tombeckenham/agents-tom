@@ -69,7 +69,19 @@ function createFrameTranslator(): (raw: string) => string[] {
  * is identical on both wires).
  */
 export function wrapLegacyWireWS(ws: WebSocket): WebSocket {
-  const translate = createFrameTranslator();
+  const translateFrame = createFrameTranslator();
+  // The projector is stateful, so a frame is translated once and every
+  // listener sees the same result (a second pass would drop chunks the first
+  // already emitted, e.g. `tool-input-available`).
+  const translated = new WeakMap<MessageEvent, string[]>();
+  const translate = (event: MessageEvent): string[] => {
+    let frames = translated.get(event);
+    if (!frames) {
+      frames = translateFrame(event.data as string);
+      translated.set(event, frames);
+    }
+    return frames;
+  };
   const wrapped = new Map<
     (event: MessageEvent) => void,
     (event: MessageEvent) => void
@@ -83,7 +95,7 @@ export function wrapLegacyWireWS(ws: WebSocket): WebSocket {
           }
           const inner = (event: MessageEvent) => {
             if (typeof event.data !== "string") return listener(event);
-            for (const data of translate(event.data)) {
+            for (const data of translate(event)) {
               listener({ data } as MessageEvent);
             }
           };

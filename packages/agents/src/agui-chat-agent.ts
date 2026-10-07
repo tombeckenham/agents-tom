@@ -351,6 +351,8 @@ const decoder = new TextDecoder();
 const agentToolChunkEncoder = new TextEncoder();
 
 /** Error text for a server tool call interrupted before a result landed. */
+const TOOL_APPROVED_NEVER_RAN_MESSAGE =
+  "The tool call was approved but did not run before the next turn started.";
 const TOOL_INTERRUPTED_MESSAGE =
   "The tool call was interrupted before a result was recorded.";
 
@@ -1051,6 +1053,9 @@ export class AGUIChatAgent<
               async () => {
                 const chatTurnBody = async () => {
                   try {
+                    await this._repairInterruptedToolsBeforeTurn({
+                      continuation: false
+                    });
                     const response = await this._invokeChatHandler(
                       async (_finishResult) => {},
                       {
@@ -2126,8 +2131,26 @@ export class AGUIChatAgent<
    * stream ends there is no further tool-result event to re-arm, so without
    * this the held continuation would never fire.
    */
-  private _onStreamingTurnFinalized(): void {
+  private _onStreamingTurnFinalized(finishReason?: string): void {
     this._streamingTurnActive = false;
+
+    // A tool result or approval can leave an auto-continuation pending while
+    // the original stream is still active. If that stream then finishes with a
+    // normal assistant response, the continuation is stale: firing it would
+    // replay a transcript ending in assistant text, which modern Anthropic
+    // models reject as an unsupported assistant prefill (#1618, #2171). A
+    // sibling tool call still awaiting its result keeps the continuation: the
+    // stream's text did not answer it, and the continuation is the only
+    // record of the batch's opt-in.
+    if (
+      finishReason === "stop" &&
+      this._continuation.pending &&
+      !this._hasIncompleteToolBatch()
+    ) {
+      this._clearPendingAutoContinuation(true);
+      return;
+    }
+
     this._autoContinuation.rearmForBatch();
   }
 
@@ -2189,7 +2212,9 @@ export class AGUIChatAgent<
               async () => {
                 const autoBody = async () => {
                   try {
-                    await this._repairInterruptedToolsBeforeTurn();
+                    await this._repairInterruptedToolsBeforeTurn({
+                      continuation: true
+                    });
                     const response = await this._invokeChatHandler(
                       async (_finishResult) => {},
                       {
@@ -2258,6 +2283,9 @@ export class AGUIChatAgent<
     const abortSignal = chatMessageId
       ? this._abortRegistry.getExistingSignal(chatMessageId)
       : undefined;
+    // Why the producer stopped (RUN_FINISHED `result.finishReason`), for the
+    // stale-continuation check in `_onStreamingTurnFinalized`.
+    let finishReason: string | undefined;
 
     return this.keepAliveWhile(() =>
       this._tryCatchChat(async (): Promise<StreamResultStatus> => {
@@ -2342,6 +2370,9 @@ export class AGUIChatAgent<
             };
           }
           streamCompleted = true;
+          if (streamResult.status === "completed") {
+            finishReason = accumulator.runMetadata.finishReason;
+          }
         } catch (error) {
           // A stall watchdog abort (#1626) is a recoverable interruption, not a
           // terminal error: the partial is persisted below (the same path a
@@ -2454,7 +2485,9 @@ export class AGUIChatAgent<
       // clear the stream-active gate and re-run the auto-continuation barrier
       // for a continuation it held (#1650). Skipped on the no-body early return,
       // which never armed the gate.
-      if (this._streamingTurnActive) this._onStreamingTurnFinalized();
+      if (this._streamingTurnActive) {
+        this._onStreamingTurnFinalized(finishReason);
+      }
     });
   }
 
@@ -2637,8 +2670,15 @@ export class AGUIChatAgent<
     }
 
     // Eagerly persist the assistant turn when an approval request lands so
-    // a refresh between request and decision keeps the modal state.
-    if (action.kind === "approval" && this._streamingAssistantId) {
+    // a refresh between request and decision keeps the modal state. A call's
+    // arguments can complete AFTER its approval request (#1872): refresh the
+    // snapshot then too, so it carries the input the user is approving.
+    if (
+      (action.kind === "approval" ||
+        (event.type === "TOOL_CALL_END" &&
+          accumulator.pendingApprovals.has(event.toolCallId))) &&
+      this._streamingAssistantId
+    ) {
       this._persistApprovalSnapshot(accumulator.messages);
     }
 
@@ -3202,8 +3242,28 @@ export class AGUIChatAgent<
    * tool results before re-entering inference, so a recovered transcript is
    * settled. Client-resolvable tool calls are left pending — the client
    * replays their results after reconnect.
+   *
+   * An APPROVED call that never ran is settled too (#2382), but only once the
+   * conversation has moved past it and no continuation will execute it: a
+   * turn that is not itself a continuation, with none waiting to run. An
+   * approval on the trailing assistant is always kept — the handler executes
+   * it when the transcript is submitted as-is.
    */
-  private async _repairInterruptedToolsBeforeTurn(): Promise<void> {
+  private async _repairInterruptedToolsBeforeTurn(options: {
+    continuation: boolean;
+  }): Promise<void> {
+    const repairApproved =
+      !options.continuation &&
+      !this._continuation.pending &&
+      !this._continuation.deferred;
+    let lastTurnIdx = -1;
+    for (let i = this._aguiMessages.length - 1; i >= 0; i--) {
+      const role = this._aguiMessages[i].role;
+      if (role !== "tool" && role !== "reasoning" && role !== "activity") {
+        lastTurnIdx = i;
+        break;
+      }
+    }
     const clientResolvable = clientResolvableToolNames(this._lastClientTools);
     const resolved = new Set<string>();
     for (const m of this._aguiMessages) {
@@ -3213,9 +3273,27 @@ export class AGUIChatAgent<
     this._aguiMessages.forEach((m, idx) => {
       if (m.role !== "assistant" || !m.toolCalls) return;
       for (const tc of m.toolCalls) {
-        if (resolved.has(tc.id) || clientResolvable.has(tc.function.name)) {
+        if (resolved.has(tc.id)) continue;
+        if (
+          repairApproved &&
+          idx < lastTurnIdx &&
+          m.toolApprovals?.[tc.id]?.approved === true
+        ) {
+          repairs.push({
+            assistantIdx: idx,
+            toolMessage: {
+              id: `tool-${nanoid()}`,
+              role: "tool",
+              toolCallId: tc.id,
+              content: JSON.stringify({
+                error: TOOL_APPROVED_NEVER_RAN_MESSAGE
+              }),
+              error: TOOL_APPROVED_NEVER_RAN_MESSAGE
+            }
+          });
           continue;
         }
+        if (clientResolvable.has(tc.function.name)) continue;
         // A call with approval state is not an orphan: undecided ones await
         // the human, decided ones are settled (deny) or owned by the
         // continuation about to run the tool (approve). Fabricating an
@@ -4241,7 +4319,9 @@ export class AGUIChatAgent<
           );
           try {
             const programmaticBody = async () => {
-              await this._repairInterruptedToolsBeforeTurn();
+              await this._repairInterruptedToolsBeforeTurn({
+                continuation: false
+              });
               const response = await this._invokeChatHandler(() => {}, {
                 requestId,
                 abortSignal,
@@ -4319,7 +4399,9 @@ export class AGUIChatAgent<
                 try {
                   // Repair interrupted server-tool orphans before re-entering
                   // inference so the recovered transcript is settled.
-                  await this._repairInterruptedToolsBeforeTurn();
+                  await this._repairInterruptedToolsBeforeTurn({
+                    continuation: true
+                  });
                   const response = await this._invokeChatHandler(() => {}, {
                     requestId,
                     abortSignal,
