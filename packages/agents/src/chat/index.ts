@@ -44,10 +44,14 @@ export {
 } from "./submit-concurrency";
 
 export {
+  observedDivergesFrom,
   transition as broadcastTransition,
   type BroadcastStreamState,
   type BroadcastStreamEvent
 } from "./broadcast-state";
+
+/** @internal Continuation replay de-duplication for sibling chat clients. */
+export { ContinuationReplayFilter } from "./replay-dedupe";
 
 export {
   ResumableStream,

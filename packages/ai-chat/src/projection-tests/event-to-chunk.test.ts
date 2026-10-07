@@ -203,6 +203,37 @@ describe("EventToChunkProjector — tool approval round-trip", () => {
     ]);
   });
 
+  it("re-sends the approval request after a tool input that completes late (#1872)", () => {
+    const chunks = project([
+      {
+        type: "TOOL_CALL_START",
+        toolCallId: "tc1",
+        toolCallName: "deleteFile"
+      },
+      {
+        type: "CUSTOM",
+        name: CF_TOOL_APPROVAL_REQUEST,
+        value: {
+          toolCallId: "tc1",
+          toolName: "deleteFile",
+          input: null,
+          approvalId: "ap1"
+        }
+      },
+      { type: "TOOL_CALL_ARGS", toolCallId: "tc1", delta: '{"path":"/x"}' },
+      { type: "TOOL_CALL_END", toolCallId: "tc1" }
+    ]);
+    expect(chunks.slice(-2)).toEqual([
+      {
+        type: "tool-input-available",
+        toolCallId: "tc1",
+        toolName: "deleteFile",
+        input: { path: "/x" }
+      },
+      { type: "tool-approval-request", toolCallId: "tc1", approvalId: "ap1" }
+    ]);
+  });
+
   it("CUSTOM tool_approval.decision approved:false → tool-output-denied chunk", () => {
     const chunks = project([
       {

@@ -82,6 +82,8 @@ export class EventToChunkProjector {
   // precede the first content event that carries the start's messageId.
   private pendingStepStarts = 0;
   private toolBuffers = new Map<string, ToolBuffer>();
+  // Approval requests still awaiting a decision, toolCallId → approvalId.
+  private pendingApprovals = new Map<string, string>();
   // Tracks the messageId of the open reasoning chunk so a stray
   // `REASONING_MESSAGE_CHUNK` without an explicit `messageId` can be
   // attributed to it.
@@ -253,7 +255,7 @@ export class EventToChunkProjector {
         }
         buffer.startedInputAvailable = true;
         const input = parseToolArgs(buffer.args);
-        return [
+        const chunks: UIMessageChunk[] = [
           {
             type: "tool-input-available",
             toolCallId: event.toolCallId,
@@ -261,9 +263,23 @@ export class EventToChunkProjector {
             input
           }
         ];
+        // The input completed after its approval request (#1872). The AI SDK
+        // client moves the part back to `input-available` on the chunk above,
+        // so send the request again: the approval card keeps its state and
+        // now carries the input.
+        const approvalId = this.pendingApprovals.get(event.toolCallId);
+        if (approvalId !== undefined) {
+          chunks.push({
+            type: "tool-approval-request",
+            toolCallId: event.toolCallId,
+            approvalId
+          });
+        }
+        return chunks;
       }
 
       case "TOOL_CALL_RESULT":
+        this.pendingApprovals.delete(event.toolCallId);
         return [
           {
             type: "tool-output-available",
@@ -352,6 +368,7 @@ export class EventToChunkProjector {
   private projectCustom(name: string, value: unknown): UIMessageChunk[] {
     if (name === CF_TOOL_APPROVAL_REQUEST) {
       const request = value as CFToolApprovalRequestValue;
+      this.pendingApprovals.set(request.toolCallId, request.approvalId);
       return [
         {
           type: "tool-approval-request",
@@ -362,6 +379,7 @@ export class EventToChunkProjector {
     }
     if (name === CF_TOOL_APPROVAL_DECISION) {
       const decision = value as CFToolApprovalDecisionValue;
+      this.pendingApprovals.delete(decision.toolCallId);
       if (decision.approved) {
         return [];
       }

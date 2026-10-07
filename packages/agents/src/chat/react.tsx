@@ -26,6 +26,8 @@ import {
   type AgentConnection
 } from "./ws-chat-transport";
 
+/** @internal Shared with the AG-UI hook in `@cloudflare/ai-chat`. */
+export { isSocketAddressPending };
 export { WebSocketChatTransport } from "./ws-chat-transport";
 export type {
   AgentConnection,
@@ -374,7 +376,7 @@ type AddToolOutputOptions = {
  * Replays re-send only recent terminals, so duplicate suppression needs only
  * a recent window of ended request ids.
  */
-const MAX_REMEMBERED_ENDED_TURNS = 500;
+export const MAX_REMEMBERED_ENDED_TURNS = 500;
 
 /**
  * A chat request that ended, passed to `onTurnEnd`.
@@ -659,7 +661,7 @@ function prependMissingHydratedMessages<ChatMessage extends UIMessage>(
 
 // Re-append the specific buffered sends a connect transcript omits, restoring
 // only the tracked ids (in local order).
-function restoreBufferedSends<ChatMessage extends UIMessage>(
+export function restoreBufferedSends<ChatMessage extends UIMessage>(
   snapshot: ChatMessage[],
   local: readonly ChatMessage[],
   bufferedIds: ReadonlySet<string>

@@ -37,7 +37,12 @@ export default defineConfig({
     retry: 3,
     include: [
       path.join(testsDir, "use-agent-chat.test.tsx"),
-      path.join(testsDir, "use-agent-chat-agui.test.tsx")
+      path.join(testsDir, "use-agent-chat-agui.test.tsx"),
+      // Upstream hook fixes whose tests live in `agents/src/react-tests`
+      // against the legacy hook; ported here to gate the AG-UI one.
+      path.join(testsDir, "initial-messages-address-change.test.tsx"),
+      path.join(testsDir, "reconnect-optimistic-send.test.tsx"),
+      path.join(testsDir, "tool-result-prune-updates.test.tsx")
     ],
     browser: {
       enabled: true,

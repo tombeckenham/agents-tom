@@ -212,6 +212,48 @@ describe("reconcileMessages", () => {
     ];
     expect(reconcileMessages(incoming, server)[0].id).toBe("cli-a1");
   });
+
+  it("keeps a later assistant and its result when a toolCallId is reused (#2040)", () => {
+    const server: AGUIMessage[] = [
+      assistant("a1", "", [toolCall("tc", "calc", '{"turn":1}')]),
+      toolMsg("a1-tool-0", "tc", '"first"')
+    ];
+    const incoming: AGUIMessage[] = [
+      ...server,
+      user("u2", "again"),
+      assistant("a2", "", [toolCall("tc", "calc", '{"turn":2}')]),
+      toolMsg("a2-tool-0", "tc", '"second"')
+    ];
+    expect(reconcileMessages(incoming, server)).toEqual(incoming);
+  });
+
+  it("matches a drifted id on the same call regardless of argument key order", () => {
+    const server: AGUIMessage[] = [
+      assistant("srv-a1", "", [toolCall("tc", "calc", '{"a":1,"b":2}')])
+    ];
+    const incoming: AGUIMessage[] = [
+      assistant("cli-a1", "", [toolCall("tc", "calc", '{"b":2,"a":1}')])
+    ];
+    expect(reconcileMessages(incoming, server)[0].id).toBe("srv-a1");
+  });
+
+  it("drops a stale pending copy of an assistant echoed in the same submit", () => {
+    const server: AGUIMessage[] = [
+      assistant("srv-a1", "", [toolCall("tc", "calc", '{"x":1}')]),
+      toolMsg("srv-t1", "tc", '{"r":1}')
+    ];
+    const stale = assistant("cli-a1", "", [toolCall("tc", "calc", '{"x":1}')]);
+    const result = reconcileMessages(
+      [...server, stale, user("u2", "next")],
+      server
+    );
+    expect(result.map((m) => m.id)).toEqual(["srv-a1", "srv-t1", "u2"]);
+    // Kept when it is the last submitted message: a new call awaiting its
+    // result sits there.
+    expect(
+      reconcileMessages([...server, stale], server).map((m) => m.id)
+    ).toEqual(["srv-a1", "srv-t1", "cli-a1"]);
+  });
 });
 
 describe("resolveToolMergeId", () => {
