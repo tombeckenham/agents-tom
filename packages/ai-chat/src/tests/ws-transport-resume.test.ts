@@ -301,7 +301,6 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
   });
 
   it("drops continuation replay chunks the client already applied (#1951)", async () => {
-    // @ts-expect-error -- not ported: the AG-UI transport has no appliedChunks (#1951)
     transport.appliedChunks.record("req-c", 2);
     const promise = transport.reconnectToStream({ chatId: "chat-1" });
     transport.handleStreamResuming({ id: "req-c" });

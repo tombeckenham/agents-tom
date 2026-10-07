@@ -17,13 +17,16 @@
 import { nanoid } from "nanoid";
 import type { AGUIEvent } from "./agui-types";
 import { CHAT_MESSAGE_TYPES } from "./protocol";
+import { AppliedChunkLedger } from "./replay-dedupe";
 
 /**
  * Structural shape of the WebSocket-like object the transport needs. The
  * `agents/react` and `partysocket` `WebSocket` shims both satisfy this.
  */
 export interface AgentConnection {
-  send: (data: string) => void;
+  // PartySocket returns `false` when the frame was buffered (socket not OPEN)
+  // rather than sent immediately; `void` keeps non-PartySocket providers valid.
+  send: (data: string) => boolean | void;
   addEventListener: (
     type: string,
     listener: (event: MessageEvent) => void,
@@ -61,6 +64,12 @@ export type AGUIWebSocketTransportOptions = {
  */
 export type AGUIEventStream = AsyncIterable<AGUIEvent> & {
   readonly error: Error | null;
+  /**
+   * The socket closed before the turn's terminal frame: the stream ended,
+   * the turn did not. Set by the time iteration completes, so a consumer can
+   * report an interrupted turn instead of a completed one (#2013).
+   */
+  readonly interrupted: boolean;
 };
 
 /** Envelope shape the transport reads off the wire. */
@@ -70,6 +79,27 @@ type ChatResponseFrame = {
   body?: string;
   done?: boolean;
   error?: boolean;
+  replay?: boolean;
+  continuation?: boolean;
+  /** Index of this frame within its stream; its replay carries the same one. */
+  seq?: number;
+};
+
+/**
+ * What a consumer needs to know about the frame an event arrived in (see
+ * {@link AGUIWebSocketTransport.frameOf}).
+ */
+export type AGUIEventFrame = {
+  /** The request the frame belongs to. */
+  id: string;
+  /** The frame belongs to a continuation of an existing assistant message. */
+  continuation: boolean;
+  /**
+   * The frame replays a continuation frame this client already applied
+   * (#1951). The event is still delivered so stateful consumers see the whole
+   * run; what it renders must not be applied a second time.
+   */
+  applied: boolean;
 };
 
 /** Handle the per-flavour setup code uses to drive one event stream. */
@@ -176,6 +206,12 @@ export class AGUIWebSocketTransport {
   private _abortToolContinuation: (() => boolean) | null = null;
   private _activeServerTurnId: string | null = null;
   private _cancelAttachedStream: (() => boolean) | null = null;
+  /**
+   * Continuation frames this client applied, shared with the hook's fallback
+   * observer so a replay after reconnect skips them on either path (#1951).
+   */
+  readonly appliedChunks = new AppliedChunkLedger();
+  private _eventFrames = new WeakMap<AGUIEvent, AGUIEventFrame>();
 
   constructor(options: AGUIWebSocketTransportOptions) {
     this.agent = options.agent;
@@ -214,6 +250,20 @@ export class AGUIWebSocketTransport {
     }
     const cancelledToolContinuation = this.abortActiveToolContinuation();
     return cancelledRequest || cancelledToolContinuation;
+  }
+
+  /**
+   * The server turn this transport last attached to that has not reported a
+   * terminal frame. A socket close ends the local stream but keeps this set,
+   * since the server keeps running the turn.
+   */
+  get activeServerTurnId(): string | null {
+    return this._activeServerTurnId;
+  }
+
+  /** The envelope an event from one of this transport's streams arrived in. */
+  frameOf(event: AGUIEvent): AGUIEventFrame | undefined {
+    return this._eventFrames.get(event);
   }
 
   private sendCancelFrame(requestId: string) {
@@ -315,6 +365,11 @@ export class AGUIWebSocketTransport {
     /** Assembles the JSON body; may be async (e.g. a `prepareBody` hook). */
     buildBody: () => Promise<string> | string;
     abortSignal?: AbortSignal;
+    /**
+     * Called when the request frame was buffered rather than sent (the socket
+     * was not OPEN, so PartySocket queued it for the next reconnect).
+     */
+    onBuffered?: () => void;
   }): { events: AGUIEventStream; sent: Promise<void> } {
     const requestId = nanoid(8);
     let resolveSent!: () => void;
@@ -352,13 +407,16 @@ export class AGUIWebSocketTransport {
           if (!ctx.done) {
             this.activeRequestIds?.add(requestId);
             ctx.markSent();
-            this.agent.send(
+            // Only an explicit `false` counts as buffered — non-PartySocket
+            // connections return undefined (treated as sent).
+            const sentNow = this.agent.send(
               JSON.stringify({
                 id: requestId,
                 init: { method: "POST", body },
                 type: CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST
               })
             );
+            if (sentNow === false) options.onBuffered?.();
           }
           resolveSent();
         } catch (error) {
@@ -648,6 +706,7 @@ export class AGUIWebSocketTransport {
     /** True once the server knows about this turn (request sent / resumed). */
     let live = false;
     let done = false;
+    let interrupted = false;
     let streamError: Error | null = null;
 
     const drain = () => {
@@ -675,20 +734,44 @@ export class AGUIWebSocketTransport {
       if (frame.type !== CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE) return;
       if (requestId === null || frame.id !== requestId) return;
       if (frame.error) {
+        this.appliedChunks.forget(requestId);
         finish(new Error(frame.body || "Stream error"));
         return;
       }
       if (frame.body && frame.body.trim().length > 0) {
         const aguiEvent = parseAGUIEvent(frame.body);
-        if (aguiEvent) queue.push(aguiEvent);
+        if (aguiEvent) {
+          // Decided as the frame arrives, not when the consumer reads it:
+          // the terminal frame behind it forgets the request.
+          const applied = this.appliedChunks.isAppliedReplay(requestId, frame);
+          if (!applied) this.appliedChunks.record(requestId, frame.seq);
+          this._eventFrames.set(aguiEvent, {
+            id: requestId,
+            continuation: frame.continuation === true,
+            applied
+          });
+          queue.push(aguiEvent);
+        }
       }
-      if (frame.done) finish(null);
+      if (frame.done) {
+        this.appliedChunks.forget(requestId);
+        finish(null);
+      }
       drain();
     };
 
     // The socket only closed on us — the server turn itself may still be
     // running, so leave it armed for a later `cancelActiveServerTurn()`.
-    const onClose = () => finish(null, { keepServerTurn: true });
+    const onClose = () => {
+      // A request still assembling its body has put nothing on the wire: its
+      // frame is yet to be sent (or buffered for the reconnect), and the
+      // reply arrives on this same connection object (#1983).
+      if (requestId !== null && !live) return;
+      // Before a continuation's handshake there is no server turn to
+      // interrupt; that one simply ends, and the hook re-probes on open.
+      interrupted = !done && requestId !== null;
+      finish(null, { keepServerTurn: true });
+    };
 
     const finish: EventStreamContext["finish"] = (error, options) => {
       if (done) return;
@@ -766,6 +849,9 @@ export class AGUIWebSocketTransport {
       [Symbol.asyncIterator]: () => iterator,
       get error() {
         return streamError;
+      },
+      get interrupted() {
+        return interrupted;
       }
     };
   }

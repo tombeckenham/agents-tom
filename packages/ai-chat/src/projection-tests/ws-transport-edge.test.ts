@@ -336,7 +336,7 @@ describe("WebSocketChatTransport — wire robustness", () => {
     expect(transport.cancelActiveServerTurn()).toBe(false);
   });
 
-  it("socket close mid-stream ends the stream cleanly with the chunks so far", async () => {
+  it("socket close mid-stream ends the stream with an error chunk after the chunks so far (#2013)", async () => {
     const agent = createMockAgent();
     const transport = new WebSocketChatTransport({ agent });
 
@@ -351,7 +351,44 @@ describe("WebSocketChatTransport — wire robustness", () => {
     agent.dispatchClose();
 
     const chunks = await drain(stream);
-    expect(chunks.map((c) => c.type)).toEqual(["start", "text-start"]);
+    expect(chunks.map((c) => c.type)).toEqual(["start", "text-start", "error"]);
+    expect(chunks.at(-1)).toEqual({
+      type: "error",
+      errorText: "WebSocket closed mid-stream"
+    });
+  });
+
+  it("delivers chunks after consecutive events that project to none", async () => {
+    const agent = createMockAgent();
+    const transport = new WebSocketChatTransport({ agent });
+
+    const stream = await transport.sendMessages(sendOptions());
+    const requestId = requestIdOf(agent);
+    // The read is waiting before any event arrives, as the AI SDK's is.
+    const consumer = drain(stream);
+    await Promise.resolve();
+
+    // `RUN_STARTED` and a `STEP_STARTED` ahead of the first content both
+    // project to no chunk: every AI SDK turn opens this way.
+    emitAGUIFrame(agent, requestId, {
+      type: "RUN_STARTED",
+      threadId: "t1",
+      runId: "r1"
+    });
+    emitAGUIFrame(agent, requestId, { type: "STEP_STARTED", stepName: "step" });
+    emitAGUIFrame(agent, requestId, {
+      type: "TEXT_MESSAGE_START",
+      messageId: "m1",
+      role: "assistant"
+    });
+    emitDone(agent, requestId);
+
+    const chunks = await consumer;
+    expect(chunks.map((c) => c.type)).toEqual([
+      "start",
+      "start-step",
+      "text-start"
+    ]);
   });
 
   it("a throwing prepareBody rejects sendMessages before anything hits the wire", async () => {
@@ -468,7 +505,45 @@ describe("WebSocketChatTransport — resumed stream", () => {
     await expect(drain(stream)).rejects.toMatchObject({ name: "AbortError" });
   });
 
-  it("socket close ends a resumed stream cleanly", async () => {
+  it("drops a continuation's replayed frames this client already applied (#1951)", async () => {
+    const agent = createMockAgent();
+    const transport = new WebSocketChatTransport({ agent });
+    // Frames 0..2 were applied live before the socket dropped.
+    transport.appliedChunks.record("resumed-c", 2);
+    const stream = await resume(transport, "resumed-c");
+
+    const replayed: AGUIEvent[] = [
+      { type: "RUN_STARTED", threadId: "t1", runId: "r1", messageId: "m1" },
+      { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "already" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: " more" }
+    ];
+    // Every frame is on the wire before the consumer reads: the terminal
+    // frame must not make the ones queued ahead of it look unapplied.
+    for (const [seq, event] of replayed.entries()) {
+      agent.dispatchMessage(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+          id: "resumed-c",
+          body: JSON.stringify(event),
+          done: false,
+          replay: true,
+          continuation: true,
+          seq
+        })
+      );
+    }
+    emitDone(agent, "resumed-c");
+
+    // The part the applied frames left open is re-opened for the new delta;
+    // no second `start`, and "already" is not rendered twice.
+    expect(await drain(stream)).toEqual([
+      { type: "text-start", id: "m1" },
+      { type: "text-delta", id: "m1", delta: " more" }
+    ]);
+  });
+
+  it("socket close ends a resumed stream with an error chunk (#2013)", async () => {
     const agent = createMockAgent();
     const transport = new WebSocketChatTransport({ agent });
     const stream = await resume(transport, "resumed-3");
@@ -481,7 +556,7 @@ describe("WebSocketChatTransport — resumed stream", () => {
     agent.dispatchClose();
 
     const chunks = await drain(stream);
-    expect(chunks.map((c) => c.type)).toEqual(["start", "text-start"]);
+    expect(chunks.map((c) => c.type)).toEqual(["start", "text-start", "error"]);
   });
 });
 

@@ -77,11 +77,21 @@ export class ContinuationReplayFilter<F extends ChunkFrame> {
 
   /** The frames to apply in place of `frame`. */
   frames(frame: F): F[] {
-    if (this.ledger.isAppliedReplay(this.requestId, frame)) {
+    const applied = this.ledger.isAppliedReplay(this.requestId, frame);
+    if (!applied) this.ledger.record(this.requestId, frame.seq);
+    return this.filter(frame, applied);
+  }
+
+  /**
+   * {@link frames} for a caller that consulted the ledger itself, when the
+   * frame arrived (the AG-UI transport, whose frames are projected to chunks
+   * only once they are read).
+   */
+  filter(frame: F, applied: boolean): F[] {
+    if (applied) {
       this.trackOpenPart(frame.body);
       return frame.body?.trim() ? [{ ...frame, body: "" }] : [frame];
     }
-    this.ledger.record(this.requestId, frame.seq);
     if (this.openParts.size === 0 || !frame.body?.trim()) return [frame];
     const reopened = [...this.openParts.values()].map(
       (body) => ({ ...frame, body, seq: undefined }) as F
