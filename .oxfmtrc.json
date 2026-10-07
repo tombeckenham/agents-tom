@@ -6,6 +6,7 @@
   "ignorePatterns": [
     "packages/agents/CHANGELOG.md",
     "packages/channels/live-tests/snapshots",
+    "packages/ai-chat/src/conformance/goldens",
     "site/agents/.astro",
     "**/routeTree.gen.ts",
     "**/think.d.ts",
