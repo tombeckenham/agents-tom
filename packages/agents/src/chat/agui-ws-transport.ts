@@ -675,6 +675,16 @@ export class AGUIWebSocketTransport {
       if (frame.type !== CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE) return;
       if (requestId === null || frame.id !== requestId) return;
       if (frame.error) {
+        // An in-band RUN_ERROR rides an `error` frame whose body is still the
+        // event: deliver it, and let the done frame that follows end the
+        // stream. Any other error frame's body is the raw error text.
+        const runError =
+          !frame.done && frame.body ? parseAGUIEvent(frame.body) : null;
+        if (runError?.type === "RUN_ERROR") {
+          queue.push(runError);
+          drain();
+          return;
+        }
         finish(new Error(frame.body || "Stream error"));
         return;
       }
