@@ -115,11 +115,29 @@ State changes sync to all connected clients automatically. Call methods like the
 ```
 Core         State sync · Routing · HTTP & WebSockets · @callable RPC · Sub-agents (facets)
 Clients      React hook · Vanilla JS · Real-time state sync
-Channels     WebSocket · HTTP · Email · (coming: SMS, Voice, Messengers)
+Channels     WebSocket · HTTP · Email · Voice · Slack · Telegram
 Background   Queue · Scheduling · Managed fibers · Workflows · Human-in-the-loop
 AI           Chat agents · Agent tools · Tool calling · MCP servers & clients
 Platform     Observability · Cross-domain auth · Resumable streams
 ```
+
+### Voice and Channels
+
+Voice and Channels use separate entry points so applications only load the
+integrations they import:
+
+```typescript
+import { withVoice } from "agents/voice";
+import { VoiceClient } from "agents/voice/client";
+import { useVoiceAgent } from "agents/voice/react";
+
+import { ChannelGateway, Channels } from "agents/experimental/channels";
+import { email } from "agents/experimental/channels/email";
+import { slack } from "agents/experimental/channels/slack";
+import { telegram } from "agents/experimental/channels/telegram";
+```
+
+See the [Voice](../../docs/agents/voice.md) reference.
 
 ### State Management
 

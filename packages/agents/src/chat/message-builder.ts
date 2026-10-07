@@ -99,6 +99,107 @@ export function normalizeToolInput(raw: unknown): {
 }
 
 /**
+ * Raw JSON text accumulated from `tool-input-delta` chunks, keyed by the tool
+ * part it belongs to. Kept off the part so a partial string never reaches
+ * storage or a client as the tool's `input`.
+ */
+const rawToolInputText = new WeakMap<MessagePart, string>();
+
+/**
+ * Tool parts whose `input` came from deltas (parsed text or an emitter's
+ * partial `input`) rather than the tool call, so the canonical input may
+ * still replace it.
+ */
+const provisionalInput = new WeakSet<MessagePart>();
+
+const APPROVAL_STATES = new Set(["approval-requested", "approval-responded"]);
+
+/**
+ * Whether `chunk` is a `tool-input-available` for a tool part that has
+ * already reached an approval state. Stream builders apply it server-side
+ * (see {@link applyLateToolInput}) but must not forward it: the AI SDK client
+ * would move its part back to `input-available` and drop the approval UI.
+ */
+export function isLateToolInputChunk(
+  parts: MessagePart[],
+  chunk: StreamChunkData
+): boolean {
+  if (chunk.type !== "tool-input-available") return false;
+  const existing = findToolPartByCallId(parts, chunk.toolCallId);
+  if (!existing) return false;
+  return APPROVAL_STATES.has(
+    (existing as Record<string, unknown>).state as string
+  );
+}
+
+/**
+ * Fill an approval part's input from a `tool-input-available` that arrived
+ * after its `tool-approval-request`, without changing the approval state.
+ * Only replaces input that is missing or was reconstructed from deltas, so
+ * a complete input the user has already seen is never swapped out.
+ *
+ * @returns `true` when the part's input changed.
+ */
+export function applyLateToolInput(
+  parts: MessagePart[],
+  chunk: StreamChunkData
+): boolean {
+  if (!isLateToolInputChunk(parts, chunk)) return false;
+  const part = findToolPartByCallId(parts, chunk.toolCallId)!;
+  const p = part as Record<string, unknown>;
+  if (p.input !== undefined && !provisionalInput.has(part)) return false;
+  p.input = normalizeToolInput(chunk.input).input;
+  provisionalInput.delete(part);
+  if (chunk.providerExecuted != null) {
+    p.providerExecuted = chunk.providerExecuted;
+  }
+  if (chunk.providerMetadata != null) {
+    p.callProviderMetadata = chunk.providerMetadata;
+  }
+  if (chunk.title != null) {
+    p.title = chunk.title;
+  }
+  return true;
+}
+
+/**
+ * The chunks a stream builder forwards and stores for a late
+ * `tool-input-available` (see {@link isLateToolInputChunk}) so clients and
+ * stream replay see the input without losing the approval: the input chunk,
+ * then the part's approval request again. The AI SDK client moves the part
+ * to `input-available` on the first and back to `approval-requested` on the
+ * second.
+ *
+ * Returns `[]` unless the part is still awaiting approval: once the user has
+ * responded, re-sending the request would reopen it.
+ */
+export function lateToolInputForwardChunks(
+  parts: MessagePart[],
+  chunk: StreamChunkData,
+  approvalRequest?: StreamChunkData
+): StreamChunkData[] {
+  if (chunk.type !== "tool-input-available") return [];
+  const part = findToolPartByCallId(parts, chunk.toolCallId) as
+    | Record<string, unknown>
+    | undefined;
+  const approval = part?.approval as
+    | { id?: string; descriptor?: unknown }
+    | undefined;
+  if (part?.state !== "approval-requested" || !approval?.id) return [];
+  return [
+    { ...chunk, input: part.input },
+    approvalRequest ?? {
+      type: "tool-approval-request",
+      approvalId: approval.id,
+      toolCallId: chunk.toolCallId,
+      ...(approval.descriptor !== undefined && {
+        approvalDescriptor: approval.descriptor
+      })
+    }
+  ];
+}
+
+/**
  * Applies a stream chunk to a mutable parts array, building up the message
  * incrementally. Returns true if the chunk was handled, false if it was
  * an unrecognized type (caller may handle it with additional logic).
@@ -267,7 +368,17 @@ export function applyChunkToParts(
         toolPart &&
         (toolPart as Record<string, unknown>).state === "input-streaming"
       ) {
-        (toolPart as Record<string, unknown>).input = chunk.input;
+        if (typeof chunk.inputTextDelta === "string") {
+          rawToolInputText.set(
+            toolPart,
+            (rawToolInputText.get(toolPart) ?? "") + chunk.inputTextDelta
+          );
+        }
+        // Older and custom emitters put a parsed partial input on the delta.
+        if (chunk.input !== undefined) {
+          (toolPart as Record<string, unknown>).input = chunk.input;
+          provisionalInput.add(toolPart);
+        }
       }
       return true;
     }
@@ -282,6 +393,8 @@ export function applyChunkToParts(
         // approval-requested, approval-responded), this chunk is a
         // provider replay and must not regress state or overwrite a
         // resolved input/output. See the comment on tool-input-start.
+        // The one exception is an approval part still missing its canonical
+        // input (see `applyLateToolInput`).
         if (p.state === "input-streaming") {
           p.state = "input-available";
           p.input = normalizeToolInput(chunk.input).input;
@@ -294,6 +407,10 @@ export function applyChunkToParts(
           if (chunk.title != null) {
             p.title = chunk.title;
           }
+          rawToolInputText.delete(existing);
+          provisionalInput.delete(existing);
+        } else {
+          applyLateToolInput(parts, chunk);
         }
         return true;
       }
@@ -375,6 +492,15 @@ export function applyChunkToParts(
         ) {
           return true;
         }
+        // The approval request can be the first boundary after the input
+        // deltas (no `tool-input-available` yet, or never). The persisted
+        // approval snapshot must carry the input the user is approving.
+        const rawInput = rawToolInputText.get(toolPart);
+        if (p.input === undefined && rawInput !== undefined) {
+          p.input = normalizeToolInput(rawInput).input;
+          provisionalInput.add(toolPart);
+        }
+        rawToolInputText.delete(toolPart);
         p.state = "approval-requested";
         p.approval = {
           id: chunk.approvalId,
@@ -478,6 +604,78 @@ export function applyChunkToParts(
       return false;
     }
   }
+}
+
+/**
+ * Returns true if `chunk` would be a no-op replay against the already-known
+ * `parts` — i.e. some upstream is re-emitting events for a tool call that
+ * the message has already advanced past.
+ *
+ * Used by stream broadcasters to suppress re-broadcasting these chunks to
+ * connected clients. AI SDK v6's `updateToolPart` mutates an existing tool
+ * part in place when a chunk arrives with a matching `toolCallId`, so a
+ * replayed `tool-input-start` would clobber an `output-available` part back
+ * to `input-streaming` on the client (issue #1404).
+ *
+ * Only returns true when re-broadcasting would *visibly regress* state on
+ * a v6 client. Safe-by-construction chunk types (e.g. `tool-output-available`
+ * carrying the same output the part already has) return false.
+ *
+ * Conditions:
+ * - `tool-input-start` for a `toolCallId` that already exists in `parts`.
+ * - `tool-input-delta` for a `toolCallId` whose existing part is no longer
+ *   `input-streaming`.
+ * - `tool-input-available` for a `toolCallId` whose existing part is no
+ *   longer `input-streaming` (i.e. has already advanced to `input-available`
+ *   or any terminal state).
+ * - `tool-output-denied` for a `toolCallId` whose existing part is already
+ *   settled (`output-available` / `output-error` / `output-denied`) or
+ *   user-approved (`approval-responded`). A continuation that re-validates
+ *   the transcript can re-emit a denial for an approval the SDK now deems
+ *   unneeded; `applyChunkToParts` already drops it server-side, and this stops
+ *   it reaching the client (where the in-place `updateToolPart` would flip the
+ *   part to `output-denied`) and the replay buffer. Mirrors the
+ *   first-write-wins guard in `applyChunkToParts`.
+ * - `tool-approval-request` for a `toolCallId` whose existing part is already
+ *   `approval-responded` or settled. A continuation replaying a prior tool
+ *   round-trip can re-emit the approval request; left unfiltered it would
+ *   revert an already-approved tool back to `approval-requested` on the client
+ *   (re-showing Approve/Reject) and replay that regression on reconnect. Same
+ *   pattern and rationale as `tool-output-denied`.
+ */
+export function isReplayChunk(
+  parts: MessagePart[],
+  chunk: StreamChunkData
+): boolean {
+  if (
+    chunk.type === "tool-output-denied" ||
+    chunk.type === "tool-approval-request"
+  ) {
+    if (!chunk.toolCallId) return false;
+    const existing = findToolPartByCallId(parts, chunk.toolCallId);
+    if (!existing) return false;
+    const state = (existing as Record<string, unknown>).state;
+    return (
+      state === "output-available" ||
+      state === "output-error" ||
+      state === "output-denied" ||
+      state === "approval-responded"
+    );
+  }
+
+  if (
+    chunk.type !== "tool-input-start" &&
+    chunk.type !== "tool-input-delta" &&
+    chunk.type !== "tool-input-available"
+  ) {
+    return false;
+  }
+  if (!chunk.toolCallId) return false;
+  const existing = findToolPartByCallId(parts, chunk.toolCallId);
+  if (!existing) return false;
+  if (chunk.type === "tool-input-start") return true;
+  const state = (existing as Record<string, unknown>).state;
+  return state !== "input-streaming";
 }
 
 /**

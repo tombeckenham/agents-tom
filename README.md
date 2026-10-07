@@ -125,16 +125,16 @@ The agent is a Durable Object, so it needs a binding and a SQLite migration in `
 
 ## Packages
 
-| Package                                                 | Description                                                                                       |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| [`agents`](packages/agents)                             | Core SDK — `Agent` class, routing, state, scheduling, MCP, email, workflows, x402, browser agents |
-| [`@cloudflare/ai-chat`](packages/ai-chat)               | Higher-level AI chat — persistent messages, resumable streaming, tool execution                   |
-| [`@cloudflare/think`](packages/think)                   | Opinionated chat agent base — agentic loop, stream resumption, client tools, workspace tools      |
-| [`@cloudflare/codemode`](packages/codemode)             | LLMs write executable code that calls your tools, instead of one tool call at a time              |
-| [`@cloudflare/shell`](packages/shell)                   | Sandboxed JS execution + virtual filesystem (`Workspace`) for agents                              |
-| [`@cloudflare/voice`](packages/voice)                   | Voice pipeline — STT, TTS, VAD, streaming, SFU utilities                                          |
-| [`@cloudflare/worker-bundler`](packages/worker-bundler) | Build and bundle Workers at runtime, for use with the Worker Loader binding                       |
-| [`hono-agents`](packages/hono-agents)                   | Hono middleware for adding agents to Hono apps                                                    |
+| Package                                                 | Description                                                                                   |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| [`agents`](packages/agents)                             | Core SDK — Agents, routing, Voice, Channels, scheduling, MCP, workflows, x402, browser agents |
+| [`@cloudflare/ai-chat`](packages/ai-chat)               | Higher-level AI chat — persistent messages, resumable streaming, tool execution               |
+| [`@cloudflare/think`](packages/think)                   | Opinionated chat agent base — agentic loop, stream resumption, client tools, workspace tools  |
+| [`@cloudflare/codemode`](packages/codemode)             | LLMs write executable code that calls your tools, instead of one tool call at a time          |
+| [`@cloudflare/shell`](packages/shell)                   | Sandboxed JS execution + virtual filesystem (`Workspace`) for agents                          |
+| [`@cloudflare/voice`](packages/voice)                   | Deprecated compatibility wrapper for the `agents/voice` exports                               |
+| [`@cloudflare/worker-bundler`](packages/worker-bundler) | Build and bundle Workers at runtime, for use with the Worker Loader binding                   |
+| [`hono-agents`](packages/hono-agents)                   | Hono middleware for adding agents to Hono apps                                                |
 
 > AI-chat modules used to live in `agents/ai-chat-agent`, `agents/chat`, `agents/ai-react`, and `agents/ai-types`. Those entry points still re-export, but they're deprecated — import from `@cloudflare/ai-chat` directly. New chat-from-scratch projects should look at `@cloudflare/think`.
 
@@ -177,7 +177,7 @@ npm start
 | [`packages/think/`](packages/think)                   | Opinionated chat agent base                              |
 | [`packages/codemode/`](packages/codemode)             | Code Mode                                                |
 | [`packages/shell/`](packages/shell)                   | Sandboxed execution + filesystem                         |
-| [`packages/voice/`](packages/voice)                   | Voice pipeline                                           |
+| [`packages/voice/`](packages/voice)                   | Deprecated Voice compatibility wrapper                   |
 | [`packages/worker-bundler/`](packages/worker-bundler) | Runtime Workers bundler                                  |
 | [`packages/hono-agents/`](packages/hono-agents)       | Hono integration                                         |
 | [`examples/`](examples)                               | Self-contained demo apps                                 |

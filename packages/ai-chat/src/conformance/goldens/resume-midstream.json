@@ -11,7 +11,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 0
         },
         {
           "body": {
@@ -20,7 +21,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 1
         },
         {
           "body": {
@@ -30,7 +32,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 2
         },
         {
           "body": {
@@ -40,7 +43,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 3
         },
         {
           "body": {
@@ -49,7 +53,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 4
         },
         {
           "body": {
@@ -57,13 +62,17 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 5
         },
         {
           "body": "",
           "done": true,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
         }
       ]
     },
@@ -82,7 +91,8 @@
           "done": false,
           "id": "id-2",
           "type": "cf_agent_use_chat_response",
-          "replay": true
+          "replay": true,
+          "seq": 0
         },
         {
           "body": {
@@ -92,7 +102,8 @@
           "done": false,
           "id": "id-2",
           "type": "cf_agent_use_chat_response",
-          "replay": true
+          "replay": true,
+          "seq": 1
         },
         {
           "body": {
@@ -103,7 +114,8 @@
           "done": false,
           "id": "id-2",
           "type": "cf_agent_use_chat_response",
-          "replay": true
+          "replay": true,
+          "seq": 2
         },
         {
           "body": "",
@@ -121,7 +133,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 3
         },
         {
           "body": {
@@ -130,7 +143,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 4
         },
         {
           "body": {
@@ -138,13 +152,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
-        },
-        {
-          "body": "",
-          "done": true,
-          "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 5
         },
         {
           "messages": [
@@ -171,6 +180,15 @@
             }
           ],
           "type": "cf_agent_chat_messages"
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
         }
       ]
     }
