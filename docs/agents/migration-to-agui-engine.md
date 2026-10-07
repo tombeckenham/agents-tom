@@ -18,19 +18,17 @@ npm install @cloudflare/ai-chat@^1 agents@latest
 
 ### 1. Persisted rows change shape, one way
 
-Conversations are stored as AG-UI rows, marked `_v: "v6_agui_message"`. The first time an agent loads a history written by an earlier release, those `UIMessage` rows are migrated in place. The migration is automatic, and it is one way — there is no downgrade path once an agent has loaded.
+Conversations are stored in Sessions as AG-UI rows, marked `_v: "v6_agui_message"`, in the session named `"agui"`. The first time an agent starts with a history written by an earlier release, that history is moved there and its source removed: rows in the `cf_ai_chat_agent_messages` table, and `UIMessage` rows in the default session. The migration is automatic, and it is one way — there is no downgrade path once an agent has started.
 
-**Action:** none for most applications. If you read `cf_ai_chat_agent_messages` directly, project the rows before treating them as `UIMessage`:
+**Action:** none for most applications. If you read `cf_ai_chat_agent_messages` or `this.sessions.session()` directly, read the `"agui"` session instead and project its rows before treating them as `UIMessage`:
 
 ```typescript
 import { toUIMessages } from "@cloudflare/ai-chat";
-import type { AGUIMessage } from "agents/chat/agui-types";
+import { autoTransformAGUIMessages, fromSessionMessage } from "agents/chat";
 
-const rows =
-  this.sql`select message from cf_ai_chat_agent_messages order by created_at` ??
-  [];
+const rows = await this.sessions.session("agui").getHistory();
 const messages = toUIMessages(
-  rows.map((row) => JSON.parse(row.message as string) as AGUIMessage)
+  autoTransformAGUIMessages(rows.map((row) => fromSessionMessage(row)))
 );
 ```
 
