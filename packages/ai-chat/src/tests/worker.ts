@@ -35,8 +35,10 @@ import {
   CHAT_RECOVERY_TASK_NAME,
   ResumableStream,
   chatRecoveryTaskRunOptions,
-  toUIMessages
+  toUIMessages,
+  type SaveMessagesOptions
 } from "agents/chat";
+import type { AGUIMessage } from "agents/chat/agui-types";
 import { ChunkToEventProjector } from "../chunk-to-event";
 
 /**
@@ -119,12 +121,14 @@ type UnportedLegacyInternals = {
     subscribe(listener: () => void): unknown;
     session(): { clearMessages(): Promise<void> };
   };
-  _agentToolTerminalOnlyRuns: Set<string>;
-  inspectAgentToolRun(
-    runId: string,
-    options?: { reconcile?: boolean }
-  ): Promise<AgentToolRunInspection | null>;
 };
+/** Argument of the engine's AG-UI-native `_saveAGUIMessages`. */
+type AGUISaveMessagesInput =
+  | AGUIMessage[]
+  | ((
+      currentMessages: readonly AGUIMessage[]
+    ) => AGUIMessage[] | Promise<AGUIMessage[]>);
+
 function unported(agent: object): UnportedLegacyInternals {
   return agent as unknown as UnportedLegacyInternals;
 }
@@ -4874,7 +4878,7 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
       insert into cf_ai_chat_agent_tool_runs (run_id, status, input_json, started_at)
       values (${runId}, 'running', '{}', ${Date.now()})
     `;
-    const inspection = await unported(this).inspectAgentToolRun(runId, {
+    const inspection = await this.inspectAgentToolRun(runId, {
       reconcile: false
     });
     return {
@@ -4888,10 +4892,14 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
     released: Promise<void>;
   } | null = null;
 
-  override async saveMessages(
-    ...args: Parameters<AIChatAgent<Env>["saveMessages"]>
+  // The engine's agent-tool lifecycle saves through the AG-UI-native
+  // `_saveAGUIMessages` (the public `saveMessages` delegates to it), so the
+  // finalize gate sits there.
+  protected override async _saveAGUIMessages(
+    messages: AGUISaveMessagesInput,
+    options?: SaveMessagesOptions
   ): Promise<SaveMessagesResult> {
-    const result = await super.saveMessages(...args);
+    const result = await super._saveAGUIMessages(messages, options);
     const gate = this._finalizeGateForTest;
     if (gate) {
       this._finalizeGateForTest = null;
@@ -4969,11 +4977,11 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
       values (${runId}, 'old-req', 'running', '{}', ${Date.now()}, 'terminal')
     `;
     this["_rebindAgentToolChildRunRequestId"]("recovery-req");
-    const afterRebind = unported(this)._agentToolTerminalOnlyRuns.has(runId);
+    const afterRebind = this["_agentToolTerminalOnlyRuns"].has(runId);
     this["_closeAgentToolTailers"](runId);
     return {
       afterRebind,
-      afterClose: unported(this)._agentToolTerminalOnlyRuns.has(runId)
+      afterClose: this["_agentToolTerminalOnlyRuns"].has(runId)
     };
   }
 
