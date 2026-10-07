@@ -23,7 +23,20 @@
         "name": "MaxPersistedAguiAgent",
         "class_name": "MaxPersistedAguiAgent"
       },
-      { "name": "SaveMessagesAguiAgent", "class_name": "SaveMessagesAguiAgent" }
+      {
+        "name": "SaveMessagesAguiAgent",
+        "class_name": "SaveMessagesAguiAgent"
+      },
+      { "name": "RecoveryAguiAgent", "class_name": "RecoveryAguiAgent" },
+      { "name": "PreStreamAguiAgent", "class_name": "PreStreamAguiAgent" },
+      {
+        "name": "PreStreamLatestAguiAgent",
+        "class_name": "PreStreamLatestAguiAgent"
+      },
+      {
+        "name": "AutoContinueAguiAgent",
+        "class_name": "AutoContinueAguiAgent"
+      }
     ]
   },
   "migrations": [
@@ -38,7 +51,11 @@
         "ErrorStreamAguiAgent",
         "ApprovalAguiAgent",
         "MaxPersistedAguiAgent",
-        "SaveMessagesAguiAgent"
+        "SaveMessagesAguiAgent",
+        "RecoveryAguiAgent",
+        "PreStreamAguiAgent",
+        "PreStreamLatestAguiAgent",
+        "AutoContinueAguiAgent"
       ]
     }
   ]
