@@ -2,7 +2,6 @@ export {
   applyChunkToParts,
   applyLateToolInput,
   isLateToolInputChunk,
-  isReplayChunk,
   lateToolInputForwardChunks,
   normalizeToolInput,
   type MessageParts,
@@ -45,11 +44,14 @@ export {
 } from "./submit-concurrency";
 
 export {
+  observedDivergesFrom,
   transition as broadcastTransition,
   type BroadcastStreamState,
-  type BroadcastStreamEvent,
-  type TransitionResult as BroadcastTransitionResult
+  type BroadcastStreamEvent
 } from "./broadcast-state";
+
+/** @internal Continuation replay de-duplication for sibling chat clients. */
+export { ContinuationReplayFilter } from "./replay-dedupe";
 
 export {
   ResumableStream,
@@ -168,11 +170,7 @@ export {
 
 export { parseProtocolMessage, type ChatProtocolEvent } from "./parse-protocol";
 
-export {
-  reconcileMessages,
-  resolveToolMergeId,
-  reconcileOrphanPartial
-} from "./message-reconciler";
+export { reconcileMessages, resolveToolMergeId } from "./message-reconciler";
 
 /**
  * @internal Shared transcript-repair primitive — flips interrupted tool calls
@@ -318,3 +316,18 @@ export {
   type TruncateOptions,
   type TruncateToolResultsOptions
 } from "./truncate-older-messages";
+
+// Shared with the AG-UI-based `useAgentChat` in `@cloudflare/ai-chat`, which
+// forwards the same throttle defaults to `useChat`.
+export { chatThrottleOptions } from "./chat-throttle";
+
+// AG-UI shape helpers used by the AI SDK projection layer
+// (`@cloudflare/ai-chat`): row migration/normalization, the UIMessage
+// projection, and the built-in message sanitizer.
+export {
+  autoTransformAGUIMessages,
+  fromSessionMessage,
+  toSessionMessage
+} from "./agui-migration";
+export { toUIMessages } from "./agui-to-ui-messages";
+export { sanitizeAGUIMessage } from "./agui-sanitize";

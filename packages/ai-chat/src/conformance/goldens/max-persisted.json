@@ -1,0 +1,220 @@
+{
+  "scenario": "max-persisted",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 0
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 1
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "part-1",
+            "delta": "Hello "
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 2
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "part-1",
+            "delta": "world"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 3
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 4
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 5
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
+        },
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-3"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 0
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 1
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "part-1",
+            "delta": "Hello "
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 2
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "part-1",
+            "delta": "world"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 3
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 4
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "seq": 5
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-4",
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-2"
+          ]
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    },
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-4",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-3"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-5",
+      "message": {
+        "id": "id-5",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "second"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-3",
+      "message": {
+        "id": "id-3",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": "Hello world",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-5",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "second"
+        }
+      ]
+    },
+    {
+      "id": "id-3",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "text",
+          "text": "Hello world",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

@@ -5,6 +5,18 @@
 > was kept inline in the RFC while the `chat-recovery-foundation` branch was in
 > flight; it was moved here at branch finalization so the RFC freezes as a
 > point-in-time decision record (per [AGENTS.md](./AGENTS.md)).
+>
+> **Superseded in part by the AG-UI cutover.** This log repeatedly cites
+> `reconcileOrphanPartial` and its unit tests as the shared orphan-persist (c)
+> merge primitive. That helper and its tests were deleted in
+> [`ag-ui-plan.md`](./ag-ui-plan.md) Phase 6: on the AG-UI engine, tool-result
+> dedup is a property of the engine's idempotent orphan replay rather than a
+> standalone merge step, so the coverage claims naming it no longer hold. The
+> behaviour they describe is still covered by `durable-chat-recovery.test.ts`
+> in `packages/ai-chat/src/tests/` and `packages/agents/src/agui-tests/`.
+> Entries below are left as written — this is an archived record, not a live
+> map. For current coverage see
+> [`test-coverage-matrix.md`](./test-coverage-matrix.md).
 
 Running record of completed steps (newest first). Each entry links the phase,
 the change, and the key review findings.

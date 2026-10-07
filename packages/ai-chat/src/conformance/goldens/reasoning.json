@@ -1,0 +1,173 @@
+{
+  "scenario": "reasoning",
+  "clients": [
+    {
+      "label": "client-1",
+      "frames": [
+        {
+          "body": {
+            "type": "start",
+            "messageId": "id-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 0
+        },
+        {
+          "body": {
+            "type": "reasoning-start",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 1
+        },
+        {
+          "body": {
+            "type": "reasoning-delta",
+            "id": "part-1",
+            "delta": "thinking about it"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 2
+        },
+        {
+          "body": {
+            "type": "reasoning-end",
+            "id": "part-1"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 3
+        },
+        {
+          "body": {
+            "type": "text-start",
+            "id": "part-2"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 4
+        },
+        {
+          "body": {
+            "type": "text-delta",
+            "id": "part-2",
+            "delta": "reasoned answer"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 5
+        },
+        {
+          "body": {
+            "type": "text-end",
+            "id": "part-2"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 6
+        },
+        {
+          "body": {
+            "type": "finish"
+          },
+          "done": false,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "seq": 7
+        },
+        {
+          "body": "",
+          "done": true,
+          "id": "id-2",
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
+        }
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "hook": "onChatResponse",
+      "requestId": "id-2",
+      "status": "completed",
+      "continuation": false,
+      "messageId": "id-1"
+    }
+  ],
+  "persistedRows": [
+    {
+      "id": "id-3",
+      "message": {
+        "id": "id-3",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "created_at": "TS"
+    },
+    {
+      "id": "id-1",
+      "message": {
+        "id": "id-1",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "thinking about it",
+            "state": "done"
+          },
+          {
+            "type": "text",
+            "text": "reasoned answer",
+            "state": "done"
+          }
+        ]
+      },
+      "created_at": "TS"
+    }
+  ],
+  "clientView": [
+    {
+      "id": "id-3",
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "id": "id-1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "thinking about it",
+          "state": "done"
+        },
+        {
+          "type": "text",
+          "text": "reasoned answer",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

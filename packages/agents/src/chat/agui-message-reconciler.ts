@@ -1,0 +1,511 @@
+/**
+ * AG-UI message reconciliation — pure functions for aligning client
+ * messages with server state during persistence, operating on the
+ * canonical `AGUIMessage` shape (sidecar to `message-reconciler.ts`,
+ * which speaks Vercel `UIMessage`).
+ *
+ * Three strategies, applied in order:
+ *   1. Reconcile `AssistantMessage` ids via: exact match → same tool
+ *      calls → content-key hash. The server's id wins because the server
+ *      is the only entity that has agreed with persistence. Each server
+ *      row is claimed at most once, and a tool-call match requires the
+ *      same `toolCallId`, tool and arguments, since providers may reuse
+ *      `toolCallId`s across turns (#2040).
+ *   2. Merge server-known `ToolMessage` outputs over incoming
+ *      `ToolMessage`s for the same call (server is authoritative once a
+ *      result lands; clients may carry stale content). A result comes only
+ *      from the server assistant the incoming one resolved to.
+ *   3. Drop a stale copy of an assistant the same submit also echoes under
+ *      its stored id (see {@link dropStaleToolCopies}).
+ *
+ * Ordering and assistant/tool pairing are preserved: a `ToolMessage` that
+ * follows its owning assistant in `incoming` stays adjacent to it. No
+ * reordering is performed.
+ */
+
+import type {
+  AGUIMessage,
+  AssistantMessage,
+  ReasoningMessage,
+  ToolCall,
+  ToolMessage
+} from "./agui-types";
+
+/**
+ * Reconcile incoming client messages against server state.
+ *
+ * @param incoming - Messages from the client.
+ * @param server - Current server-side messages (source of truth).
+ * @param sanitizeForContentKey - Optional sanitizer applied to messages
+ *   before computing their content key (typically strips ephemeral
+ *   provider metadata so logically-equivalent assistant turns hash the
+ *   same).
+ * @returns Reconciled messages, ready for persistence. Order matches
+ *   `incoming`; inputs are not mutated.
+ */
+export function reconcileMessages(
+  incoming: AGUIMessage[],
+  server: readonly AGUIMessage[],
+  sanitizeForContentKey?: (message: AGUIMessage) => AGUIMessage
+): AGUIMessage[] {
+  const withReconciledIds = reconcileAssistantIds(
+    incoming,
+    server,
+    sanitizeForContentKey
+  );
+  return dropStaleToolCopies(
+    mergeServerToolResults(withReconciledIds, server),
+    server,
+    sanitizeForContentKey
+  );
+}
+
+/**
+ * For a single message, find the server message id whose `ToolCall`s
+ * (when the input is an `AssistantMessage`) or `toolCallId` (when the
+ * input is a `ToolMessage`) share an id with this message. Returns
+ * `null` when no candidate matches.
+ *
+ * Only same-role candidates are considered: the caller adopts the matched
+ * id, so an assistant must never take its own `ToolMessage`'s id (that row
+ * would then be overwritten by the assistant turn).
+ *
+ * @deprecated Unsafe when a provider reuses a toolCallId across turns: it
+ * scans the whole conversation and claims nothing, so a later assistant can
+ * adopt an earlier row's id and overwrite it on upsert. Use
+ * {@link reconcileMessages}, which claims server rows one-to-one.
+ */
+export function resolveToolMergeId(
+  message: AGUIMessage,
+  server: readonly AGUIMessage[]
+): string | null {
+  const ids = collectToolCallIds(message);
+  if (ids.length === 0) return null;
+
+  for (const candidate of server) {
+    if (candidate.id === message.id) continue;
+    // Same role only: the caller adopts the candidate's id, and an assistant
+    // that borrowed its own `ToolMessage`'s id would overwrite that row.
+    if (candidate.role !== message.role) continue;
+    const candidateIds = collectToolCallIds(candidate);
+    for (const id of ids) {
+      if (candidateIds.includes(id)) return candidate.id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Stable content-key hash for assistant messages, used for dedup when
+ * the assistant id has drifted (e.g. the client generated a temporary
+ * id before the server response came back).
+ *
+ * The key is intentionally narrow:
+ *   - `content` — the assistant's text body (final and authoritative).
+ *   - `toolCalls` — projected to `{id, name, arguments}` and sorted by
+ *     id so streaming order doesn't perturb the hash; this captures
+ *     "same tool calls with same arguments", which is the strongest
+ *     dedup signal we have when text content is absent.
+ *   - `reasoningContent` — when the immediately-preceding message in
+ *     the same list is a `ReasoningMessage` paired with this assistant
+ *     (same `id` prefix is intentionally not assumed; pairing is
+ *     positional in AG-UI), its content is folded in so logically
+ *     identical reasoning + assistant pairs collide.
+ *
+ * Excluded on purpose:
+ *   - `id` (we are looking for assistants whose ids drifted).
+ *   - `role` (always `"assistant"` at this call site).
+ *   - `name` (cosmetic; not stable across producers).
+ *   - `encryptedValue` / provider metadata (ephemeral per turn; the
+ *     `sanitize` callback is the configured hook for stripping these).
+ *
+ * Returns `undefined` for non-assistant messages — content-key dedup
+ * only makes sense for the role whose ids the server may revise.
+ */
+export function assistantContentKey(
+  message: AGUIMessage,
+  sanitize?: (message: AGUIMessage) => AGUIMessage,
+  pairedReasoning?: ReasoningMessage
+): string | undefined {
+  if (message.role !== "assistant") return undefined;
+  const sanitized = sanitize ? sanitize(message) : message;
+  if (sanitized.role !== "assistant") return undefined;
+
+  const projected = {
+    content: sanitized.content ?? "",
+    toolCalls: projectToolCallsForKey(sanitized.toolCalls),
+    reasoningContent: pairedReasoning?.content ?? ""
+  };
+  return JSON.stringify(projected);
+}
+
+// ─── internals ──────────────────────────────────────────────────────
+
+function mergeServerToolResults(
+  incoming: AGUIMessage[],
+  server: readonly AGUIMessage[]
+): AGUIMessage[] {
+  // Server results indexed by the assistant that issued the call, then
+  // toolCallId. Providers may reuse toolCallIds across turns, so a result
+  // merges only from the row the incoming assistant resolved to: one on any
+  // other row can belong to another turn (#2040). `serverToolMessages` is
+  // the conversation-wide index, used only for an incoming result whose
+  // issuing assistant is not part of this batch.
+  const serverToolMessages = new Map<string, ToolMessage>();
+  const serverResultsByOwner = new Map<string, Map<string, ToolMessage>>();
+  // Assistants carrying approval state: decisions are recorded server-side
+  // (the approval frame never reaches this path), so a stale client copy
+  // without them must not erase a recorded denial on an exact-id write-back.
+  const serverApprovals = new Map<string, AssistantMessage>();
+  const serverOwners = new Map<string, string>();
+  for (const msg of server) {
+    if (!isWellFormed(msg)) continue;
+    if (msg.role === "tool") {
+      serverToolMessages.set(msg.toolCallId, msg);
+      const owner = serverOwners.get(msg.toolCallId);
+      if (owner !== undefined) {
+        let results = serverResultsByOwner.get(owner);
+        if (!results) serverResultsByOwner.set(owner, (results = new Map()));
+        results.set(msg.toolCallId, msg);
+      }
+    } else if (msg.role === "assistant") {
+      for (const tc of msg.toolCalls ?? []) serverOwners.set(tc.id, msg.id);
+      if (msg.toolApprovals) serverApprovals.set(msg.id, msg);
+    }
+  }
+
+  if (serverToolMessages.size === 0 && serverApprovals.size === 0) {
+    return incoming;
+  }
+
+  const incomingOwners = new Map<string, string>();
+  return incoming.map((msg) => {
+    if (!isWellFormed(msg)) return msg;
+    if (msg.role === "assistant") {
+      for (const tc of msg.toolCalls ?? []) incomingOwners.set(tc.id, msg.id);
+      const serverAssistant = serverApprovals.get(msg.id);
+      if (!serverAssistant?.toolApprovals) return msg;
+      // Server entries win per toolCallId; incoming entries for calls the
+      // server has no record of are kept.
+      return {
+        ...msg,
+        toolApprovals: {
+          ...msg.toolApprovals,
+          ...serverAssistant.toolApprovals
+        }
+      };
+    }
+    if (msg.role !== "tool") return msg;
+    const owner = incomingOwners.get(msg.toolCallId);
+    const serverTool =
+      owner === undefined
+        ? serverToolMessages.get(msg.toolCallId)
+        : serverResultsByOwner.get(owner)?.get(msg.toolCallId);
+    if (!serverTool) return msg;
+    if (serverTool.id === msg.id && serverTool.content === msg.content) {
+      return msg;
+    }
+    return { ...serverTool };
+  });
+}
+
+function reconcileAssistantIds(
+  incoming: AGUIMessage[],
+  server: readonly AGUIMessage[],
+  sanitize?: (message: AGUIMessage) => AGUIMessage
+): AGUIMessage[] {
+  if (server.length === 0) {
+    warnMalformed(incoming);
+    return incoming.slice();
+  }
+
+  const claimedServerIndices = new Set<number>();
+
+  for (let i = 0; i < incoming.length; i++) {
+    const incomingMsg = incoming[i];
+    if (!isWellFormed(incomingMsg)) continue;
+    const serverIdx = server.findIndex(
+      (sm, si) =>
+        !claimedServerIndices.has(si) &&
+        isWellFormed(sm) &&
+        sm.id === incomingMsg.id
+    );
+    if (serverIdx !== -1) claimedServerIndices.add(serverIdx);
+  }
+
+  return incoming.map((incomingMessage, i) => {
+    if (!isWellFormed(incomingMessage)) {
+      console.warn(
+        "[agui-message-reconciler] passing through malformed message",
+        incomingMessage
+      );
+      return incomingMessage;
+    }
+
+    const exactServerIdx = server.findIndex(
+      (sm) => isWellFormed(sm) && sm.id === incomingMessage.id
+    );
+    if (exactServerIdx !== -1) {
+      // Exact id match: the incoming version wins (legacy parity — clients
+      // may legitimately update a message's content; the server's authority
+      // is over IDS and tool results, which step 1 already merged).
+      return incomingMessage;
+    }
+
+    if (incomingMessage.role !== "assistant") return incomingMessage;
+
+    // Candidates are taken in transcript order, first unclaimed row first, so
+    // repeated identical assistants (the same reused call) pair up turn by
+    // turn. Compared in the host's persisted form, so arguments the host
+    // truncates on write still match their stored row.
+    const incomingCalls = toolCallsById(
+      sanitize ? sanitize(incomingMessage) : incomingMessage
+    );
+    if (incomingCalls.size > 0) {
+      for (let s = 0; s < server.length; s++) {
+        if (claimedServerIndices.has(s)) continue;
+        const serverMsg = server[s];
+        if (
+          isWellFormed(serverMsg) &&
+          serverMsg.role === "assistant" &&
+          carriesSameToolCalls(serverMsg, incomingCalls)
+        ) {
+          claimedServerIndices.add(s);
+          return { ...incomingMessage, id: serverMsg.id };
+        }
+      }
+      return incomingMessage;
+    }
+
+    const pairedReasoning = findPairedReasoning(incoming, i);
+    const incomingKey = assistantContentKey(
+      incomingMessage,
+      sanitize,
+      pairedReasoning
+    );
+    if (incomingKey !== undefined) {
+      for (let s = 0; s < server.length; s++) {
+        if (claimedServerIndices.has(s)) continue;
+        const serverMsg = server[s];
+        if (!isWellFormed(serverMsg)) continue;
+        if (serverMsg.role !== "assistant") continue;
+        const serverPairedReasoning = findPairedReasoning(server, s);
+        const serverKey = assistantContentKey(
+          serverMsg,
+          sanitize,
+          serverPairedReasoning
+        );
+        if (serverKey === incomingKey) {
+          claimedServerIndices.add(s);
+          return { ...incomingMessage, id: serverMsg.id };
+        }
+      }
+    }
+
+    return incomingMessage;
+  });
+}
+
+/**
+ * Drop a stale client copy of an assistant that the same submit also echoes
+ * under its stored id. Kept, the copy persists as a second row carrying the
+ * same toolCallIds and reaches the next prompt as a duplicate tool call, which
+ * providers that issue unique ids reject.
+ *
+ * A message is dropped only when it claimed no server row, is not the last
+ * submitted message (a new call awaiting its result sits there), and consists
+ * solely of pending tool calls each matching the same call already settled on
+ * a server row this submit claimed. Anything else is kept.
+ */
+function dropStaleToolCopies(
+  reconciled: AGUIMessage[],
+  server: readonly AGUIMessage[],
+  sanitize?: (message: AGUIMessage) => AGUIMessage
+): AGUIMessage[] {
+  const reconciledIds = new Set<string>();
+  // Calls this batch carries a result for, keyed `assistantId:toolCallId`.
+  const answeredInBatch = new Set<string>();
+  const batchOwners = new Map<string, string>();
+  for (const msg of reconciled) {
+    if (!isWellFormed(msg)) continue;
+    reconciledIds.add(msg.id);
+    if (msg.role === "assistant") {
+      for (const tc of msg.toolCalls ?? []) batchOwners.set(tc.id, msg.id);
+    } else if (msg.role === "tool") {
+      const owner = batchOwners.get(msg.toolCallId);
+      if (owner !== undefined) {
+        answeredInBatch.add(`${owner}:${msg.toolCallId}`);
+      }
+    }
+  }
+
+  const serverIds = new Set<string>();
+  const settledOnClaimed = new Map<string, ToolCall[]>();
+  const settle = (owner: AssistantMessage, toolCallId: string) => {
+    const call = owner.toolCalls?.find((tc) => tc.id === toolCallId);
+    if (!call) return;
+    const settled = settledOnClaimed.get(toolCallId);
+    if (settled) settled.push(call);
+    else settledOnClaimed.set(toolCallId, [call]);
+  };
+  const serverOwners = new Map<string, AssistantMessage>();
+  for (const msg of server) {
+    if (!isWellFormed(msg)) continue;
+    serverIds.add(msg.id);
+    if (msg.role === "assistant") {
+      for (const tc of msg.toolCalls ?? []) serverOwners.set(tc.id, msg);
+      if (!reconciledIds.has(msg.id)) continue;
+      // A denied approval is terminal without a result row.
+      for (const [toolCallId, approval] of Object.entries(
+        msg.toolApprovals ?? {}
+      )) {
+        if (approval.approved === false) settle(msg, toolCallId);
+      }
+    } else if (msg.role === "tool") {
+      const owner = serverOwners.get(msg.toolCallId);
+      if (owner && reconciledIds.has(owner.id)) settle(owner, msg.toolCallId);
+    }
+  }
+  if (settledOnClaimed.size === 0) return reconciled;
+
+  const lastIndex = reconciled.length - 1;
+  const kept = reconciled.filter((msg, index) => {
+    if (index === lastIndex || !isWellFormed(msg)) return true;
+    if (msg.role !== "assistant" || serverIds.has(msg.id)) return true;
+    const comparable = sanitize ? sanitize(msg) : msg;
+    if (comparable.role !== "assistant" || !comparable.toolCalls?.length) {
+      return true;
+    }
+    if (
+      comparable.content ||
+      comparable.extraParts?.some((part) => part.type !== "step-start")
+    ) {
+      return true;
+    }
+    return !comparable.toolCalls.every(
+      (call) =>
+        !answeredInBatch.has(`${msg.id}:${call.id}`) &&
+        comparable.toolApprovals?.[call.id]?.approved !== false &&
+        settledOnClaimed
+          .get(call.id)
+          ?.some((candidate) => sameToolCall(candidate, call))
+    );
+  });
+  return kept.length === reconciled.length ? reconciled : kept;
+}
+
+/**
+ * Whether `serverMessage` shares at least one toolCallId with the incoming
+ * message and every shared toolCallId is the same call on both sides. A
+ * provider that reuses a toolCallId for a new call carries a different tool
+ * or arguments, so it cannot adopt the older row's id.
+ */
+function carriesSameToolCalls(
+  serverMessage: AssistantMessage,
+  incomingCalls: Map<string, ToolCall>
+): boolean {
+  let shared = false;
+  for (const call of serverMessage.toolCalls ?? []) {
+    const incomingCall = incomingCalls.get(call.id);
+    if (!incomingCall) continue;
+    if (!sameToolCall(call, incomingCall)) return false;
+    shared = true;
+  }
+  return shared;
+}
+
+/** Same tool and structurally equal arguments (object key order ignored). */
+function sameToolCall(a: ToolCall, b: ToolCall): boolean {
+  return (
+    a.function.name === b.function.name &&
+    stableArguments(a.function.arguments) ===
+      stableArguments(b.function.arguments)
+  );
+}
+
+function stableArguments(args: string): string {
+  try {
+    return stableStringify(JSON.parse(args)) ?? args;
+  } catch {
+    return args;
+  }
+}
+
+function stableStringify(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item) ?? "null").join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function toolCallsById(message: AGUIMessage): Map<string, ToolCall> {
+  const calls = new Map<string, ToolCall>();
+  if (message.role !== "assistant") return calls;
+  for (const call of message.toolCalls ?? []) {
+    if (!calls.has(call.id)) calls.set(call.id, call);
+  }
+  return calls;
+}
+
+function projectToolCallsForKey(
+  toolCalls: ToolCall[] | undefined
+): Array<{ id: string; name: string; arguments: string }> {
+  if (!toolCalls || toolCalls.length === 0) return [];
+  return toolCalls
+    .map((tc) => ({
+      id: tc.id,
+      name: tc.function.name,
+      arguments: tc.function.arguments
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+function collectToolCallIds(message: AGUIMessage): string[] {
+  if (!isWellFormed(message)) return [];
+  if (message.role === "assistant") {
+    return collectAssistantToolCallIds(message);
+  }
+  if (message.role === "tool") return [message.toolCallId];
+  return [];
+}
+
+function collectAssistantToolCallIds(message: AssistantMessage): string[] {
+  if (!message.toolCalls) return [];
+  return message.toolCalls.map((tc) => tc.id);
+}
+
+function findPairedReasoning(
+  messages: readonly AGUIMessage[],
+  assistantIdx: number
+): ReasoningMessage | undefined {
+  const prev = messages[assistantIdx - 1];
+  if (prev && isWellFormed(prev) && prev.role === "reasoning") return prev;
+  return undefined;
+}
+
+function isWellFormed(
+  message: AGUIMessage | undefined | null
+): message is AGUIMessage {
+  if (!message || typeof message !== "object") return false;
+  const msg = message as { id?: unknown; role?: unknown };
+  return typeof msg.id === "string" && typeof msg.role === "string";
+}
+
+function warnMalformed(messages: readonly AGUIMessage[]): void {
+  for (const msg of messages) {
+    if (!isWellFormed(msg)) {
+      console.warn(
+        "[agui-message-reconciler] passing through malformed message",
+        msg
+      );
+    }
+  }
+}

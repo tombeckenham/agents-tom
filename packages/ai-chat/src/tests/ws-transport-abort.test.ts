@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { UIMessage as ChatMessage, UIMessageChunk } from "ai";
-import { connectChatWS } from "./test-utils";
+import { connectChatWSRaw as connectChatWS } from "./test-utils";
 import { WebSocketChatTransport } from "../ws-chat-transport";
 import { MessageType, type OutgoingMessage } from "../types";
 

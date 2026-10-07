@@ -1,7 +1,11 @@
 import { env } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { MessageType, type OutgoingMessage } from "../types";
-import { connectChatWS, isUseChatResponseMessage } from "./test-utils";
+import {
+  connectChatWS,
+  connectChatWSRaw,
+  isUseChatResponseMessage
+} from "./test-utils";
 import { getAgentByName } from "agents";
 
 function isStreamResumingMessage(
@@ -945,25 +949,29 @@ describe("Resumable Streaming", () => {
         1000
       );
 
+      // Post-cutover the stored stream opens with a `start` carrying the
+      // run's generated assistant id, and part ids are opaque — assert
+      // shape/order, not exact id bytes.
       const responseMessages = messages.filter(isUseChatResponseMessage);
-      expect(responseMessages[0]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-start","id":"t1"}',
-          done: false,
-          replay: true
-        })
-      );
-      expect(responseMessages[1]).toEqual(
-        expect.objectContaining({
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-          id: requestId,
-          body: '{"type":"text-delta","id":"t1","delta":"hello after ack"}',
-          done: false,
-          replay: true
-        })
-      );
+      const bodies = responseMessages.map((m) =>
+        typeof m.body === "string" && m.body ? JSON.parse(m.body) : m.body
+      ) as Array<{ type?: string; delta?: string }>;
+      expect(bodies[0]?.type).toBe("start");
+      expect(bodies[1]?.type).toBe("text-start");
+      expect(bodies[2]).toMatchObject({
+        type: "text-delta",
+        delta: "hello after ack"
+      });
+      for (const frame of responseMessages.slice(0, 3)) {
+        expect(frame).toEqual(
+          expect.objectContaining({
+            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+            id: requestId,
+            done: false,
+            replay: true
+          })
+        );
+      }
       expect(responseMessages.at(-1)).toEqual(
         expect.objectContaining({
           type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
@@ -1181,15 +1189,15 @@ describe("Resumable Streaming", () => {
       const liveSeqs = [
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-start","id":"t1"}'
+          '{"type":"TEXT_MESSAGE_START","messageId":"t1","role":"assistant"}'
         ),
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-delta","id":"t1","delta":"a"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"a"}'
         ),
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-delta","id":"t1","delta":"b"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"b"}'
         )
       ];
       expect(liveSeqs).toEqual([0, 1, 2]);
@@ -1197,7 +1205,9 @@ describe("Resumable Streaming", () => {
       ws1.close();
       await new Promise((r) => setTimeout(r, 50));
 
-      const { ws: ws2 } = await connectChatWS(
+      // Raw AG-UI wire: `seq` indexes stored events, and the legacy
+      // projection can turn one event into several chunks.
+      const { ws: ws2 } = await connectChatWSRaw(
         `/agents/test-chat-agent/${room}`
       );
       const messages2 = collectMessages(ws2);
@@ -1244,11 +1254,11 @@ describe("Resumable Streaming", () => {
       });
       await agentStub.testStoreStreamChunk(
         first,
-        '{"type":"text-start","id":"t1"}'
+        '{"type":"TEXT_MESSAGE_START","messageId":"t1","role":"assistant"}'
       );
       await agentStub.testStoreStreamChunk(
         first,
-        '{"type":"text-delta","id":"t1","delta":"a"}'
+        '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"a"}'
       );
       await agentStub.testCompleteStream(first);
 
@@ -1258,11 +1268,11 @@ describe("Resumable Streaming", () => {
       const liveSeqs = [
         await agentStub.testStoreStreamChunk(
           retry,
-          '{"type":"text-start","id":"t2"}'
+          '{"type":"TEXT_MESSAGE_START","messageId":"t2","role":"assistant"}'
         ),
         await agentStub.testStoreStreamChunk(
           retry,
-          '{"type":"text-delta","id":"t2","delta":"b"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t2","delta":"b"}'
         )
       ];
       expect(liveSeqs).toEqual([2, 3]);
@@ -1270,7 +1280,9 @@ describe("Resumable Streaming", () => {
       ws1.close();
       await new Promise((r) => setTimeout(r, 50));
 
-      const { ws: ws2 } = await connectChatWS(
+      // Raw AG-UI wire: `seq` indexes stored events, and the legacy
+      // projection can turn one event into several chunks.
+      const { ws: ws2 } = await connectChatWSRaw(
         `/agents/test-chat-agent/${room}`
       );
       const messages2 = collectMessages(ws2);
@@ -1447,6 +1459,77 @@ describe("Resumable Streaming", () => {
       ws2.close(1000);
     });
 
+    it("re-running the orphan reconstruction is idempotent (repeat ACK / recovery / approval overlap)", async () => {
+      // The reconstruction is NOT one-shot: it runs from resume ACKs and
+      // (twice) from the recovery engine, and an approval snapshot may have
+      // persisted part of the same stream already. Applying it repeatedly
+      // must not duplicate text, extras, or reasoning — and replayed
+      // reasoning content must survive.
+      const room = crypto.randomUUID();
+      const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+      await new Promise((r) => setTimeout(r, 50));
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+      await agentStub.persistMessages([
+        {
+          id: "user-idem",
+          role: "user",
+          parts: [{ type: "text", text: "go" }]
+        }
+      ]);
+
+      const streamId = await agentStub.testStartStream("req-idem");
+      for (const body of [
+        '{"type":"start","messageId":"assistant-idem"}',
+        '{"type":"start-step"}',
+        '{"type":"reasoning-start","id":"r-idem"}',
+        '{"type":"reasoning-delta","id":"r-idem","delta":"thinking hard"}',
+        '{"type":"reasoning-end","id":"r-idem"}',
+        '{"type":"tool-input-available","toolCallId":"tc-idem","toolName":"lookup","input":{"q":1}}',
+        '{"type":"tool-output-available","toolCallId":"tc-idem","output":{"a":2}}',
+        '{"type":"text-start","id":"t-idem"}',
+        '{"type":"text-delta","id":"t-idem","delta":"partial answer"}'
+        // interrupted: no text-end / finish
+      ]) {
+        await agentStub.testStoreStreamChunk(streamId, body);
+      }
+      await agentStub.testFlushChunkBuffer();
+
+      const snapshotOf = async () => {
+        const persisted =
+          (await agentStub.getPersistedMessages()) as unknown as Array<{
+            id: string;
+            role: string;
+            parts: Array<{ type: string; text?: string }>;
+          }>;
+        const assistant = persisted.find((m) => m.role === "assistant");
+        return { persisted, assistant };
+      };
+
+      await agentStub.testPersistOrphanedStream(streamId);
+      const first = await snapshotOf();
+      expect(first.assistant).toBeDefined();
+
+      // Re-apply twice more (repeat ACK / second recovery pass).
+      await agentStub.testPersistOrphanedStream(streamId);
+      await agentStub.testPersistOrphanedStream(streamId);
+      const after = await snapshotOf();
+
+      // Identical outcome — nothing duplicated.
+      expect(after.persisted).toEqual(first.persisted);
+      const parts = after.assistant!.parts;
+      expect(parts.filter((p) => p.type === "step-start")).toHaveLength(1);
+      const reasoningParts = parts.filter((p) => p.type === "reasoning");
+      expect(reasoningParts).toHaveLength(1);
+      expect(reasoningParts[0].text).toBe("thinking hard");
+      const textParts = parts.filter((p) => p.type === "text");
+      expect(textParts).toHaveLength(1);
+      expect(textParts[0].text).toBe("partial answer");
+      expect(parts.filter((p) => p.type === "tool-lookup")).toHaveLength(1);
+
+      ws.close(1000);
+    });
+
     it("orphaned stream with tool call parts reconstructs correctly", async () => {
       const room = crypto.randomUUID();
 
@@ -1559,10 +1642,15 @@ describe("Resumable Streaming", () => {
         }
       ]);
 
-      // Start a continuation stream whose start chunk has NO messageId
-      // (stripped by #1229 server-side logic).
+      // Post-cutover a continuation stream is anchored server-side on the
+      // seed assistant id (chunk-to-event injects it; the #1229 provider-id
+      // strip is upstream of that), so the stored stream opens with the
+      // existing assistant's id.
       const streamId = await agentStub.testStartStream("req-cont-orphan");
-      await agentStub.testStoreStreamChunk(streamId, '{"type":"start"}');
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"start","messageId":"assistant-cont"}'
+      );
       await agentStub.testStoreStreamChunk(
         streamId,
         '{"type":"text-start","id":"t-cont"}'
@@ -2122,6 +2210,265 @@ describe("Resumable Streaming", () => {
       );
       expect(await agentStub.getStreamMetadata("long-silent")).toBeNull();
       ws.close(1000);
+    });
+  });
+
+  describe("Duplicate resume notify / replay contract (#1733)", () => {
+    it("notifies STREAM_RESUMING from both onConnect and RESUME_REQUEST for the same request", async () => {
+      // This duplication is INTENTIONAL and must not be deduped server-side:
+      // an explicit resume request always deserves a response (otherwise
+      // the client's reconnectToStream hangs until its safety timeout), and
+      // the proactive onConnect notify covers clients that never send one.
+      // Clients are responsible for not ACKing the same offer twice.
+      const room = crypto.randomUUID();
+
+      const { ws: ws1 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+      const streamId = await agentStub.testStartStream("req-double-notify");
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"text-start","id":"t1"}'
+      );
+      await agentStub.testFlushChunkBuffer();
+
+      ws1.close();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { ws: ws2 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      const messages2 = collectMessages(ws2);
+
+      // Wait for the proactive onConnect notify first…
+      await waitFor(
+        () => messages2.filter(isStreamResumingMessage).length >= 1
+      );
+
+      // …then the explicit request must produce a second notify.
+      ws2.send(
+        JSON.stringify({ type: MessageType.CF_AGENT_STREAM_RESUME_REQUEST })
+      );
+      await waitFor(
+        () => messages2.filter(isStreamResumingMessage).length >= 2
+      );
+
+      const resumeMsgs = messages2.filter(isStreamResumingMessage);
+      expect(resumeMsgs.length).toBe(2);
+      expect(resumeMsgs[0].id).toBe("req-double-notify");
+      expect(resumeMsgs[1].id).toBe("req-double-notify");
+
+      ws2.close(1000);
+    });
+
+    it("replays the full buffer once per ACK — clients must dedupe duplicate offers", async () => {
+      // Pin the contract the client-side fix relies on: the server has no
+      // per-connection replay memory (an ACK from the fallback path and one
+      // from the transport handshake both legitimately need the full
+      // prefix), so a client that ACKs the same offer twice receives the
+      // buffer twice. The dedupe therefore lives client-side.
+      const room = crypto.randomUUID();
+
+      const { ws: ws1 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+      const streamId = await agentStub.testStartStream("req-double-ack");
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"start","messageId":"m-double-ack"}'
+      );
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"text-start","id":"t1"}'
+      );
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"text-delta","id":"t1","delta":"hello"}'
+      );
+      await agentStub.testFlushChunkBuffer();
+
+      ws1.close();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { ws: ws2 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      const messages2 = collectMessages(ws2);
+
+      await waitFor(
+        () => messages2.filter(isStreamResumingMessage).length >= 1
+      );
+
+      const ack = JSON.stringify({
+        type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+        id: "req-double-ack"
+      });
+      ws2.send(ack);
+      ws2.send(ack);
+
+      const isReplayedStart = (m: unknown) =>
+        isUseChatResponseMessage(m) &&
+        (m as { replay?: boolean }).replay === true &&
+        typeof (m as { body?: string }).body === "string" &&
+        (m as { body: string }).body.includes('"type":"start"');
+      const replayCompleteCount = () =>
+        messages2.filter(
+          (m) =>
+            isUseChatResponseMessage(m) &&
+            (m as { replayComplete?: boolean }).replayComplete === true
+        ).length;
+
+      await waitFor(() => replayCompleteCount() >= 2);
+
+      expect(messages2.filter(isReplayedStart).length).toBe(2);
+      expect(replayCompleteCount()).toBe(2);
+
+      ws2.close(1000);
+    });
+
+    it("replay frames of a continuation stream carry continuation: true", async () => {
+      // Live continuation frames carry `continuation: true`; replay frames
+      // must mirror them (#1733) — a replayed continuation `start` without
+      // the flag is treated by clients as a fresh message, dropping the
+      // parts streamed before the continuation.
+      const room = crypto.randomUUID();
+
+      const { ws: ws1 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+      const streamId = await agentStub.testStartStream("req-cont-replay", {
+        continuation: true
+      });
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"start","messageId":"m-cont"}'
+      );
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"text-delta","id":"t1","delta":"continued"}'
+      );
+      await agentStub.testFlushChunkBuffer();
+
+      ws1.close();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { ws: ws2 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      const messages2 = collectMessages(ws2);
+
+      await waitFor(
+        () => messages2.filter(isStreamResumingMessage).length >= 1
+      );
+
+      ws2.send(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+          id: "req-cont-replay"
+        })
+      );
+
+      const replayFrames = () =>
+        messages2.filter(
+          (m) =>
+            isUseChatResponseMessage(m) &&
+            (m as { replay?: boolean }).replay === true
+        ) as Array<{
+          continuation?: boolean;
+          replayComplete?: boolean;
+          body?: string;
+        }>;
+
+      await waitFor(() =>
+        replayFrames().some((m) => m.replayComplete === true)
+      );
+
+      const frames = replayFrames();
+      // Post-cutover RUN_STARTED has no chunk projection, so the replay is
+      // one frame shorter than the legacy wire; the contract under test is
+      // the continuation flag, not the frame count.
+      expect(frames.length).toBeGreaterThanOrEqual(2);
+      for (const frame of frames) {
+        expect(frame.continuation).toBe(true);
+      }
+
+      ws2.close(1000);
+    });
+
+    it("retains the continuation flag on replay after hibernation wake", async () => {
+      // The flag is persisted in stream metadata (is_continuation) so a
+      // restored/orphaned continuation stream still replays with
+      // `continuation: true` after the in-memory state was lost.
+      const room = crypto.randomUUID();
+
+      const { ws: ws1 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const agentStub = await getAgentByName(env.TestChatAgent, room);
+      const streamId = await agentStub.testStartStream("req-cont-orphan2", {
+        continuation: true
+      });
+      await agentStub.testStoreStreamChunk(
+        streamId,
+        '{"type":"text-delta","id":"t1","delta":"continued after wake"}'
+      );
+      await agentStub.testFlushChunkBuffer();
+
+      ws1.close();
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Simulate hibernation: ResumableStream is reconstructed and restores
+      // the active stream (including is_continuation) from SQLite.
+      await agentStub.testSimulateHibernationWake();
+      expect(await agentStub.getActiveStreamId()).toBe(streamId);
+
+      const { ws: ws2 } = await connectChatWS(
+        `/agents/test-chat-agent/${room}`
+      );
+      const messages2 = collectMessages(ws2);
+
+      await waitFor(
+        () => messages2.filter(isStreamResumingMessage).length >= 1
+      );
+
+      ws2.send(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+          id: "req-cont-orphan2"
+        })
+      );
+
+      // Orphaned stream: replay ends with done=true.
+      await waitFor(() =>
+        messages2.some(
+          (m) =>
+            isUseChatResponseMessage(m) &&
+            (m as { done?: boolean }).done === true
+        )
+      );
+
+      const replayFrames = messages2.filter(
+        (m) =>
+          isUseChatResponseMessage(m) &&
+          (m as { replay?: boolean }).replay === true
+      ) as Array<{ continuation?: boolean }>;
+      expect(replayFrames.length).toBeGreaterThanOrEqual(2);
+      for (const frame of replayFrames) {
+        expect(frame.continuation).toBe(true);
+      }
+
+      ws2.close(1000);
     });
   });
 });

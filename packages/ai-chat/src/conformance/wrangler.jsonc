@@ -1,0 +1,86 @@
+{
+  "main": "./worker.ts",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "enable_nodejs_tty_module",
+    "enable_nodejs_fs_module",
+    "enable_nodejs_http_modules",
+    "enable_nodejs_perf_hooks_module",
+    "enable_nodejs_v8_module",
+    "enable_nodejs_process_v2"
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ScriptedAgent", "class_name": "ScriptedAgent" },
+      { "name": "GatedAgent", "class_name": "GatedAgent" },
+      { "name": "LatestGatedAgent", "class_name": "LatestGatedAgent" },
+      { "name": "DropGatedAgent", "class_name": "DropGatedAgent" },
+      { "name": "MergeGatedAgent", "class_name": "MergeGatedAgent" },
+      { "name": "DebounceGatedAgent", "class_name": "DebounceGatedAgent" },
+      { "name": "MaxPersistedAgent", "class_name": "MaxPersistedAgent" },
+      { "name": "ProjectedAgent", "class_name": "ProjectedAgent" },
+      { "name": "ProjectedChildAgent", "class_name": "ProjectedChildAgent" },
+      { "name": "ProjectedToolParent", "class_name": "ProjectedToolParent" },
+      {
+        "name": "ProjectedScriptedAgent",
+        "class_name": "ProjectedScriptedAgent"
+      },
+      { "name": "ProjectedGatedAgent", "class_name": "ProjectedGatedAgent" },
+      {
+        "name": "ProjectedLatestGatedAgent",
+        "class_name": "ProjectedLatestGatedAgent"
+      },
+      {
+        "name": "ProjectedDropGatedAgent",
+        "class_name": "ProjectedDropGatedAgent"
+      },
+      {
+        "name": "ProjectedMergeGatedAgent",
+        "class_name": "ProjectedMergeGatedAgent"
+      },
+      {
+        "name": "ProjectedDebounceGatedAgent",
+        "class_name": "ProjectedDebounceGatedAgent"
+      },
+      {
+        "name": "ProjectedMaxPersistedAgent",
+        "class_name": "ProjectedMaxPersistedAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ScriptedAgent",
+        "GatedAgent",
+        "LatestGatedAgent",
+        "DropGatedAgent",
+        "MergeGatedAgent",
+        "DebounceGatedAgent",
+        "MaxPersistedAgent"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["ProjectedAgent"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ProjectedChildAgent", "ProjectedToolParent"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "ProjectedScriptedAgent",
+        "ProjectedGatedAgent",
+        "ProjectedLatestGatedAgent",
+        "ProjectedDropGatedAgent",
+        "ProjectedMergeGatedAgent",
+        "ProjectedDebounceGatedAgent",
+        "ProjectedMaxPersistedAgent"
+      ]
+    }
+  ]
+}

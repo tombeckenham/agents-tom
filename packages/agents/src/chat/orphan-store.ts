@@ -10,9 +10,7 @@
  * AI-SDK-specific. The two AI-SDK chat hosts (`@cloudflare/ai-chat` and
  * `@cloudflare/think`) instantiate it at the `UIMessage` default because their
  * orphan reconstruction via `StreamAccumulator.toMessage()` already yields
- * `UIMessage`. The AI-SDK-specific merge primitive
- * (`reconcileOrphanPartial`) stays typed on `UIMessage` — the store (where
- * messages live) is neutral, the merge (how AI-SDK partials combine) is not.
+ * `UIMessage`.
  *
  * Method returns are `T | Promise<T>` so a synchronous DO-SQLite store and an
  * async (e.g. Postgres) store both satisfy it.

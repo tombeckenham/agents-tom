@@ -252,6 +252,11 @@
       "import": "./dist/mcp/client/do-oauth-client-provider.js",
       "require": "./dist/mcp/client/do-oauth-client-provider.js"
     },
+    "./mcp/tanstack-ai": {
+      "types": "./dist/mcp/tanstack-ai.d.ts",
+      "import": "./dist/mcp/tanstack-ai.js",
+      "require": "./dist/mcp/tanstack-ai.js"
+    },
     "./observability": {
       "types": "./dist/observability/index.d.ts",
       "import": "./dist/observability/index.js",
@@ -332,6 +337,16 @@
       "import": "./dist/chat/index.js",
       "require": "./dist/chat/index.js"
     },
+    "./chat/agui-types": {
+      "types": "./dist/chat/agui-types.d.ts",
+      "import": "./dist/chat/agui-types.js",
+      "require": "./dist/chat/agui-types.js"
+    },
+    "./chat/agui-ws-transport": {
+      "types": "./dist/chat/agui-ws-transport.d.ts",
+      "import": "./dist/chat/agui-ws-transport.js",
+      "require": "./dist/chat/agui-ws-transport.js"
+    },
     "./chat/transport": {
       "types": "./dist/chat/transport.d.ts",
       "import": "./dist/chat/transport.js",
@@ -346,6 +361,11 @@
       "types": "./dist/chat-sdk/index.d.ts",
       "import": "./dist/chat-sdk/index.js",
       "require": "./dist/chat-sdk/index.js"
+    },
+    "./agui-chat-agent": {
+      "types": "./dist/agui-chat-agent.d.ts",
+      "import": "./dist/agui-chat-agent.js",
+      "require": "./dist/agui-chat-agent.js"
     },
     "./ai-chat-agent": {
       "types": "./dist/ai-chat-agent.d.ts",

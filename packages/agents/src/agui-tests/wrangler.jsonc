@@ -1,0 +1,71 @@
+{
+  "main": "./worker.ts",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "enable_nodejs_tty_module",
+    "enable_nodejs_fs_module",
+    "enable_nodejs_http_modules",
+    "enable_nodejs_perf_hooks_module",
+    "enable_nodejs_v8_module",
+    "enable_nodejs_process_v2"
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "EchoAguiAgent", "class_name": "EchoAguiAgent" },
+      { "name": "ToolCallAguiAgent", "class_name": "ToolCallAguiAgent" },
+      { "name": "SlowAguiAgent", "class_name": "SlowAguiAgent" },
+      { "name": "PlaintextAguiAgent", "class_name": "PlaintextAguiAgent" },
+      { "name": "PreThrowAguiAgent", "class_name": "PreThrowAguiAgent" },
+      { "name": "ErrorStreamAguiAgent", "class_name": "ErrorStreamAguiAgent" },
+      { "name": "ApprovalAguiAgent", "class_name": "ApprovalAguiAgent" },
+      {
+        "name": "MaxPersistedAguiAgent",
+        "class_name": "MaxPersistedAguiAgent"
+      },
+      {
+        "name": "SaveMessagesAguiAgent",
+        "class_name": "SaveMessagesAguiAgent"
+      },
+      { "name": "RecoveryAguiAgent", "class_name": "RecoveryAguiAgent" },
+      { "name": "PreStreamAguiAgent", "class_name": "PreStreamAguiAgent" },
+      {
+        "name": "PreStreamLatestAguiAgent",
+        "class_name": "PreStreamLatestAguiAgent"
+      },
+      {
+        "name": "AutoContinueAguiAgent",
+        "class_name": "AutoContinueAguiAgent"
+      },
+      { "name": "AguiAgentToolChild", "class_name": "AguiAgentToolChild" },
+      { "name": "AguiAgentToolParent", "class_name": "AguiAgentToolParent" },
+      {
+        "name": "DetachedNotifyAguiAgent",
+        "class_name": "DetachedNotifyAguiAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "EchoAguiAgent",
+        "ToolCallAguiAgent",
+        "SlowAguiAgent",
+        "PlaintextAguiAgent",
+        "PreThrowAguiAgent",
+        "ErrorStreamAguiAgent",
+        "ApprovalAguiAgent",
+        "MaxPersistedAguiAgent",
+        "SaveMessagesAguiAgent",
+        "RecoveryAguiAgent",
+        "PreStreamAguiAgent",
+        "PreStreamLatestAguiAgent",
+        "AutoContinueAguiAgent",
+        "AguiAgentToolChild",
+        "AguiAgentToolParent",
+        "DetachedNotifyAguiAgent"
+      ]
+    }
+  ]
+}

@@ -310,12 +310,15 @@ describe("Message Sanitization", () => {
 
     const persisted = (await agentStub.getPersistedMessages()) as ChatMessage[];
     expect(persisted.length).toBe(1);
-    expect(persisted[0].parts.length).toBe(2);
-
-    // Non-OpenAI metadata should be preserved
-    const metaPart = persisted[0].parts[1] as {
+    // Post-cutover the two text parts merge into the assistant's single
+    // content string; the non-OpenAI metadata survives on it.
+    expect(persisted[0].parts.length).toBe(1);
+    const metaPart = persisted[0].parts[0] as {
+      text?: string;
       providerMetadata?: Record<string, unknown>;
     };
+    expect(metaPart.text).toContain("Just a plain message");
+    expect(metaPart.text).toContain("With non-OpenAI metadata");
     expect(metaPart.providerMetadata?.anthropic).toEqual({
       cacheControl: "ephemeral"
     });
@@ -718,14 +721,18 @@ describe("Message Sanitization", () => {
     const persisted = (await agentStub.getPersistedMessages()) as ChatMessage[];
     expect(persisted.length).toBe(1);
 
-    // Built-in should have stripped OpenAI metadata
-    const textPart = persisted[0].parts[0] as {
+    // Post-cutover part order within the assistant is [tool, text]; find
+    // parts by type rather than position.
+    const textPart = persisted[0].parts.find((p) => p.type === "text") as {
       providerMetadata?: Record<string, unknown>;
     };
+    // Built-in should have stripped OpenAI metadata
     expect(textPart.providerMetadata).toBeUndefined();
 
     // Custom hook should have redacted tool output
-    const toolPart = persisted[0].parts[1] as Record<string, unknown>;
+    const toolPart = persisted[0].parts.find((p) =>
+      p.type.startsWith("tool-")
+    ) as Record<string, unknown>;
     expect((toolPart.output as Record<string, unknown>).content).toBe(
       "[custom-redacted]"
     );
