@@ -38,6 +38,7 @@ import {
   type ToolMessage,
   type UserMessage
 } from "./agui-types";
+import type { SessionMessage, SessionMessagePart } from "../sessions/types";
 
 const AGUI_ROLES = new Set<AGUIRole>([
   "user",
@@ -168,6 +169,93 @@ function stripVersionMarker(persisted: PersistedAGUIMessage): AGUIMessage {
   const { _v, ...rest } = persisted;
   void _v;
   return rest as AGUIMessage;
+}
+
+// ----------------------------------------------------------------------------
+// Sessions row codec
+// ----------------------------------------------------------------------------
+
+/**
+ * Part type of a Sessions row that carries one AG-UI message. Sessions stores
+ * `{ id, role, parts[] }`; an AG-UI message has no `parts`, so it rides whole
+ * inside a single part. Rows without this part are upstream `UIMessage` rows.
+ */
+const AGUI_SESSION_PART_TYPE = "agui-message";
+
+const CANONICAL_BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** Rewrite the `source` of each multimodal entry in a user message. */
+function mapUserMediaSources(
+  message: unknown,
+  map: (source: Record<string, unknown>) => Record<string, unknown>
+): unknown {
+  if (
+    !isObject(message) ||
+    message.role !== "user" ||
+    !Array.isArray(message.content)
+  ) {
+    return message;
+  }
+  return {
+    ...message,
+    content: message.content.map((entry: unknown) =>
+      isObject(entry) && isObject(entry.source)
+        ? { ...entry, source: map(entry.source) }
+        : entry
+    )
+  };
+}
+
+/**
+ * Wrap an AG-UI message as the Sessions row that stores it (with the `_v`
+ * marker). Inline media (`{ type: "data", value, mimeType }`) is re-keyed to
+ * `{ data, mediaType }`, the shape Sessions lifts into its attachment store,
+ * so an image leaves the row instead of splitting it. Only canonical base64
+ * is re-keyed: Sessions re-encodes the bytes on read, and anything else
+ * would not come back character-for-character.
+ */
+export function toSessionMessage(message: AGUIMessage): SessionMessage {
+  const stored = mapUserMediaSources(
+    { ...message, _v: PERSISTED_MESSAGE_SCHEMA_VERSION },
+    (source) => {
+      const { value, mimeType, ...rest } = source;
+      return source.type === "data" &&
+        typeof mimeType === "string" &&
+        typeof value === "string" &&
+        value.length % 4 === 0 &&
+        CANONICAL_BASE64.test(value)
+        ? { ...rest, mediaType: mimeType, data: value }
+        : source;
+    }
+  );
+  return {
+    id: message.id,
+    role: message.role,
+    parts: [
+      { type: AGUI_SESSION_PART_TYPE, message: stored } as SessionMessagePart
+    ]
+  };
+}
+
+/**
+ * Undo {@link toSessionMessage}: the `_v`-marked AG-UI message a Sessions row
+ * carries. A row that is not such an envelope (an upstream `UIMessage`) is
+ * returned as it is; feed the result to {@link autoTransformAGUIMessages}.
+ */
+export function fromSessionMessage(row: unknown): unknown {
+  const part =
+    isObject(row) && Array.isArray(row.parts) && row.parts.length === 1
+      ? (row.parts[0] as unknown)
+      : undefined;
+  if (!isObject(part) || part.type !== AGUI_SESSION_PART_TYPE) return row;
+  return mapUserMediaSources(part.message, (source) => {
+    const { data, mediaType, ...rest } = source;
+    return source.type === "data" &&
+      typeof mediaType === "string" &&
+      typeof data === "string"
+      ? { ...rest, value: data, mimeType: mediaType }
+      : source;
+  });
 }
 
 // ----------------------------------------------------------------------------

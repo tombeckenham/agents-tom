@@ -94,16 +94,15 @@ import {
 } from "./chat/agui-message-builder";
 import {
   autoTransformAGUIMessages,
+  fromSessionMessage,
   isCleanAGUIMessage,
   isLegacyUIMessage,
-  isPersistedAGUIMessage
+  isPersistedAGUIMessage,
+  toSessionMessage
 } from "./chat/agui-migration";
 import { reconcileMessages } from "./chat/agui-message-reconciler";
 import {
-  byteLength as aguiByteLength,
-  enforceRowSizeLimit,
   isEmptyReasoningMessage,
-  ROW_MAX_BYTES,
   sanitizeAGUIMessage
 } from "./chat/agui-sanitize";
 import { AGUIStreamAccumulator } from "./chat/agui-stream-accumulator";
@@ -144,6 +143,7 @@ import {
   ChatStreamStalledError,
   iterateWithStallWatchdog
 } from "./chat/stall-watchdog";
+import { Sessions, type Session } from "./sessions";
 import type { Streams } from "./streams";
 import {
   type SubmitConcurrencyDecision,
@@ -376,6 +376,15 @@ function isWebSocketClosedSendError(error: unknown): boolean {
  * Lives next to the class because both the constructor (load path) and
  * `persistMessages` (write path) need it.
  */
+/** Session id of the engine's AG-UI transcript within {@link Sessions}. */
+const AGUI_SESSION_ID = "agui";
+
+/** Set once a legacy-table lift finished with rows it could not migrate. */
+const LEGACY_TABLE_LIFT_KEY = "cf_ai_chat:legacy_table_lift_incomplete";
+
+/** Set once a default-session lift finished with rows it could not migrate. */
+const UPSTREAM_SESSION_LIFT_KEY = "cf_ai_chat:upstream_session_lift_incomplete";
+
 function wrapPersistedShape(
   message: AGUIMessage
 ): AGUIMessage & { readonly _v: typeof PERSISTED_MESSAGE_SCHEMA_VERSION } {
@@ -430,6 +439,16 @@ export class AGUIChatAgent<
   Props extends object = object
 > extends Agent<Env, State, Props> {
   private _abortRegistry: AbortRegistry;
+
+  /**
+   * Sessions capability holding the transcript. The engine keeps its AG-UI
+   * rows in the {@link AGUI_SESSION_ID} session; the default session is where
+   * upstream `AIChatAgent` stored `UIMessage` rows, and is lifted on start.
+   */
+  readonly sessions = new Sessions();
+
+  /** The transcript: one AG-UI message per row, linear. */
+  protected readonly _session: Session = this.sessions.session(AGUI_SESSION_ID);
 
   /** Streams capability backing {@link _resumableStream}; mirrors AIChatAgent. */
   readonly streams: Streams = createChatStreams();
@@ -519,6 +538,26 @@ export class AGUIChatAgent<
 
   /** JSON cache for incremental persistence (skip SQL writes for unchanged rows). */
   private _persistedMessageCache: Map<string, string> = new Map();
+
+  /**
+   * The transcript as stored, in storage order, kept in step by the Sessions
+   * change feed. {@link _aguiMessages} is re-derived from it after each
+   * persist, so a row the engine adopted early but never stored drops out.
+   */
+  private _storedMessages: AGUIMessage[] = [];
+
+  /**
+   * The finished stream waiting for its message write. Rides on the instance,
+   * not on an argument, so a subclass overriding {@link persistMessages} and
+   * forwarding only the messages still gets the atomic stream to session
+   * cutover. Consumed by the first persist carrying one of the turn's
+   * messages.
+   */
+  private _pendingCutover: {
+    streamId: string;
+    messageIds: ReadonlySet<string>;
+    discard: boolean;
+  } | null = null;
 
   /**
    * Shared auto-continuation barrier (#1649 / #1650): owns the coalesce timer
@@ -664,12 +703,8 @@ export class AGUIChatAgent<
 
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
+    this.lifecycle.use(this.sessions);
     this.lifecycle.use(this.streams);
-    this.sql`create table if not exists cf_ai_chat_agent_messages (
-			id text primary key,
-			message text not null,
-			created_at datetime default current_timestamp
-		)`;
 
     this.sql`create table if not exists cf_ai_chat_request_context (
 			key text primary key,
@@ -685,8 +720,24 @@ export class AGUIChatAgent<
       this.sql.bind(this)
     );
 
-    const rawMessages = this._loadMessagesFromDb();
-    this._aguiMessages = autoTransformAGUIMessages(rawMessages);
+    // The transcript lives in Sessions, which starts with the Lifecycle: the
+    // constructor never reads it. Legacy lifts and hydration run in `onStart`.
+    this._session.mirror<AGUIMessage>({
+      get: () => this._storedMessages,
+      set: (messages) => {
+        this._storedMessages = messages;
+      },
+      transform: (row) =>
+        autoTransformAGUIMessages([fromSessionMessage(row)])[0] ??
+        (row as unknown as AGUIMessage)
+    });
+    const _onStart = this.onStart.bind(this);
+    this.onStart = async (props?: Props) => {
+      await this._migrateLegacyMessages();
+      await this._liftUpstreamSession();
+      await this._hydrateMessages();
+      return _onStart(props);
+    };
 
     this._abortRegistry = new AbortRegistry();
 
@@ -756,24 +807,9 @@ export class AGUIChatAgent<
       return this._tryCatchChat(async () => {
         const url = new URL(request.url);
         if (url.pathname.split("/").pop() === "get-messages") {
-          // Structural validation on read (legacy parity): unrecognized rows
-          // are skipped with a warning; recognized rows are served verbatim
-          // (including the `_v` marker) — consumers run the migration.
-          return Response.json(
-            this._loadMessagesFromDb().filter((row) => {
-              const recognized =
-                isPersistedAGUIMessage(row) ||
-                isLegacyUIMessage(row) ||
-                isCleanAGUIMessage(row);
-              if (!recognized) {
-                console.warn(
-                  "[AGUIChatAgent] Skipping malformed persisted message row on /get-messages",
-                  row
-                );
-              }
-              return recognized;
-            })
-          );
+          // ponytail: served from the hydrated mirror in one body; stream
+          // `_session.historyBatches()` if hydration ever becomes windowed.
+          return Response.json(this._serializeTranscript(this._storedMessages));
         }
         return _onRequest(request);
       });
@@ -1117,7 +1153,7 @@ export class AGUIChatAgent<
 
   private async _handleChatClear(connection: Connection): Promise<boolean> {
     this.resetTurnState();
-    this.sql`delete from cf_ai_chat_agent_messages`;
+    await this._session.clearMessages();
     // Drop any pending terminal record (#1645) so a stale exhaustion can't
     // replay onto a freshly-cleared conversation.
     await this._clearChatTerminal();
@@ -1532,30 +1568,158 @@ export class AGUIChatAgent<
   // Persistence
   // ──────────────────────────────────────────────────────────────────
 
-  private _loadMessagesFromDb(): unknown[] {
-    const rows =
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      [];
-    this._persistedMessageCache.clear();
-    return rows
-      .map((row) => {
-        try {
-          const messageStr = row.message as string;
-          const parsed = JSON.parse(messageStr) as unknown;
-          const id =
-            parsed && typeof parsed === "object" && "id" in parsed
-              ? (parsed as { id: unknown }).id
-              : undefined;
-          if (typeof id === "string") {
-            this._persistedMessageCache.set(id, messageStr);
-          }
-          return parsed;
-        } catch (error) {
-          console.error(`Failed to parse message ${row.id}:`, error);
-          return null;
-        }
+  /**
+   * Lift the pre-Sessions `cf_ai_chat_agent_messages` table into the
+   * transcript and drop it. Its rows are legacy AI SDK messages, the engine's
+   * own `_v` AG-UI rows, or a mix; each is normalized on the way. Dropped
+   * rather than renamed: keeping it would hold the history twice.
+   */
+  private async _migrateLegacyMessages(): Promise<void> {
+    const present =
+      this.ctx.storage.sql
+        .exec(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'table' AND name = 'cf_ai_chat_agent_messages'`
+        )
+        .toArray().length > 0;
+    if (!present) return;
+
+    const complete = await this._liftRows(LEGACY_TABLE_LIFT_KEY, () =>
+      // Ids only: bodies are read one at a time, so a large transcript never
+      // sits in the isolate twice.
+      this.sql<{ id: string; created_at: string | number | null }>`
+        select id, created_at from cf_ai_chat_agent_messages
+        order by created_at asc, rowid asc
+      `.map((row, index) => {
+        const parsedTime =
+          typeof row.created_at === "number"
+            ? row.created_at
+            : Date.parse(String(row.created_at ?? ""));
+        return {
+          id: row.id,
+          createdAt: Number.isFinite(parsedTime) ? parsedTime : index,
+          read: () =>
+            JSON.parse(
+              this.sql<{ message: string }>`
+                select message from cf_ai_chat_agent_messages
+                where id = ${row.id}
+              `[0].message
+            ) as unknown
+        };
       })
-      .filter((m): m is unknown => m !== null);
+    );
+    if (complete) {
+      this.ctx.storage.sql.exec("DROP TABLE cf_ai_chat_agent_messages");
+    }
+  }
+
+  /**
+   * Lift a transcript upstream `AIChatAgent` stored in the default session
+   * (`UIMessage` rows) into the AG-UI transcript, then clear the source.
+   * Rows are read raw, so a compaction overlay never stands in for the
+   * messages it summarizes.
+   */
+  private async _liftUpstreamSession(): Promise<void> {
+    const source = this.sessions.session();
+    const path = await source.getHistoryRowStats();
+    if (path.length === 0) return;
+    const now = Date.now();
+    const complete = await this._liftRows(UPSTREAM_SESSION_LIFT_KEY, () =>
+      path.map(({ id }) => ({
+        id,
+        createdAt: now,
+        read: () => source.getMessage(id)
+      }))
+    );
+    if (complete) await source.clearMessages();
+  }
+
+  /**
+   * Append source rows, in order, to the transcript. A message the
+   * transcript already holds is left alone and every new one is chained to
+   * the current tail, so a lift interrupted by a crash resumes on the next
+   * start. Returns whether every row landed: the caller deletes its source
+   * only then.
+   *
+   * A pass that ends with rows it could not read is recorded under `key` and
+   * never repeated; the source stays for manual recovery. Repeating it would
+   * re-append any lifted message the user has deleted since.
+   */
+  private async _liftRows(
+    key: string,
+    rows: () => Array<{
+      id: string;
+      createdAt: number;
+      read(): unknown | Promise<unknown>;
+    }>
+  ): Promise<boolean> {
+    if (await this.ctx.storage.get<boolean>(key)) return false;
+    const stored = await this._session.getHistoryRowStats();
+    const existing = new Set(stored.map((row) => row.id));
+    let parentId = stored.at(-1)?.id ?? null;
+    let skipped = 0;
+    for (const row of rows()) {
+      try {
+        const raw = await row.read();
+        if (
+          !isPersistedAGUIMessage(raw) &&
+          !isLegacyUIMessage(raw) &&
+          !isCleanAGUIMessage(raw)
+        ) {
+          throw new Error("missing or malformed id, role, or content");
+        }
+        for (const message of autoTransformAGUIMessages([raw])) {
+          if (existing.has(message.id)) continue;
+          await this._session.importMessage(toSessionMessage(message), {
+            parentId,
+            createdAt: row.createdAt
+          });
+          existing.add(message.id);
+          parentId = message.id;
+        }
+      } catch (error) {
+        console.error(
+          `[AGUIChatAgent] Failed to migrate message ${row.id}:`,
+          error
+        );
+        skipped++;
+      }
+    }
+    if (skipped === 0) return true;
+    await this.ctx.storage.put(key, true);
+    console.error(
+      `[AGUIChatAgent] Transcript lift (${key}) could not migrate ${skipped} ` +
+        "rows; leaving the source in place so they remain recoverable."
+    );
+    return false;
+  }
+
+  /**
+   * Hydrate the transcript once per wake; every later change arrives
+   * through the Sessions change feed.
+   */
+  private async _hydrateMessages(): Promise<void> {
+    // ponytail: hydrates the whole transcript, as the table-backed engine
+    // did. Upstream's `hydrationByteBudget` window is not ported: retention
+    // and /get-messages read this mirror, and a window can cut an assistant
+    // from its tool rows. Window it here if isolate memory becomes a problem.
+    const rows = await this._session.getHistory();
+    this._storedMessages = autoTransformAGUIMessages(
+      rows.map((row) => fromSessionMessage(row))
+    );
+    this._persistedMessageCache.clear();
+    for (const message of this._storedMessages) {
+      this._persistedMessageCache.set(message.id, JSON.stringify(message));
+    }
+    this._aguiMessages = [...this._storedMessages];
+  }
+
+  /**
+   * The transcript as `/get-messages` serves it: AG-UI rows with the `_v`
+   * marker. A projection layer overrides this to serve its own vocabulary.
+   */
+  protected _serializeTranscript(messages: readonly AGUIMessage[]): unknown[] {
+    return messages.map((message) => wrapPersistedShape(message));
   }
 
   async persistMessages(
@@ -1569,29 +1733,54 @@ export class AGUIChatAgent<
       (msg) => this._sanitizeMessageForPersistence(msg, messages)
     );
 
+    // Nothing is truncated or skipped for size: Sessions splits a message
+    // larger than one row across continuation rows.
+    const toWrite: Array<{ message: AGUIMessage; json: string }> = [];
     for (const message of mergedMessages) {
       if (isEmptyReasoningMessage(message)) continue;
       const sanitized = this._sanitizeMessageForPersistence(
         message,
         mergedMessages
       );
-      const safe = enforceRowSizeLimit(sanitized);
-      const persisted = wrapPersistedShape(safe);
-      const json = JSON.stringify(persisted);
+      const json = JSON.stringify(sanitized);
+      if (this._persistedMessageCache.get(sanitized.id) === json) continue;
+      toWrite.push({ message: sanitized, json });
+    }
 
-      if (this._persistedMessageCache.get(safe.id) === json) continue;
-      if (aguiByteLength(json) > ROW_MAX_BYTES) {
-        console.warn(
-          `[AGUIChatAgent] Skipping persist of ${safe.id}: row exceeds size limit after enforcement`
+    // The cutover: a persist that carries the finished turn's messages lands
+    // every changed message in the same transaction that settles the stream
+    // and drops its rows. A persist of other messages (an override writing
+    // its own first) takes the plain path and leaves the cutover pending.
+    // The change feed runs once the transaction has committed.
+    const cutover = this._pendingCutover;
+    if (cutover && mergedMessages.some((m) => cutover.messageIds.has(m.id))) {
+      this._pendingCutover = null;
+      const sync = this._session.__DO_NOT_USE_WILL_BREAK__sync();
+      const afters: Array<() => Promise<void>> = [];
+      try {
+        this._resumableStream.cutover(
+          cutover.streamId,
+          () => {
+            for (const { message } of toWrite) {
+              afters.push(sync.upsert(toSessionMessage(message)).after);
+            }
+          },
+          { discard: cutover.discard }
         );
-        continue;
+      } catch (error) {
+        // The settle transaction rolled back: no row landed, but the
+        // session's in-memory caches already counted the writes.
+        sync.abandon();
+        throw error;
       }
-      this.sql`
-				insert into cf_ai_chat_agent_messages (id, message)
-				values (${safe.id}, ${json})
-				on conflict(id) do update set message = excluded.message
-			`;
-      this._persistedMessageCache.set(safe.id, json);
+      for (const after of afters) await after();
+    } else {
+      for (const { message } of toWrite) {
+        await this._session.upsertMessage(toSessionMessage(message));
+      }
+    }
+    for (const { message, json } of toWrite) {
+      this._persistedMessageCache.set(message.id, json);
     }
 
     if (options?._deleteStaleRows) {
@@ -1599,25 +1788,22 @@ export class AGUIChatAgent<
       const isSubsetOfServer = mergedMessages.every((m) => serverIds.has(m.id));
       if (isSubsetOfServer) {
         const keepIds = new Set(mergedMessages.map((m) => m.id));
-        const allDbRows =
-          this.sql<{ id: string }>`select id from cf_ai_chat_agent_messages` ||
-          [];
-        for (const row of allDbRows) {
-          if (!keepIds.has(row.id)) {
-            this
-              .sql`delete from cf_ai_chat_agent_messages where id = ${row.id}`;
-            this._persistedMessageCache.delete(row.id);
-          }
-        }
+        await this._deleteMessagesByIds(
+          this._storedMessages.map((m) => m.id).filter((id) => !keepIds.has(id))
+        );
       }
     }
 
     if (this.maxPersistedMessages != null) {
-      this._enforceMaxPersistedMessages();
+      const excess = this._storedMessages.length - this.maxPersistedMessages;
+      if (excess > 0) {
+        await this._deleteMessagesByIds(
+          this._storedMessages.slice(0, excess).map((m) => m.id)
+        );
+      }
     }
 
-    const persistedRows = this._loadMessagesFromDb();
-    this._aguiMessages = autoTransformAGUIMessages(persistedRows);
+    this._aguiMessages = [...this._storedMessages];
     this._broadcastChatMessage(
       {
         messages: mergedMessages,
@@ -1641,25 +1827,14 @@ export class AGUIChatAgent<
     return this.sanitizeMessageForPersistence(base);
   }
 
-  private _enforceMaxPersistedMessages() {
-    if (this.maxPersistedMessages == null) return;
-    const countResult = this.sql<{ cnt: number }>`
-			select count(*) as cnt from cf_ai_chat_agent_messages
-		`;
-    const count = countResult?.[0]?.cnt ?? 0;
-    if (count <= this.maxPersistedMessages) return;
-    const excess = count - this.maxPersistedMessages;
-    const toDelete = this.sql<{ id: string }>`
-			select id from cf_ai_chat_agent_messages
-			order by created_at asc
-			limit ${excess}
-		`;
-    if (toDelete && toDelete.length > 0) {
-      for (const row of toDelete) {
-        this.sql`delete from cf_ai_chat_agent_messages where id = ${row.id}`;
-        this._persistedMessageCache.delete(row.id);
-      }
-    }
+  /**
+   * Delete transcript rows through Sessions, which splices each row's
+   * children to its parent; the change feed drops them from the mirror.
+   */
+  private async _deleteMessagesByIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this._session.deleteMessages(ids);
+    for (const id of ids) this._persistedMessageCache.delete(id);
   }
 
   private _restoreRequestContext() {
@@ -2433,12 +2608,11 @@ export class AGUIChatAgent<
           this._markStreamError(streamId);
         }
 
-        if (accumulator.messages.length > 0) {
-          await this._persistStreamResult(
-            accumulator.messages,
-            excludeBroadcastIds
-          );
-        }
+        await this._persistFinishedTurn(
+          { streamId, requestId: id },
+          accumulator.messages,
+          excludeBroadcastIds
+        );
 
         this._pendingChatResponseResults.push({
           messages: [...accumulator.messages],
@@ -2567,7 +2741,7 @@ export class AGUIChatAgent<
             continuation
           );
         }
-        this._completeStream(streamId);
+        this._finishStream(streamId);
         this._broadcastChatMessage({
           body: "",
           done: true,
@@ -2602,7 +2776,7 @@ export class AGUIChatAgent<
     // abort path. Finish the stream unconditionally anyway: if that invariant
     // ever changes, a client must still get a terminal frame rather than be
     // stranded mid-stream.
-    this._completeStream(streamId);
+    this._finishStream(streamId);
     this._broadcastChatMessage({
       body: "",
       done: true,
@@ -2715,7 +2889,7 @@ export class AGUIChatAgent<
           id,
           continuation
         );
-        this._completeStream(streamId);
+        this._finishStream(streamId);
         this._broadcastChatMessage({
           body: "",
           done: true,
@@ -2744,7 +2918,7 @@ export class AGUIChatAgent<
       id,
       continuation
     );
-    this._completeStream(streamId);
+    this._finishStream(streamId);
     this._broadcastChatMessage({
       body: "",
       done: true,
@@ -2775,33 +2949,59 @@ export class AGUIChatAgent<
   }
 
   private _persistApprovalSnapshot(messages: readonly AGUIMessage[]): void {
-    // Direct SQL insert (no broadcast) — clients already have the data
+    // Direct synchronous write (no broadcast) — clients already have the data
     // from the live event stream; broadcasting would double-render.
+    const sync = this._session.__DO_NOT_USE_WILL_BREAK__sync();
     for (const m of messages) {
       if (isEmptyReasoningMessage(m)) continue;
       const sanitized = this._sanitizeMessageForPersistence(m, messages);
-      const safe = enforceRowSizeLimit(sanitized);
-      const persisted = wrapPersistedShape(safe);
-      const json = JSON.stringify(persisted);
-      // Same guard as `persistMessages`: an oversized row would throw here and
-      // surface as a terminal stream error rather than a skipped snapshot.
-      if (aguiByteLength(json) > ROW_MAX_BYTES) {
-        console.warn(
-          `[AGUIChatAgent] Skipping approval snapshot of ${safe.id}: row exceeds size limit after enforcement`
-        );
-        continue;
-      }
-      this.sql`
-				insert into cf_ai_chat_agent_messages (id, message)
-				values (${safe.id}, ${json})
-				on conflict(id) do update set message = excluded.message
-			`;
-      this._persistedMessageCache.set(safe.id, json);
+      const json = JSON.stringify(sanitized);
+      if (this._persistedMessageCache.get(sanitized.id) === json) continue;
+      const { after } = sync.upsert(toSessionMessage(sanitized));
+      this._persistedMessageCache.set(sanitized.id, json);
+      // The row is committed; `after` only feeds the stored-transcript mirror.
+      void after().catch((error) =>
+        console.error("[AGUIChatAgent] approval snapshot change feed", error)
+      );
     }
     const last = messages.find(
       (m): m is AssistantMessage => m.role === "assistant"
     );
     if (last) this._approvalPersistedAssistantId = last.id;
+  }
+
+  /**
+   * Persist a finished turn and cut its stream over: when the stream is
+   * awaiting settlement ({@link _finishStream}), the persist carrying the
+   * turn's messages settles it and drops its rows in one transaction (see
+   * {@link _pendingCutover}). Agent-tool child turns keep their rows (the
+   * parent tails the stored chunks after completion); the next stream start
+   * reclaims them.
+   */
+  private async _persistFinishedTurn(
+    stream: { streamId: string; requestId: string },
+    streamedMessages: readonly AGUIMessage[],
+    excludeBroadcastIds: string[]
+  ): Promise<void> {
+    this._pendingCutover =
+      this._resumableStream.pendingCutoverId === stream.streamId
+        ? {
+            streamId: stream.streamId,
+            messageIds: new Set(streamedMessages.map((m) => m.id)),
+            discard: !this._agentToolRunForRequest(stream.requestId)
+          }
+        : null;
+    try {
+      if (streamedMessages.length > 0) {
+        await this._persistStreamResult(streamedMessages, excludeBroadcastIds);
+      }
+    } finally {
+      // Nothing to persist, the persist threw, or an override never reached
+      // the session write: settle the stream so it is not mistaken for an
+      // interrupted turn.
+      this._pendingCutover = null;
+      this._resumableStream.finalizePending();
+    }
   }
 
   private async _persistStreamResult(
@@ -3097,6 +3297,21 @@ export class AGUIChatAgent<
     this._resumableStream.complete(streamId);
     this._pendingResumeConnections.clear();
     if (completedRequestId === this._continuation.activeRequestId) {
+      this._continuation.activeRequestId = null;
+      this._continuation.activeConnectionId = null;
+    }
+  }
+
+  /**
+   * The producer finished; leave the row for the cutover that persists the
+   * turn's messages ({@link _persistFinishedTurn}), which also settles the
+   * stream when no persist follows.
+   */
+  protected _finishStream(streamId: string) {
+    const finishedRequestId = this._resumableStream.activeRequestId;
+    this._resumableStream.finish(streamId);
+    this._pendingResumeConnections.clear();
+    if (finishedRequestId === this._continuation.activeRequestId) {
       this._continuation.activeRequestId = null;
       this._continuation.activeConnectionId = null;
     }
