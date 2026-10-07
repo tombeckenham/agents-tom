@@ -32,6 +32,11 @@ import type {
   SaveMessagesResult
 } from "../chat/lifecycle";
 import { CF_TOOL_APPROVAL_REQUEST, type AGUIEvent } from "../chat/agui-types";
+import {
+  autoTransformAGUIMessages,
+  fromSessionMessage
+} from "../chat/agui-migration";
+import type { SessionMessage } from "../sessions";
 
 function sseResponse(
   events: AGUIEvent[],
@@ -143,6 +148,75 @@ export class EchoAguiAgent extends AGUIChatAgent<Env> {
     return sseResponse(
       textRunEvents(`assistant-${Date.now()}`, ["Hello ", "world"])
     );
+  }
+
+  // ── Storage starting states (sessions-storage.test.ts) ─────────────
+
+  /** The pre-Sessions table, as either older build left it. */
+  seedLegacyTableForTest(rows: Array<{ id: string; message: string }>): void {
+    this.sql`
+      create table cf_ai_chat_agent_messages (
+        id text primary key,
+        message text not null,
+        created_at datetime default current_timestamp
+      )
+    `;
+    rows.forEach((row, index) => {
+      this.sql`
+        insert into cf_ai_chat_agent_messages (id, message, created_at)
+        values (${row.id}, ${row.message}, ${`2026-01-01 00:00:0${index}`})
+      `;
+    });
+  }
+
+  /** Upstream `AIChatAgent` storage: `UIMessage` rows in the default session. */
+  async seedUpstreamSessionForTest(messages: SessionMessage[]): Promise<void> {
+    for (const message of messages) {
+      await this.sessions.session().appendMessage(message);
+    }
+  }
+
+  async persistForTest(messages: AGUIMessage[]): Promise<void> {
+    await this.__unsafe_ensureInitialized();
+    await this.persistMessages(messages);
+  }
+
+  async clearTranscriptForTest(): Promise<void> {
+    await this._session.clearMessages();
+  }
+
+  async storageStateForTest(): Promise<{
+    messages: AGUIMessage[];
+    stored: AGUIMessage[];
+    legacyTables: string[];
+    upstreamRows: number;
+    continuationRows: number;
+    attachments: number;
+  }> {
+    // Native RPC bypasses fetch: start the lifecycle so `messages` is hydrated.
+    await this.__unsafe_ensureInitialized();
+    const count = (table: string) =>
+      Number(
+        this.ctx.storage.sql
+          .exec(`select count(*) as count from ${table}`)
+          .one().count
+      );
+    return {
+      messages: this.messages,
+      stored: autoTransformAGUIMessages(
+        (await this._session.getHistory()).map((row) => fromSessionMessage(row))
+      ),
+      legacyTables: this.ctx.storage.sql
+        .exec(
+          `select name from sqlite_master
+           where type = 'table' and name like 'cf_ai_chat_agent_messages%'`
+        )
+        .toArray()
+        .map((row) => String(row.name)),
+      upstreamRows: (await this.sessions.session().getHistoryRowStats()).length,
+      continuationRows: count("cf_agents_session_message_chunks"),
+      attachments: count("cf_agents_session_attachment_refs")
+    };
   }
 }
 
@@ -810,11 +884,11 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
     return this.recoveryContexts;
   }
 
-  getPersistedMessages(): AGUIMessage[] {
-    return (
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      []
-    ).map((row) => JSON.parse(row.message as string));
+  /** The stored transcript: `_v`-marked AG-UI rows read back from Sessions. */
+  async getPersistedMessages(): Promise<AGUIMessage[]> {
+    return (await this._session.getHistory()).map(
+      (row) => fromSessionMessage(row) as AGUIMessage
+    );
   }
 
   getActiveFibers(): Array<{ id: string; name: string }> {

@@ -1376,24 +1376,23 @@ For more details, see [Resumable Streaming](./resumable-streaming.md).
 
 ### Persisted row format
 
-`AIChatAgent` stores conversations as AG-UI rows, marked with `_v: "v6_agui_message"`. This is an implementation detail for most applications — `this.messages`, `onChatResponse`, and `useAgentChat` all speak `UIMessage` — but it is visible if you read the table directly, and it differs from the `UIMessage` rows written by releases before `@cloudflare/ai-chat` v1.
+`AIChatAgent` stores conversations in [Sessions](./sessions.md), one AG-UI message per row, in the session named `"agui"`. Each message is marked with `_v: "v6_agui_message"`. This is an implementation detail for most applications — `this.messages`, `onChatResponse`, `useAgentChat`, and the `/get-messages` route all speak `UIMessage` — but it is visible if you read the session directly, and it differs from the `UIMessage` rows written by earlier releases.
 
-Two consequences follow from the row shape:
+Three consequences follow from the row shape:
 
 - **Tool results are separate rows** with `role: "tool"`, matched to their call by `toolCallId`. `UIMessage` folds them onto the assistant turn instead. This is what makes `maxPersistedMessages` count differently — see [`maxPersistedMessages`](#maxpersistedmessages).
-- **Legacy rows migrate on first load**, one way. The first time an agent with pre-v1 rows loads its history, those rows are rewritten in the AG-UI shape. There is no automatic path back.
+- **Earlier transcripts migrate on first start**, one way. Rows in the `cf_ai_chat_agent_messages` table and `UIMessage` rows in the default session are moved into the `"agui"` session in the AG-UI shape, and the source is removed. A source holding a row that cannot be migrated is left in place. There is no automatic path back.
+- **No message is too large to store.** A message larger than one SQLite row is split across rows, and inline images move to the attachment store. Both are read back unchanged.
 
-To read persisted rows as `UIMessage[]` yourself, project them with `toUIMessages`:
+To read stored rows as `UIMessage[]` yourself, unwrap them with `fromSessionMessage` and project them with `toUIMessages`:
 
 ```typescript
 import { toUIMessages } from "@cloudflare/ai-chat";
-import type { AGUIMessage } from "agents/chat/agui-types";
+import { autoTransformAGUIMessages, fromSessionMessage } from "agents/chat";
 
-const rows =
-  this.sql`select message from cf_ai_chat_agent_messages order by created_at` ??
-  [];
+const rows = await this.sessions.session("agui").getHistory();
 const messages = toUIMessages(
-  rows.map((row) => JSON.parse(row.message as string) as AGUIMessage)
+  autoTransformAGUIMessages(rows.map((row) => fromSessionMessage(row)))
 );
 ```
 

@@ -216,8 +216,11 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
     );
     await client.waitFor(isDone("req-1"));
     sendToolApproval(client, "call-approval-1", approved);
-    // The continuation is a server-initiated stream: ack the resume offer so
-    // its chunks replay, then wait for the outcome text.
+    // The continuation is a server-initiated stream: ack the resume offer,
+    // then wait for the outcome text. An ACK that lands while the stream is
+    // live replays its chunks; one that lands after the stream → session
+    // cutover has no chunks left to replay, and the outcome arrives in the
+    // transcript broadcast instead.
     const resuming = await client.waitFor(
       (f: WireFrame) => f.type === MessageType.CF_AGENT_STREAM_RESUMING
     );
@@ -227,12 +230,21 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
         id: resuming.id
       })
     );
-    await client.waitFor(
-      (f: WireFrame) =>
+    await client.waitFor((f: WireFrame) => {
+      if (
         typeof f.body === "object" &&
         f.body !== null &&
         (f.body as { delta?: string }).delta === finalText
-    );
+      ) {
+        return true;
+      }
+      const { messages } = f as { messages?: Array<{ content?: unknown }> };
+      return (
+        f.type === MessageType.CF_AGENT_CHAT_MESSAGES &&
+        Array.isArray(messages) &&
+        messages.some((message) => message.content === finalText)
+      );
+    });
     expect(await stub.stable()).toBe(true);
     return { client, stub };
   }
