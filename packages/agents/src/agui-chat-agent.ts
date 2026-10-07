@@ -2774,15 +2774,26 @@ export class AGUIChatAgent<
     // their UI from the raw event stream.
     const body = JSON.stringify(event);
     const seq = await this._storeStreamChunk(streamId, body);
+    if (event.type === "RUN_ERROR") {
+      // Live, an in-band error is the protocol's error frame (the message as
+      // its body), terminal for clients and so held with the done frame. The
+      // event itself stays in the stream log for replay (#1575).
+      this._broadcastChatMessage({
+        body: event.message,
+        done: false,
+        error: true,
+        id,
+        type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+        ...(continuation && { continuation: true })
+      });
+      return;
+    }
     this._broadcastChatMessage({
       body,
       done: false,
       id,
       type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
       ...(seq !== undefined && { seq }),
-      // Clients end the turn on RUN_ERROR, so its frame is terminal: marked
-      // `error` (the body stays the event) and held with the done frame.
-      ...(event.type === "RUN_ERROR" && { error: true }),
       ...(continuation && { continuation: true })
     });
     // Action is consumed for side-effects only (approval persist above);

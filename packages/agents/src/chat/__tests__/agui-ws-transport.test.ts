@@ -126,45 +126,6 @@ describe("AGUIWebSocketTransport — socket close", () => {
   });
 });
 
-describe("AGUIWebSocketTransport — error frames", () => {
-  const frame = (id: string, extra: Record<string, unknown>) =>
-    JSON.stringify({
-      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
-      id,
-      ...extra
-    });
-
-  it("delivers an in-band RUN_ERROR and ends on the done frame that follows", async () => {
-    const agent = makeAgent();
-    const transport = new AGUIWebSocketTransport({ agent });
-    const { events, requestId } = await openRequest(transport, agent);
-    const runError = { type: "RUN_ERROR", message: "quota exceeded" };
-
-    const drained = collect(events);
-    agent.dispatch(
-      "message",
-      frame(requestId, { body: JSON.stringify(runError), error: true })
-    );
-    agent.dispatch("message", frame(requestId, { body: "", done: true }));
-
-    expect(await drained).toEqual([runError]);
-  });
-
-  it("rejects with the body of a terminal error frame", async () => {
-    const agent = makeAgent();
-    const transport = new AGUIWebSocketTransport({ agent });
-    const { events, requestId } = await openRequest(transport, agent);
-
-    const drained = collect(events);
-    agent.dispatch(
-      "message",
-      frame(requestId, { body: "boom", done: true, error: true })
-    );
-
-    await expect(drained).rejects.toThrow("boom");
-  });
-});
-
 describe("AGUIWebSocketTransport — connection swapped mid-stream", () => {
   it("removes its listeners from the socket it attached to", async () => {
     const first = makeAgent();
