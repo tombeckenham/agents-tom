@@ -521,6 +521,17 @@ export function projectChunkStreamToAGUISSE(
   const projector = new ChunkToEventProjector(options);
   const encoder = new TextEncoder();
   const reader = chunks.getReader();
+  // Text parts this response has opened. A `text-delta` with no `text-start`
+  // still opens a text part in the AI SDK message builder, so a whole
+  // response opens the AG-UI message for it too. (The projector itself
+  // cannot: it also translates mid-stream fragments.)
+  const openedText = new Set<string | undefined>();
+  const withImplicitTextStart = (chunk: UIMessageChunk): UIMessageChunk[] => {
+    if (chunk.type === "text-start") openedText.add(chunk.id);
+    if (chunk.type !== "text-delta" || openedText.has(chunk.id)) return [chunk];
+    openedText.add(chunk.id);
+    return [{ type: "text-start", id: chunk.id }, chunk];
+  };
 
   return new ReadableStream<Uint8Array>({
     // Same contract as parseUIMessageSSE's pull: never resolve without
@@ -539,7 +550,9 @@ export function projectChunkStreamToAGUISSE(
             controller.close();
             return;
           }
-          for (const event of projector.project(value)) {
+          for (const event of withImplicitTextStart(value).flatMap((chunk) =>
+            projector.project(chunk)
+          )) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
             );

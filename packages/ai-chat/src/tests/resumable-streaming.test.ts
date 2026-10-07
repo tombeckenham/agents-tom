@@ -1,7 +1,11 @@
 import { env } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { MessageType, type OutgoingMessage } from "../types";
-import { connectChatWS, isUseChatResponseMessage } from "./test-utils";
+import {
+  connectChatWS,
+  connectChatWSRaw,
+  isUseChatResponseMessage
+} from "./test-utils";
 import { getAgentByName } from "agents";
 
 function isStreamResumingMessage(
@@ -1185,15 +1189,15 @@ describe("Resumable Streaming", () => {
       const liveSeqs = [
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-start","id":"t1"}'
+          '{"type":"TEXT_MESSAGE_START","messageId":"t1","role":"assistant"}'
         ),
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-delta","id":"t1","delta":"a"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"a"}'
         ),
         await agentStub.testStoreStreamChunk(
           streamId,
-          '{"type":"text-delta","id":"t1","delta":"b"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"b"}'
         )
       ];
       expect(liveSeqs).toEqual([0, 1, 2]);
@@ -1201,7 +1205,9 @@ describe("Resumable Streaming", () => {
       ws1.close();
       await new Promise((r) => setTimeout(r, 50));
 
-      const { ws: ws2 } = await connectChatWS(
+      // Raw AG-UI wire: `seq` indexes stored events, and the legacy
+      // projection can turn one event into several chunks.
+      const { ws: ws2 } = await connectChatWSRaw(
         `/agents/test-chat-agent/${room}`
       );
       const messages2 = collectMessages(ws2);
@@ -1248,11 +1254,11 @@ describe("Resumable Streaming", () => {
       });
       await agentStub.testStoreStreamChunk(
         first,
-        '{"type":"text-start","id":"t1"}'
+        '{"type":"TEXT_MESSAGE_START","messageId":"t1","role":"assistant"}'
       );
       await agentStub.testStoreStreamChunk(
         first,
-        '{"type":"text-delta","id":"t1","delta":"a"}'
+        '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1","delta":"a"}'
       );
       await agentStub.testCompleteStream(first);
 
@@ -1262,11 +1268,11 @@ describe("Resumable Streaming", () => {
       const liveSeqs = [
         await agentStub.testStoreStreamChunk(
           retry,
-          '{"type":"text-start","id":"t2"}'
+          '{"type":"TEXT_MESSAGE_START","messageId":"t2","role":"assistant"}'
         ),
         await agentStub.testStoreStreamChunk(
           retry,
-          '{"type":"text-delta","id":"t2","delta":"b"}'
+          '{"type":"TEXT_MESSAGE_CONTENT","messageId":"t2","delta":"b"}'
         )
       ];
       expect(liveSeqs).toEqual([2, 3]);
@@ -1274,7 +1280,9 @@ describe("Resumable Streaming", () => {
       ws1.close();
       await new Promise((r) => setTimeout(r, 50));
 
-      const { ws: ws2 } = await connectChatWS(
+      // Raw AG-UI wire: `seq` indexes stored events, and the legacy
+      // projection can turn one event into several chunks.
+      const { ws: ws2 } = await connectChatWSRaw(
         `/agents/test-chat-agent/${room}`
       );
       const messages2 = collectMessages(ws2);

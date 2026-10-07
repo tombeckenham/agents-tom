@@ -1517,7 +1517,9 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
           if (format === "sse") {
             const chunk = JSON.stringify({
               type: "text-delta",
-              textDelta: `chunk-${i} `
+              // AI SDK field name: the engine translates chunks, so a
+              // non-protocol `textDelta` would carry no text through it.
+              delta: `chunk-${i} `
             });
             controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
           } else {
@@ -1903,7 +1905,9 @@ export class ResponseAgent extends AIChatAgent<Env> {
           if (format === "sse") {
             const chunk = JSON.stringify({
               type: "text-delta",
-              textDelta: `chunk-${i} `
+              // AI SDK field name: the engine translates chunks, so a
+              // non-protocol `textDelta` would carry no text through it.
+              delta: `chunk-${i} `
             });
             controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
           } else {
