@@ -37,6 +37,7 @@ import {
   AgentToolProgressEmitter,
   interceptAgentToolBroadcast
 } from "./chat/agent-tools";
+import { isPositionlessAgentToolChunk } from "./agent-tool-types";
 import { isDurableObjectMemoryLimitReset } from "./retries";
 import { AbortRegistry } from "./chat/abort-registry";
 import {
@@ -5009,8 +5010,12 @@ export class AGUIChatAgent<
           if (closed) return;
           // Drop out-of-order / duplicate sequences: in-order, exactly-once
           // delivery so the parent can rebuild tool-call state without gaps.
-          if (chunk.sequence <= lastEmitted) return;
-          lastEmitted = chunk.sequence;
+          // Progress/milestone frames and unstored chunks have no stored
+          // position (they reuse the next one), so they bypass the mark (#2384).
+          if (!isPositionlessAgentToolChunk(chunk)) {
+            if (chunk.sequence <= lastEmitted) return;
+            lastEmitted = chunk.sequence;
+          }
           try {
             controller.enqueue(
               agentToolChunkEncoder.encode(`${JSON.stringify(chunk)}\n`)
@@ -5141,14 +5146,7 @@ export class AGUIChatAgent<
   }
 
   private _getAgentToolStreamId(requestId: string): string | undefined {
-    const rows = this.sql<{ id: string }>`
-      select id
-      from cf_ai_chat_stream_metadata
-      where request_id = ${requestId}
-      order by rowid desc
-      limit 1
-    `;
-    return rows[0]?.id;
+    return this._resumableStream.latestStreamInfoForRequest(requestId)?.id;
   }
 
   private _getAgentToolStoredChunks(
