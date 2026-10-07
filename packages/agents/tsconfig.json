@@ -2,6 +2,8 @@
   "extends": "agents/tsconfig",
   "exclude": [
     "src/tests/**/*.ts",
+    "src/__tests__/**/*.ts",
+    "src/agui-tests/**/*.ts",
     "src/react-tests/**/*.ts",
     "src/react-tests/**/*.tsx",
     "src/voice/tests/**/*.ts",
