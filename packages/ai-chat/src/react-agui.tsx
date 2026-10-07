@@ -32,6 +32,7 @@ import { nanoid } from "nanoid";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   broadcastTransition,
+  chatThrottleOptions,
   MessageType,
   STREAM_RESUME_NONE_REASONS,
   toUIMessages,
@@ -361,6 +362,8 @@ export function useAgentChat<
     syncMessagesToServer = true,
     body: bodyOption,
     prepareSendMessagesRequest,
+    throttle,
+    experimental_throttle,
     ...rest
   } = options;
 
@@ -602,6 +605,7 @@ export function useAgentChat<
 
   const useChatHelpers = useChat<ChatMessage>({
     ...rest,
+    ...chatThrottleOptions({ experimental_throttle, throttle }),
     onData,
     messages: initialMessages,
     transport: customTransport,
