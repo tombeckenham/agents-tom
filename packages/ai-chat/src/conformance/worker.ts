@@ -109,17 +109,20 @@ class ConformanceBase extends AIChatAgent<Env> {
     )._submitConcurrency.overlappingSubmitCount;
   }
 
-  /** Raw persisted rows, in table order (rowid tiebreak for same-second ties). */
-  rows(): Array<{ id: string; message: unknown; created_at: string }> {
-    return (
-      this.sql<{ id: string; message: string; created_at: string }>`
-        select id, message, created_at
-        from cf_ai_chat_agent_messages order by created_at, rowid
-      ` || []
-    ).map((row) => ({
-      id: row.id,
-      message: JSON.parse(row.message),
-      created_at: row.created_at
+  /**
+   * Persisted messages, in history order. Legacy AIChatAgent now stores its
+   * transcript in the Sessions capability (the `cf_ai_chat_agent_messages`
+   * table is migrated and dropped), so read the session history and keep the
+   * `{ id, message, created_at }` row shape the goldens were recorded with.
+   */
+  async rows(): Promise<
+    Array<{ id: string; message: unknown; created_at: string }>
+  > {
+    const history = await this.sessions.session().getHistory();
+    return history.map((message) => ({
+      id: message.id,
+      message,
+      created_at: ""
     }));
   }
 

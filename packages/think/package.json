@@ -9,7 +9,7 @@
     "tools"
   ],
   "type": "module",
-  "version": "0.16.0",
+  "version": "0.20.0",
   "license": "MIT",
   "repository": {
     "directory": "packages/think",
@@ -43,13 +43,13 @@
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "vite": "^8.1.0",
-    "zod": "^4.4.3"
+    "zod": "^4.5.4"
   },
   "peerDependencies": {
-    "@ai-sdk/react": "^3.0.0 || ^4.0.0",
+    "@ai-sdk/react": "^4.0.0",
     "@chat-adapter/telegram": "^4.29.0",
-    "agents": ">=0.20.2 <1.0.0",
-    "ai": "^6.0.0 || ^7.0.0",
+    "agents": ">=0.25.0 <1.0.0",
+    "ai": "^7.0.0",
     "react": "^19.0.0",
     "zod": "^4.0.0"
   },
@@ -124,7 +124,9 @@
     "test": "npm run test:workers && npm run test:react",
     "test:react": "vitest --run -c src/react-tests/vitest.config.ts",
     "test:workers": "vitest --run -c src/tests/vitest.config.ts",
-    "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts"
+    "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts",
+    "test:harness": "tsx scripts/harness-compat.ts",
+    "test:harness:check": "tsx scripts/harness-compat.ts --check"
   },
   "nx": {
     "targets": {

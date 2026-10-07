@@ -834,8 +834,8 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
 
   getScheduleCountForCallback(callback: string): number {
     const rows = this.sql<{ count: number }>`
-      SELECT COUNT(*) as count FROM cf_agents_schedules
-      WHERE callback = ${callback}
+      SELECT COUNT(*) as count FROM cf_agents_jobs
+      WHERE capability = 'scheduler' AND fn = ${callback}
     `;
     return rows[0]?.count ?? 0;
   }
@@ -864,14 +864,18 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   ): void {
     const createdAt = Date.now() - ageMs;
     this.sql`
-      insert into cf_ai_chat_stream_metadata (id, request_id, status, created_at)
-      values (${streamId}, ${requestId}, 'streaming', ${createdAt})
+      insert into cf_agents_streams
+        (stream_id, state, tag, metadata, chunk_count, created_at, updated_at)
+      values (${streamId}, 'streaming', ${requestId}, ${JSON.stringify({ cfChat: 1 })},
+              ${chunks.length}, ${createdAt}, ${createdAt})
     `;
-    for (const chunk of chunks) {
-      const id = `chunk-${streamId}-${chunk.index}`;
+    if (chunks.length > 0) {
+      const body = chunks.map((c) => JSON.stringify(c.body)).join(",");
       this.sql`
-        insert into cf_ai_chat_stream_chunks (id, stream_id, body, chunk_index, created_at)
-        values (${id}, ${streamId}, ${chunk.body}, ${chunk.index}, ${createdAt})
+        insert into cf_agents_stream_blocks
+          (stream_id, block, seq_from, seq_to, body, created_at, updated_at)
+        values (${streamId}, 0, ${chunks[0].index}, ${chunks[chunks.length - 1].index + 1},
+                ${body}, ${createdAt}, ${createdAt})
       `;
     }
     (
@@ -922,8 +926,8 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
 
   async runScheduledRecoveryContinueForTest(): Promise<void> {
     const rows = this.sql<{ payload: string }>`
-      SELECT payload FROM cf_agents_schedules
-      WHERE callback = '_chatRecoveryContinue'
+      SELECT json_extract(payload, '$.payload') AS payload FROM cf_agents_jobs
+      WHERE capability = 'scheduler' AND fn = '_chatRecoveryContinue'
       ORDER BY time ASC LIMIT 1
     `;
     if (!rows[0]) return;
@@ -932,8 +936,8 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
 
   async runScheduledRecoveryRetryForTest(): Promise<void> {
     const rows = this.sql<{ payload: string }>`
-      SELECT payload FROM cf_agents_schedules
-      WHERE callback = '_chatRecoveryRetry'
+      SELECT json_extract(payload, '$.payload') AS payload FROM cf_agents_jobs
+      WHERE capability = 'scheduler' AND fn = '_chatRecoveryRetry'
       ORDER BY time ASC LIMIT 1
     `;
     if (!rows[0]) return;
