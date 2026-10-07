@@ -55,7 +55,6 @@ import {
 import { shouldCreditStreamProgress } from "./chat/recovery-codec";
 import {
   ChatRecoveryEngine,
-  chatRecoverySchedulePolicy,
   runChatRecoveryExhaustion,
   type ChatFiberWakeHooks,
   type ChatRecoveryAdapter,
@@ -132,16 +131,13 @@ import {
   CHAT_MESSAGE_TYPES,
   type StreamResumeNoneReason
 } from "./chat/protocol";
-import {
-  cleanupStreamBuffers,
-  ResumableStream,
-  STREAM_CLEANUP_DELAY_SECONDS
-} from "./chat/resumable-stream";
+import { createChatStreams, ResumableStream } from "./chat/resumable-stream";
 import { ResumeHandshake } from "./chat/resume-handshake";
 import {
   ChatStreamStalledError,
   iterateWithStallWatchdog
 } from "./chat/stall-watchdog";
+import type { Streams } from "./streams";
 import {
   type SubmitConcurrencyDecision,
   SubmitConcurrencyController
@@ -428,6 +424,9 @@ export class AGUIChatAgent<
 > extends Agent<Env, State, Props> {
   private _abortRegistry: AbortRegistry;
 
+  /** Streams capability backing {@link _resumableStream}; mirrors AIChatAgent. */
+  readonly streams: Streams = createChatStreams();
+
   protected _resumableStream!: ResumableStream;
 
   // Current in-flight assistant + tool messages produced by `_reply`. Used
@@ -658,6 +657,7 @@ export class AGUIChatAgent<
 
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
+    this.lifecycle.use(this.streams);
     this.sql`create table if not exists cf_ai_chat_agent_messages (
 			id text primary key,
 			message text not null,
@@ -673,7 +673,10 @@ export class AGUIChatAgent<
 
     this._restoreRequestContext();
 
-    this._resumableStream = new ResumableStream(this.sql.bind(this));
+    this._resumableStream = new ResumableStream(
+      this.streams,
+      this.sql.bind(this)
+    );
 
     const rawMessages = this._loadMessagesFromDb();
     this._aguiMessages = autoTransformAGUIMessages(rawMessages);
@@ -2769,40 +2772,17 @@ export class AGUIChatAgent<
       this._flushAwaitingStreamStartConnections();
       this._activateDeferredAutoContinuation();
     }
-    // Arm the buffer sweep on START so an idle/one-off chat DO still reclaims
-    // its chunk rows even if the turn never finalizes (#1706). The sweep's
-    // last-activity threshold keeps an actively streaming run alive.
-    void this._ensureStreamCleanupScheduled();
     return streamId;
   }
 
   /**
-   * Ensure a single cleanup alarm is pending for this DO's resumable-stream
-   * buffers. `idempotent` dedupes on (callback, payload, owner) so repeated
-   * arming collapses onto one row.
-   * @internal
-   */
-  protected async _ensureStreamCleanupScheduled({
-    idempotent = true
-  }: { idempotent?: boolean } = {}): Promise<void> {
-    await this.schedule(
-      STREAM_CLEANUP_DELAY_SECONDS,
-      "_cleanupStreamBuffers",
-      undefined,
-      { idempotent }
-    );
-  }
-
-  /**
-   * Alarm callback: sweep aged stream buffers, re-arming while rows remain (see
-   * the shared {@link cleanupStreamBuffers}). Public so it is reachable as a
-   * schedule callback.
+   * @deprecated Streams are reclaimed at cutover and on the next stream
+   * start; no alarm is armed any more. Kept so a cleanup alarm persisted
+   * by an earlier version still resolves to a callback when it fires.
    * @internal
    */
   async _cleanupStreamBuffers(): Promise<void> {
-    await cleanupStreamBuffers(this._resumableStream, () =>
-      this._ensureStreamCleanupScheduled({ idempotent: false })
-    );
+    this._resumableStream.reclaim();
   }
 
   protected _completeStream(streamId: string) {
@@ -3119,12 +3099,11 @@ export class AGUIChatAgent<
           ...(event.reason ? { reason: event.reason } : {})
         }),
       scheduleRecovery: async (callback, data, reason, delaySeconds) => {
-        await this.schedule(
-          delaySeconds,
-          callback,
-          data,
-          chatRecoverySchedulePolicy(reason)
-        );
+        // Still the Scheduler transport: dedupe the initial schedule, never a
+        // reschedule. Upstream moved AIChatAgent recovery onto Tasks (#2194).
+        await this.schedule(delaySeconds, callback, data, {
+          idempotent: reason === "initial"
+        });
       },
       setRecovering: (active, requestId) =>
         this._setChatRecovering(active, requestId),
@@ -3315,7 +3294,6 @@ export class AGUIChatAgent<
         this._persistOrphanedStream(streamId),
       completeRecoveredStream: (streamId) => {
         this._resumableStream.complete(streamId);
-        void this._ensureStreamCleanupScheduled();
       },
       dispatchRecoveredTurn: (input) => this._dispatchRecoveredChatTurn(input)
     } satisfies ChatFiberWakeHooks<AGUIRecoveryClassification>);
@@ -3330,17 +3308,9 @@ export class AGUIChatAgent<
   private _resolveAGUIRecoveryStream(
     requestId: string
   ): ResolvedRecoveryStream {
-    let streamId = "";
-    if (requestId) {
-      const rows = this.sql<{ id: string }>`
-        SELECT id FROM cf_ai_chat_stream_metadata
-        WHERE request_id = ${requestId}
-        ORDER BY created_at DESC LIMIT 1
-      `;
-      if (rows.length > 0) {
-        streamId = rows[0].id;
-      }
-    }
+    let streamId = requestId
+      ? (this._resumableStream.latestStreamInfoForRequest(requestId)?.id ?? "")
+      : "";
     if (!streamId && this._resumableStream.hasActiveStream()) {
       streamId = this._resumableStream.activeStreamId ?? "";
     }
@@ -3784,16 +3754,21 @@ export class AGUIChatAgent<
     return true;
   }
 
-  /** Recovery callbacks the alarm-boundary OOM circuit breaker may purge (#1825). */
-  protected override _cf_recoveryAlarmCallbacks(): string[] {
-    return ["_chatRecoveryContinue", "_chatRecoveryRetry"];
+  /**
+   * Host memory-limit hook (#1825), dispatched by the Lifecycle circuit
+   * breaker: at the strike budget, seal in-flight recovery. Mirrors
+   * AIChatAgent.
+   */
+  protected async onAlarmMemoryLimit(context: { readonly sealed: boolean }) {
+    if (!context.sealed) return;
+    await this._cf_sealMemoryLimitedRecovery();
   }
 
   /**
    * Seal any still-live recovery incident as an out-of-memory exhaustion when
    * the alarm circuit breaker trips (#1825).
    */
-  protected override async _cf_sealMemoryLimitedRecovery(): Promise<void> {
+  private async _cf_sealMemoryLimitedRecovery(): Promise<void> {
     const active = await listActiveChatRecoveryIncidents(this.ctx.storage);
     for (const { incident } of active) {
       const callback: ChatRecoveryScheduleCallback =

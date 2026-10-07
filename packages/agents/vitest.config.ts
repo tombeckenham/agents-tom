@@ -5,9 +5,16 @@ export default defineConfig({
     projects: [
       "src/tests/vitest.config.ts",
       "src/agui-tests/vitest.config.ts",
-      "src/lifecycle-tests/vitest.config.ts",
       "src/react-tests/vitest.config.ts",
-      "src/cli-tests/vitest.config.ts",
+      "src/voice/tests/vitest.config.ts",
+      "src/voice/react-tests/vitest.config.ts",
+      "src/harness/opencode/tests/vitest.config.ts",
+      "src/harness/pi/tests/vitest.config.ts",
+      "src/harness/think/tests/vitest.config.ts",
+      "src/harness/container/tests/vitest.config.ts",
+      "src/harness/container/runtime/tests/vitest.config.ts",
+      "src/experimental/channels/vitest.config.ts",
+      "src/node-tests/vitest.config.ts",
       "src/x402-tests/vitest.config.ts",
       "src/chat/__tests__/vitest.config.ts",
       "src/webmcp-tests/vitest.config.ts"
