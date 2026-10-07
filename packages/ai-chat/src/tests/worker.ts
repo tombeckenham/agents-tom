@@ -3444,7 +3444,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       WHERE id = ${`task:${runId}`}
     `;
     await this.alarm();
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    await this.waitForIdleForTest();
     return true;
   }
 
@@ -3484,7 +3484,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       LIMIT 1
     `;
     if (!rows[0]) {
-      await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+      await this.waitForIdleForTest();
       return;
     }
     await this._chatRecoveryRetry(
@@ -3507,7 +3507,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       LIMIT 1
     `;
     if (!rows[0]) {
-      await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+      await this.waitForIdleForTest();
       return;
     }
     await this._chatRecoveryContinue(
