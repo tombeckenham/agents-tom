@@ -68,7 +68,8 @@ import type {
   SaveMessagesResult
 } from "./chat/lifecycle";
 import { CHAT_MESSAGE_TYPES } from "./chat/protocol";
-import { ResumableStream } from "./chat/resumable-stream";
+import { ResumableStream, createChatStreams } from "./chat/resumable-stream";
+import type { Streams } from "./streams";
 import {
   type SubmitConcurrencyDecision,
   SubmitConcurrencyController
@@ -277,6 +278,9 @@ export class AGUIChatAgent<
 > extends Agent<Env, State, Props> {
   private _abortRegistry: AbortRegistry;
 
+  /** Streams capability backing {@link _resumableStream}; mirrors AIChatAgent. */
+  readonly streams: Streams = createChatStreams();
+
   protected _resumableStream!: ResumableStream;
 
   // Current in-flight assistant + tool messages produced by `_reply`. Used
@@ -397,6 +401,7 @@ export class AGUIChatAgent<
 
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
+    this.lifecycle.use(this.streams);
     this.sql`create table if not exists cf_ai_chat_agent_messages (
 			id text primary key,
 			message text not null,
@@ -410,7 +415,10 @@ export class AGUIChatAgent<
 
     this._restoreRequestContext();
 
-    this._resumableStream = new ResumableStream(this.sql.bind(this));
+    this._resumableStream = new ResumableStream(
+      this.streams,
+      this.sql.bind(this)
+    );
 
     const rawMessages = this._loadMessagesFromDb();
     this.messages = autoTransformAGUIMessages(rawMessages);
