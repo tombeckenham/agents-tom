@@ -207,6 +207,12 @@ export type AssistantMessage = BaseMessage & {
    * UIMessage projection can mark the part `state: "streaming"`.
    */
   partial?: true;
+  /**
+   * CF extension: migrated from a legacy text part that carried no `state`
+   * (rows stored before parts had one), so the UIMessage projection emits
+   * none either. Dropped once text is streamed into the message.
+   */
+  stateless?: true;
   /** CF extension: the legacy text part's providerMetadata. */
   contentProviderMetadata?: unknown;
   /**
@@ -253,6 +259,8 @@ export type ReasoningMessage = BaseMessage & {
   encryptedValue?: string;
   /** CF extension: reasoning stream still open — see AssistantMessage.partial. */
   partial?: true;
+  /** CF extension: no legacy `state` — see AssistantMessage.stateless. */
+  stateless?: true;
   /** CF extension: the legacy reasoning part's providerMetadata (e.g.
    * Anthropic redacted_thinking blocks) — required for provider round-trips. */
   providerMetadata?: unknown;

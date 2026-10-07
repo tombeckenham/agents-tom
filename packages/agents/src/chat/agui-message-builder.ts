@@ -275,6 +275,7 @@ function handleTextStart(
       notePartOrder(existing, "text", false);
     }
     existing.partial = true;
+    delete existing.stateless;
     state.textStreams.set(event.messageId, existing);
     return true;
   }

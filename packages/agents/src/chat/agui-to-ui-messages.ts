@@ -45,13 +45,19 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
     metadata?: unknown;
     text: string;
     partial?: true;
+    stateless?: true;
     providerMetadata?: unknown;
   }> = [];
 
   // Streamed parts carry a state marker (legacy shape): "done" once the
   // stream closed, "streaming" while open / when interrupted (`partial`).
-  const partState = (partial: true | undefined) =>
-    partial ? "streaming" : "done";
+  // A part migrated from a legacy row without one (`stateless`) gets none.
+  const partState = (source: { partial?: true; stateless?: true }) =>
+    source.partial
+      ? { state: "streaming" }
+      : source.stateless
+        ? {}
+        : { state: "done" };
 
   // The most recent assistant pushed to `ui` — a reasoning row with no
   // FOLLOWING assistant (a continuation's reasoning persists after its
@@ -64,7 +70,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
         lastAssistant.parts.push({
           type: "reasoning",
           text: r.text,
-          state: partState(r.partial),
+          ...partState(r),
           ...(r.providerMetadata !== undefined && {
             providerMetadata: r.providerMetadata
           })
@@ -78,7 +84,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           {
             type: "reasoning",
             text: r.text,
-            state: partState(r.partial),
+            ...partState(r),
             ...(r.providerMetadata !== undefined && {
               providerMetadata: r.providerMetadata
             })
@@ -137,7 +143,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           parts.push({
             type: "reasoning",
             text: r.text,
-            state: partState(r.partial),
+            ...partState(r),
             ...(r.providerMetadata !== undefined && {
               providerMetadata: r.providerMetadata
             })
@@ -163,7 +169,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
             {
               type: "text",
               text: message.content,
-              state: partState(message.partial),
+              ...partState(message),
               ...(message.contentProviderMetadata !== undefined && {
                 providerMetadata: message.contentProviderMetadata
               })
@@ -244,6 +250,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           id: message.id,
           text: message.content ?? "",
           ...(message.partial && { partial: message.partial }),
+          ...(message.stateless && { stateless: message.stateless }),
           ...(message.providerMetadata !== undefined && {
             providerMetadata: message.providerMetadata
           }),

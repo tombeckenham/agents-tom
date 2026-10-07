@@ -478,6 +478,15 @@ function readAguiRole(metadata: unknown): string | undefined {
 
 // ---------------- assistant ----------------
 
+/** A legacy part's `state` as the AG-UI flags the projection reads back. */
+function legacyPartState(state: string | undefined): {
+  partial?: true;
+  stateless?: true;
+} {
+  if (state === "streaming") return { partial: true };
+  return state === undefined ? { stateless: true } : {};
+}
+
 function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
   const out: AGUIMessage[] = [];
 
@@ -495,9 +504,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
       id: msg.id,
       role: "reasoning",
       content: reasoningParts[0].text ?? "",
-      ...(reasoningParts[0].state === "streaming" && {
-        partial: true as const
-      }),
+      ...legacyPartState(reasoningParts[0].state),
       ...(reasoningParts[0].providerMetadata !== undefined && {
         providerMetadata: reasoningParts[0].providerMetadata
       })
@@ -510,7 +517,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
       id: `${msg.id}-reasoning-${reasoningIndex++}`,
       role: "reasoning",
       content: part.text ?? "",
-      ...(part.state === "streaming" && { partial: true as const }),
+      ...legacyPartState(part.state),
       ...(part.providerMetadata !== undefined && {
         providerMetadata: part.providerMetadata
       })
@@ -681,9 +688,10 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     partOrder.length !== canonicalOrder.length ||
     partOrder.some((token, i) => token !== canonicalOrder[i]);
 
-  const streamingText = msg.parts.some(
-    (part) => isTextPart(part) && part.state === "streaming"
-  );
+  const textParts = msg.parts.filter(isTextPart);
+  const streamingText = textParts.some((part) => part.state === "streaming");
+  const statelessText =
+    !!textContent && textParts.every((part) => part.state === undefined);
   const contentProviderMetadata = (
     msg.parts.find(
       (part) => isTextPart(part) && part.providerMetadata !== undefined
@@ -698,6 +706,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     ...(extraParts.length ? { extraParts } : {}),
     ...(orderDiffers ? { partOrder } : {}),
     ...(streamingText && { partial: true as const }),
+    ...(statelessText && { stateless: true as const }),
     ...(contentProviderMetadata !== undefined && { contentProviderMetadata }),
     ...(msg.metadata !== undefined && { metadata: msg.metadata })
   };

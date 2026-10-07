@@ -92,8 +92,22 @@ describe("agui-migration", () => {
       parts: [{ type: "text", text: "result" }]
     };
     expect(migrateUIMessageToAGUI(ui)).toEqual([
-      { id: "a1", role: "assistant", content: "result" }
+      // The part carried no `state`, and projects back without one.
+      { id: "a1", role: "assistant", content: "result", stateless: true }
     ]);
+    expect(toUIMessages(migrateUIMessageToAGUI(ui))).toEqual([ui]);
+  });
+
+  it("keeps a state the legacy part carried, and marks live text done", () => {
+    const done = {
+      id: "a1",
+      role: "assistant",
+      parts: [{ type: "text", text: "result", state: "done" }]
+    };
+    const row = { id: "a1", role: "assistant", content: "result" };
+    expect(migrateUIMessageToAGUI(done)).toEqual([row]);
+    // A live-streamed row never has the flag.
+    expect(toUIMessages([row as AGUIMessage])).toEqual([done]);
   });
 
   it("migrates an assistant with one output-available tool part into AssistantMessage + ToolMessage", () => {
@@ -116,6 +130,7 @@ describe("agui-migration", () => {
         id: "a2",
         role: "assistant",
         content: "calling tool",
+        stateless: true,
         toolCalls: [
           {
             id: "call_1",
@@ -284,7 +299,12 @@ describe("agui-migration", () => {
     };
     // No `-reasoning-N` suffix, no fabricated empty assistant row.
     expect(migrateUIMessageToAGUI(ui)).toEqual([
-      { id: "r-standalone", role: "reasoning", content: "thinking" }
+      {
+        id: "r-standalone",
+        role: "reasoning",
+        content: "thinking",
+        stateless: true
+      }
     ]);
   });
 
@@ -390,7 +410,12 @@ describe("agui-migration", () => {
         rows = next;
       }
       expect(rows).toEqual([
-        { id: "a1", role: "reasoning", content: "only thinking" }
+        {
+          id: "a1",
+          role: "reasoning",
+          content: "only thinking",
+          stateless: true
+        }
       ]);
     });
 

@@ -1384,11 +1384,7 @@ describe("Tool approval (needsApproval) duplicate message prevention", () => {
     // Messages should remain unchanged (no crash, graceful handling)
     expect(messages.length).toBe(2);
     const assistantMsg = messages.find((m) => m.role === "assistant");
-    expect(assistantMsg?.parts[0]).toEqual({
-      type: "text",
-      text: "Hi there!",
-      state: "done"
-    });
+    expect(assistantMsg?.parts[0]).toEqual({ type: "text", text: "Hi there!" });
 
     ws.close(1000);
   });
