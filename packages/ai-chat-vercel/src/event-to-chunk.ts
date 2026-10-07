@@ -32,6 +32,24 @@ import {
 } from "agents/chat/agui-types";
 import type { UIMessageChunk } from "ai";
 
+/**
+ * Whether a chunk contributes a part to the assistant message, and so marks
+ * the point where the run's message begins.
+ *
+ * Verified against `processUIMessageStream` (ai@7): every `tool-*` chunk
+ * writes a tool part on its own, and a non-transient `data-*` chunk pushes a
+ * data part and writes; a transient one only fires `onData`. Run-level chunks
+ * (`start`, `finish`, `start-step`, `finish-step`, `error`) contribute
+ * nothing, so they must not mark a message as begun.
+ */
+function opensMessage(chunk: UIMessageChunk): boolean {
+  if (chunk.type.startsWith("tool-")) return true;
+  return (
+    chunk.type.startsWith("data-") &&
+    !(chunk as { transient?: boolean }).transient
+  );
+}
+
 type ToolBuffer = {
   toolName: string;
   args: string;
@@ -53,6 +71,24 @@ export class EventToChunkProjector {
 
   /** Project a single AG-UI event into zero or more `UIMessageChunk`s. */
   project(event: AGUIEvent): UIMessageChunk[] {
+    const chunks = this.projectEvent(event);
+    if (this.leadingStartEmitted || chunks.length === 0) return chunks;
+    if (!opensMessage(chunks[0])) return chunks;
+
+    // Backstop for a run whose first content carries no id to open with —
+    // a tool result or approval with no preceding `TOOL_CALL_START`, or a
+    // producer that omits `parentMessageId`. The chunk is inert in the AI
+    // SDK (see `emitLeadingStart`); it exists so consumers that key off the
+    // leading `start` — `broadcast-state`'s replay reset, the accumulator's
+    // id adoption — still see one. Without an id the accumulator keeps its
+    // caller-supplied fallback id, so such a run cannot reconcile against a
+    // later server snapshot; the fix is for the producer to send
+    // `parentMessageId`, which `chunk-to-event` now does.
+    this.leadingStartEmitted = true;
+    return [{ type: "start" }, ...chunks];
+  }
+
+  private projectEvent(event: AGUIEvent): UIMessageChunk[] {
     switch (event.type) {
       case "RUN_STARTED":
         this.runStartedBuffered = true;
@@ -117,6 +153,9 @@ export class EventToChunkProjector {
           startedInputAvailable: false
         });
         return [
+          // `parentMessageId` is the assistant id for a turn whose first
+          // content is a tool call — the only id AG-UI carries for one.
+          ...this.emitLeadingStart(event.parentMessageId),
           {
             type: "tool-input-start",
             toolCallId: event.toolCallId,
@@ -222,7 +261,7 @@ export class EventToChunkProjector {
     }
   }
 
-  private emitLeadingStart(messageId: string): UIMessageChunk[] {
+  private emitLeadingStart(messageId?: string): UIMessageChunk[] {
     if (this.leadingStartEmitted) return [];
     if (!this.runStartedBuffered) {
       // A TEXT/REASONING start without a prior RUN_STARTED is legal in
@@ -230,7 +269,13 @@ export class EventToChunkProjector {
       // the AI SDK gets a well-formed lifecycle.
     }
     this.leadingStartEmitted = true;
-    return [{ type: "start", messageId }];
+    // An id-less `start` is inert in the AI SDK (`processUIMessageStream`
+    // only assigns an id / writes when `messageId` or `messageMetadata` is
+    // present) — it is emitted for the consumers that key off the chunk
+    // itself, notably `broadcast-state`'s replay-reset marker.
+    return [
+      messageId != null ? { type: "start", messageId } : { type: "start" }
+    ];
   }
 
   private projectCustom(name: string, value: unknown): UIMessageChunk[] {

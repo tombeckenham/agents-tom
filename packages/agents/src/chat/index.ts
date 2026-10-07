@@ -319,6 +319,10 @@ export {
   type TruncateToolResultsOptions
 } from "./truncate-older-messages";
 
+// Shared with the AG-UI-based `useAgentChat` in `@cloudflare/ai-chat`, which
+// forwards the same throttle defaults to `useChat`.
+export { chatThrottleOptions } from "./chat-throttle";
+
 // AG-UI shape helpers used by the AI SDK projection layer
 // (`@cloudflare/ai-chat`): row migration/normalization, the UIMessage
 // projection, and the built-in message sanitizer.
