@@ -19,7 +19,22 @@ import type {
   ToolSet
 } from "ai";
 import { Agent, routeAgentRequest, type RunAgentToolResult } from "agents";
-import type { ChatResponseResult as EngineChatResponseResult } from "agents/chat";
+import {
+  fromSessionMessage,
+  type ChatResponseResult as EngineChatResponseResult
+} from "agents/chat";
+import type { Session } from "agents/sessions";
+
+/** Stored transcript rows: the `_v`-marked AG-UI message each row carries. */
+async function storedRows(
+  agent: object
+): Promise<Array<{ id: string; message: unknown }>> {
+  const session = (agent as { _session: Session })._session;
+  return (await session.getHistory()).map((row) => ({
+    id: row.id,
+    message: fromSessionMessage(row)
+  }));
+}
 
 type ToolPart = Extract<
   ChatMessage["parts"][number],
@@ -111,17 +126,11 @@ class ConformanceBase extends AIChatAgent<Env> {
   }
 
   /** Raw persisted rows, in table order (rowid tiebreak for same-second ties). */
-  rows(): Array<{ id: string; message: unknown; created_at: string }> {
-    return (
-      this.sql<{ id: string; message: string; created_at: string }>`
-        select id, message, created_at
-        from cf_ai_chat_agent_messages order by created_at, rowid
-      ` || []
-    ).map((row) => ({
-      id: row.id,
-      message: JSON.parse(row.message),
-      created_at: row.created_at
-    }));
+  async rows(): Promise<
+    Array<{ id: string; message: unknown; created_at: string }>
+  > {
+    // Sessions does not expose a row's timestamp; the harness masks it anyway.
+    return (await storedRows(this)).map((row) => ({ ...row, created_at: "" }));
   }
 
   /** Append a user message programmatically, triggering a server-side turn. */
@@ -531,17 +540,11 @@ class ProjectedConformanceBase extends ProjectedAIChatAgent<Env> {
   }
 
   /** Raw persisted rows — AG-UI shape; the harness projects them for diffing. */
-  rows(): Array<{ id: string; message: unknown; created_at: string }> {
-    return (
-      this.sql<{ id: string; message: string; created_at: string }>`
-        select id, message, created_at
-        from cf_ai_chat_agent_messages order by created_at, rowid
-      ` || []
-    ).map((row) => ({
-      id: row.id,
-      message: JSON.parse(row.message),
-      created_at: row.created_at
-    }));
+  async rows(): Promise<
+    Array<{ id: string; message: unknown; created_at: string }>
+  > {
+    // Sessions does not expose a row's timestamp; the harness masks it anyway.
+    return (await storedRows(this)).map((row) => ({ ...row, created_at: "" }));
   }
 
   async programmaticTurn(text: string) {
@@ -644,13 +647,8 @@ export class ProjectedAgent extends ProjectedAIChatAgent<Env> {
   }
 
   /** Raw persisted rows — AG-UI shape with the `_v` marker. */
-  rows(): Array<{ id: string; message: unknown }> {
-    return (
-      this.sql<{ id: string; message: string }>`
-        select id, message from cf_ai_chat_agent_messages
-        order by created_at, rowid
-      ` || []
-    ).map((row) => ({ id: row.id, message: JSON.parse(row.message) }));
+  rows(): Promise<Array<{ id: string; message: unknown }>> {
+    return storedRows(this);
   }
 
   /** The legacy-projected view (`this.messages` getter). */
@@ -854,13 +852,10 @@ export class ProjectedChildAgent extends ProjectedAIChatAgent<Env> {
   }
 
   /** Raw persisted rows (AG-UI shape) — bypasses the UIMessage projection. */
-  rawRowsForTest(): Array<Record<string, unknown>> {
-    return (
-      this.sql<{ message: string }>`
-        select message from cf_ai_chat_agent_messages
-        order by created_at, rowid
-      ` || []
-    ).map((row) => JSON.parse(row.message) as Record<string, unknown>);
+  async rawRowsForTest(): Promise<Array<Record<string, unknown>>> {
+    return (await storedRows(this)).map(
+      (row) => row.message as Record<string, unknown>
+    );
   }
 }
 

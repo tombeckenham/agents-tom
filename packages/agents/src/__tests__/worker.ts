@@ -2,6 +2,10 @@ import { routeAgentRequest } from "../index";
 import { AGUIChatAgent, type OnChatMessageOptions } from "../agui-chat-agent";
 import type { AGUIEvent, AGUIMessage } from "../chat/agui-types";
 import {
+  autoTransformAGUIMessages,
+  fromSessionMessage
+} from "../chat/agui-migration";
+import {
   CF_TOOL_APPROVAL_REQUEST,
   type CFToolApprovalRequestValue
 } from "../chat/agui-types";
@@ -90,14 +94,12 @@ export class BasicAGUIAgent extends AGUIChatAgent<Env> {
     ]);
   }
 
-  getRawRows(): Array<{ id: string; message: string }> {
-    const rows =
-      this.sql<{
-        id: string;
-        message: string;
-      }>`select id, message from cf_ai_chat_agent_messages order by created_at` ||
-      [];
-    return rows.map((r) => ({ id: r.id, message: r.message }));
+  /** Stored rows: the `_v`-marked AG-UI message each Sessions row carries. */
+  async getRawRows(): Promise<Array<{ id: string; message: string }>> {
+    return (await this._session.getHistory()).map((row) => ({
+      id: row.id,
+      message: JSON.stringify(fromSessionMessage(row))
+    }));
   }
 
   getInMemoryMessagesJSON(): string {
@@ -112,18 +114,18 @@ export class BasicAGUIAgent extends AGUIChatAgent<Env> {
     return rows.map((r) => r.name);
   }
 
-  async seedRawRow(id: string, json: string): Promise<void> {
-    this
-      .sql`insert into cf_ai_chat_agent_messages (id, message) values (${id}, ${json})`;
+  /** Write a row straight into the transcript session, bypassing the engine. */
+  async seedRawRow(_id: string, json: string): Promise<void> {
+    await this._session.importMessage(JSON.parse(json), {
+      parentId: (await this._session.getLatestLeaf())?.id ?? null,
+      createdAt: Date.now()
+    });
   }
 
   async clearAndReloadJSON(): Promise<string> {
-    const rows =
-      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
-      [];
-    const parsed = rows.map((r) => JSON.parse(r.message as string));
-    const { autoTransformAGUIMessages } =
-      await import("../chat/agui-migration");
+    const parsed = (await this._session.getHistory()).map((row) =>
+      fromSessionMessage(row)
+    );
     const transformed = autoTransformAGUIMessages(parsed);
     this.messages = transformed;
     return toJSON(transformed);

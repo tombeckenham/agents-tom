@@ -66,7 +66,7 @@ describe("AGUIChatAgent — SQL setup", () => {
     const room = crypto.randomUUID();
     const stub = await getAgentByName(env.BasicAGUIAgent, room);
     const tables = await stub.getTableNames();
-    expect(tables).toContain("cf_ai_chat_agent_messages");
+    expect(tables).toContain("cf_agents_session_messages");
     expect(tables).toContain("cf_ai_chat_request_context");
   });
 
