@@ -83,7 +83,7 @@ function parseJSON(value: string | undefined): unknown {
 export class AIChatAgent<
   Env extends Cloudflare.Env = Cloudflare.Env,
   State = unknown,
-  Props extends Record<string, unknown> = Record<string, unknown>
+  Props extends object = object
 > extends AGUIChatAgent<Env, State, Props> {
   /** Memoized projection keyed on the AG-UI store's array identity. */
   private _uiProjection?: {

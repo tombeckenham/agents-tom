@@ -71,7 +71,9 @@ export type {
   UseAgentChatOptions,
   PrepareSendMessagesRequestOptions,
   PrepareSendMessagesRequestResult,
-  OnToolCallCallback
+  OnToolCallCallback,
+  ChatTurnEndEvent,
+  ChatTurnOutcome
 } from "agents/chat/react";
 export {
   WebSocketChatTransport,
