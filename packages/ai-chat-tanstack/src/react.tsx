@@ -206,7 +206,7 @@ export function useAgentChat(options: UseAgentChatOptions): UseAgentChatReturn {
     if (!resume) return;
     if (triedInitialResumeRef.current) return;
     triedInitialResumeRef.current = true;
-    void transport.reconnectToStream();
+    void transport.reconnectToStream().catch(() => undefined);
   }, [resume, transport]);
 
   const startToolContinuation = useCallback(() => {
