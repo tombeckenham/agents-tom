@@ -3,6 +3,9 @@
 type _WorkerEnv = {
   TestTanstackAgent: DurableObjectNamespace;
   CancellableTanstackAgent: DurableObjectNamespace;
+  ClientToolTanstackAgent: DurableObjectNamespace<
+    import("./worker").ClientToolTanstackAgent
+  >;
 };
 
 declare namespace Cloudflare {

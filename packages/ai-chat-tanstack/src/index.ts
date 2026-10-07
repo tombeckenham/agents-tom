@@ -2,7 +2,8 @@
  * `@cloudflare/ai-chat-tanstack` — server entry.
  *
  * TanStack AI's `chat()` already emits `AGUIEvent`s, so the server-side
- * "projection" is identity. {@link toAGUIResponse} wraps an
+ * "projection" is identity, apart from copying a run's finish reason to
+ * where the engine reads it. {@link toAGUIResponse} wraps an
  * `AsyncIterable<AGUIEvent>` (the shape `chat()` returns) into a
  * `Response` whose body is AG-UI SSE so an
  * {@link import("agents/agui-chat-agent").AGUIChatAgent} `onChatMessage`
@@ -104,7 +105,9 @@ export function toAGUISSEStream(
           return;
         }
         controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(result.value)}\n\n`)
+          encoder.encode(
+            `data: ${JSON.stringify(withFinishReason(result.value))}\n\n`
+          )
         );
       } catch (error) {
         controller.error(error);
@@ -122,6 +125,33 @@ export function toAGUISSEStream(
       }
     }
   });
+}
+
+/**
+ * TanStack AI reports why a run stopped on the event itself (`finishReason`,
+ * or `metadata.tanstack.finishReason` once stripped to the AG-UI spec).
+ * `AGUIChatAgent` reads it from `result.finishReason`, in the AI SDK's
+ * hyphenated spelling, to drop an auto-continuation the run already answered.
+ */
+function withFinishReason(event: AGUIEvent): AGUIEvent {
+  if (event.type !== "RUN_FINISHED") return event;
+  const { result } = event;
+  if (result !== undefined && !isRecord(result)) return event;
+  if (typeof result?.finishReason === "string") return event;
+  const source = event as {
+    finishReason?: unknown;
+    metadata?: { tanstack?: { finishReason?: unknown } };
+  };
+  const reason = source.finishReason ?? source.metadata?.tanstack?.finishReason;
+  if (typeof reason !== "string") return event;
+  return {
+    ...event,
+    result: { ...result, finishReason: reason.replace("_", "-") }
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function aguiHeaders(source: HeadersInit | undefined): Headers {

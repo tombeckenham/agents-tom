@@ -81,6 +81,45 @@ describe("toAGUIResponse — framing", () => {
   });
 });
 
+describe("toAGUIResponse — finish reason", () => {
+  const finished = { type: "RUN_FINISHED", threadId: "t1", runId: "r1" };
+  const sent = async (event: object) =>
+    parseSSEDataLines(
+      await readAll(toAGUIResponse(events([event as AGUIEvent])))
+    )[0];
+
+  it("copies TanStack AI's finishReason onto result, in the AI SDK spelling", async () => {
+    expect(await sent({ ...finished, finishReason: "stop" })).toMatchObject({
+      result: { finishReason: "stop" }
+    });
+    expect(
+      await sent({ ...finished, finishReason: "tool_calls" })
+    ).toMatchObject({ result: { finishReason: "tool-calls" } });
+  });
+
+  it("reads the reason from metadata.tanstack on a spec-stripped event", async () => {
+    expect(
+      await sent({
+        ...finished,
+        result: { usage: 1 },
+        metadata: { tanstack: { finishReason: "stop" } }
+      })
+    ).toMatchObject({ result: { usage: 1, finishReason: "stop" } });
+  });
+
+  it("leaves an event alone when it has a result reason or no reason", async () => {
+    const own = {
+      ...finished,
+      finishReason: "stop",
+      result: { finishReason: "length" }
+    };
+    expect(await sent(own)).toEqual(own);
+    expect(await sent(finished)).toEqual(finished);
+    const opaque = { ...finished, finishReason: "stop", result: "done" };
+    expect(await sent(opaque)).toEqual(opaque);
+  });
+});
+
 describe("toAGUIResponse — headers", () => {
   it("sets Content-Type: text/event-stream; charset=utf-8 and SSE cache headers", async () => {
     const response = toAGUIResponse(events([]));

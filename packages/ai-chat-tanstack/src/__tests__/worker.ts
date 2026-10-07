@@ -94,7 +94,49 @@ export class ErroringTanstackAgent extends AGUIChatAgent {
   }
 }
 
+/**
+ * A client tool call answered while the run is still streaming, then a
+ * final answer. The run ends the way TanStack AI's `chat()` ends one:
+ * the finish reason on the event, not in `result`.
+ */
+export class ClientToolTanstackAgent extends AGUIChatAgent {
+  private _calls = 0;
+
+  getCalls(): number {
+    return this._calls;
+  }
+
+  async onChatMessage(
+    _onFinish: (result: unknown) => void | Promise<void>,
+    options?: { abortSignal?: AbortSignal }
+  ) {
+    this._calls++;
+    const events = [
+      { type: "RUN_STARTED", threadId: "t1", runId: "r1" },
+      {
+        type: "TOOL_CALL_START",
+        toolCallId: "tc-1",
+        toolCallName: "clientTool",
+        parentMessageId: "m1"
+      },
+      { type: "TOOL_CALL_ARGS", toolCallId: "tc-1", delta: "{}" },
+      { type: "TOOL_CALL_END", toolCallId: "tc-1" },
+      { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "Handled." },
+      { type: "TEXT_MESSAGE_END", messageId: "m1" },
+      {
+        type: "RUN_FINISHED",
+        threadId: "t1",
+        runId: "r1",
+        finishReason: "stop"
+      }
+    ] as AGUIEvent[];
+    return toAGUIResponse(yieldEventsSlow(events, 75, options?.abortSignal));
+  }
+}
+
 type Env = {
+  ClientToolTanstackAgent: DurableObjectNamespace<ClientToolTanstackAgent>;
   TestTanstackAgent: DurableObjectNamespace<TestTanstackAgent>;
   CancellableTanstackAgent: DurableObjectNamespace<CancellableTanstackAgent>;
   SlowTanstackAgent: DurableObjectNamespace<SlowTanstackAgent>;

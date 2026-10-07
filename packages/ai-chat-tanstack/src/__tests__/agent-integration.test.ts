@@ -6,7 +6,8 @@
  * its async iterable (no projection layer).
  */
 
-import { exports as workerExports } from "cloudflare:workers";
+import { env, exports as workerExports } from "cloudflare:workers";
+import { getAgentByName } from "agents";
 import type { AGUIEvent } from "agents/chat/agui-types";
 import { describe, expect, it } from "vitest";
 import { MessageType } from "../types";
@@ -193,5 +194,57 @@ describe("AGUIChatAgent + WebSocketChatTransport — end to end (TanStack)", () 
         }
       })()
     ).rejects.toThrow(/agent exploded/);
+  });
+});
+
+describe("AGUIChatAgent auto-continuation (TanStack)", () => {
+  it("does not fire a stale continuation when the stream finishes with stop", async () => {
+    const room = crypto.randomUUID();
+    const ws = await openAgent(`/agents/client-tool-tanstack-agent/${room}`);
+    const stub = await getAgentByName(env.ClientToolTanstackAgent, room);
+
+    const done = new Promise<void>((resolve) => {
+      ws.addEventListener("message", (event: MessageEvent) => {
+        const frame = JSON.parse(event.data as string) as {
+          type?: string;
+          body?: string;
+          done?: boolean;
+        };
+        if (frame.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
+        if (frame.done) return resolve();
+        if (!frame.body) return;
+        const streamed = JSON.parse(frame.body) as AGUIEvent;
+        if (streamed.type !== "TOOL_CALL_END") return;
+        // The result lands while the run is still streaming and opts into a
+        // continuation the run's own final answer then makes stale.
+        ws.send(
+          JSON.stringify({
+            type: MessageType.CF_AGENT_TOOL_RESULT,
+            toolCallId: "tc-1",
+            toolName: "clientTool",
+            output: { ok: true },
+            autoContinue: true
+          })
+        );
+      });
+    });
+    ws.send(
+      JSON.stringify({
+        type: MessageType.CF_AGENT_USE_CHAT_REQUEST,
+        id: "req-stop",
+        init: {
+          method: "POST",
+          body: JSON.stringify({
+            messages: [{ id: "u1", role: "user", content: "Run the tool" }]
+          })
+        }
+      })
+    );
+    await done;
+
+    // Past the continuation's coalesce window: no second turn ran.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await stub.getCalls()).toBe(1);
+    ws.close(1000);
   });
 });

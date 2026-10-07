@@ -26,6 +26,10 @@
       {
         "class_name": "ErroringTanstackAgent",
         "name": "ErroringTanstackAgent"
+      },
+      {
+        "class_name": "ClientToolTanstackAgent",
+        "name": "ClientToolTanstackAgent"
       }
     ]
   },
@@ -36,7 +40,8 @@
         "TestTanstackAgent",
         "CancellableTanstackAgent",
         "SlowTanstackAgent",
-        "ErroringTanstackAgent"
+        "ErroringTanstackAgent",
+        "ClientToolTanstackAgent"
       ],
       "tag": "v1"
     }
