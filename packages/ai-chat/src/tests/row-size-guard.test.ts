@@ -365,10 +365,14 @@ describe("Oversized rows and incremental persistence", () => {
       await agentStub.testFlushChunkBuffer();
 
       const chunks = await agentStub.getStreamChunks(streamId);
-      // Should have 2 chunks (the oversized one was skipped)
-      expect(chunks.length).toBe(2);
-      expect(chunks[0].body).toContain("text-start");
-      expect(chunks[1].body).toContain("text-end");
+      // Post-cutover the first content event also synthesizes RUN_STARTED
+      // (3 stored events); the oversized one is still skipped.
+      expect(chunks.length).toBe(3);
+      expect(chunks.some((c) => (c.body as string).length > 1_800_000)).toBe(
+        false
+      );
+      expect(chunks[1].body).toContain("TEXT_MESSAGE_START");
+      expect(chunks[2].body).toContain("TEXT_MESSAGE_END");
 
       ws.close(1000);
     });

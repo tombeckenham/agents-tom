@@ -111,6 +111,13 @@ export type ToolCall = {
     /** JSON-encoded argument object. Parse with `JSON.parse`. */
     arguments: string;
   };
+  /**
+   * CF extension: legacy tool-part fields with no AG-UI slot
+   * (`providerExecuted`, `callProviderMetadata`, `providerMetadata`,
+   * `preliminary`, …) so provider round-trips survive the storage flip.
+   * Spread back onto the projected tool part verbatim.
+   */
+  partExtras?: Record<string, unknown>;
 };
 
 // ============================================================================
@@ -194,6 +201,25 @@ export type AssistantMessage = BaseMessage & {
   extraParts?: AssistantExtraPart[];
   /** CF extension: see {@link ToolApprovalState}. */
   toolApprovals?: Record<string, ToolApprovalState>;
+  /**
+   * CF extension: text stream still open (no `TEXT_MESSAGE_END` yet). Set by
+   * the reducer while streaming; survives on interrupted persists so the
+   * UIMessage projection can mark the part `state: "streaming"`.
+   */
+  partial?: true;
+  /** CF extension: the legacy text part's providerMetadata. */
+  contentProviderMetadata?: unknown;
+  /**
+   * CF extension: original part order within the assistant turn, present only
+   * when it differs from the canonical projection order (extraParts →
+   * toolCalls → text). Tokens: `"text"` (the `content` slot),
+   * `"tool:<toolCallId>"`, `"extra:<index into extraParts>"`. `toUIMessages`
+   * rebuilds parts in this order; without it a turn like
+   * [step-start, tool, step-start, text] would be reordered — and
+   * `convertToModelMessages` splits on step-start, so the model would see the
+   * post-tool answer before the tool result.
+   */
+  partOrder?: string[];
 };
 
 /**
@@ -210,6 +236,9 @@ export type ToolMessage = BaseMessage & {
   content: string;
   error?: string;
   encryptedValue?: string;
+  /** CF extension: result of a provider-executed tool (code_execution,
+   * text_editor, …) whose payload the sanitizer may truncate. */
+  providerExecuted?: true;
 };
 
 /**
@@ -222,6 +251,11 @@ export type ReasoningMessage = BaseMessage & {
   readonly role: "reasoning";
   content?: string;
   encryptedValue?: string;
+  /** CF extension: reasoning stream still open — see AssistantMessage.partial. */
+  partial?: true;
+  /** CF extension: the legacy reasoning part's providerMetadata (e.g.
+   * Anthropic redacted_thinking blocks) — required for provider round-trips. */
+  providerMetadata?: unknown;
 };
 
 /**
@@ -343,6 +377,15 @@ export type RunStartedEvent = BaseAGUIEvent & {
   readonly runId: string;
   readonly parentRunId?: string;
   readonly input?: unknown;
+  /**
+   * CF extension: the assistant message id this run will stream into, when
+   * the producer knows it up front. Lets a client projection emit its leading
+   * `start` chunk with the SAME id the server persists even when the run's
+   * first content is not text (reasoning-first, metadata-first turns) —
+   * without it the client mints an id and the streamed message can never
+   * reconcile with the persisted row.
+   */
+  readonly messageId?: string;
 };
 
 /**
@@ -355,6 +398,10 @@ export type RunFinishedEvent = BaseAGUIEvent & {
   readonly threadId: string;
   readonly runId: string;
   readonly result?: unknown;
+  /** CF extension: synthesized at stream end because the producer never
+   * sent a `finish` chunk — clients projecting back to AI SDK chunks can
+   * skip re-inventing one. */
+  readonly synthesized?: true;
 };
 
 /**
@@ -431,6 +478,9 @@ export type ToolCallStartEvent = BaseAGUIEvent & {
   readonly toolCallId: string;
   readonly toolCallName: string;
   readonly parentMessageId?: string;
+  /** CF extension: synthesized from a non-streamed `tool-input-available`
+   * (the producer never sent a `tool-input-start`). */
+  readonly synthesized?: true;
 };
 
 /**
@@ -442,6 +492,12 @@ export type ToolCallArgsEvent = BaseAGUIEvent & {
   readonly type: "TOOL_CALL_ARGS";
   readonly toolCallId: string;
   readonly delta: string;
+  /**
+   * CF extension: the args were synthesized from a non-streamed
+   * `tool-input-available` (the producer never sent input deltas). A client
+   * projection can skip re-emitting a delta chunk the producer never sent.
+   */
+  readonly synthesized?: true;
 };
 
 /**

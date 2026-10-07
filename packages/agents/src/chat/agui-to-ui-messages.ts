@@ -37,19 +37,53 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
   const ui: UIMessage[] = [];
   // toolCallId -> the tool part awaiting its output.
   const pendingToolParts = new Map<string, Record<string, unknown>>();
+  // toolCallId -> the projected assistant message that owns the part.
+  const pendingToolOwners = new Map<string, UIMessage>();
   // Reasoning rows waiting for their adjacent following assistant.
   let pendingReasoning: Array<{
     id: string;
     metadata?: unknown;
     text: string;
+    partial?: true;
+    providerMetadata?: unknown;
   }> = [];
+
+  // Streamed parts carry a state marker (legacy shape): "done" once the
+  // stream closed, "streaming" while open / when interrupted (`partial`).
+  const partState = (partial: true | undefined) =>
+    partial ? "streaming" : "done";
+
+  // The most recent assistant pushed to `ui` — a reasoning row with no
+  // FOLLOWING assistant (a continuation's reasoning persists after its
+  // assistant in table order) folds onto it as trailing parts.
+  let lastAssistant: UIMessage | null = null;
 
   const flushStandaloneReasoning = () => {
     for (const r of pendingReasoning) {
+      if (lastAssistant) {
+        lastAssistant.parts.push({
+          type: "reasoning",
+          text: r.text,
+          state: partState(r.partial),
+          ...(r.providerMetadata !== undefined && {
+            providerMetadata: r.providerMetadata
+          })
+        } as UIPart);
+        continue;
+      }
       ui.push({
         id: r.id,
         role: "assistant",
-        parts: [{ type: "reasoning", text: r.text }],
+        parts: [
+          {
+            type: "reasoning",
+            text: r.text,
+            state: partState(r.partial),
+            ...(r.providerMetadata !== undefined && {
+              providerMetadata: r.providerMetadata
+            })
+          }
+        ],
         ...(r.metadata !== undefined && { metadata: r.metadata })
       } as UIMessage);
     }
@@ -60,6 +94,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
     switch (message.role) {
       case "user": {
         flushStandaloneReasoning();
+        lastAssistant = null;
         const parts = inputContentToParts(message.content);
         if (parts.length) {
           ui.push({
@@ -77,6 +112,7 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
       case "system":
       case "developer": {
         flushStandaloneReasoning();
+        lastAssistant = null;
         if (!message.content) break;
         // `aguiRole` markers let migrate restore the developer role.
         const metadata =
@@ -98,29 +134,70 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
       case "assistant": {
         const parts: UIPart[] = [];
         for (const r of pendingReasoning) {
-          parts.push({ type: "reasoning", text: r.text });
+          parts.push({
+            type: "reasoning",
+            text: r.text,
+            state: partState(r.partial),
+            ...(r.providerMetadata !== undefined && {
+              providerMetadata: r.providerMetadata
+            })
+          } as UIPart);
         }
         pendingReasoning = [];
-        for (const extra of message.extraParts ?? []) {
-          parts.push(extra as unknown as UIPart);
-        }
+        // Build each part keyed by its `partOrder` token, then emit in the
+        // recorded order (falling back to canonical extras → tools → text).
+        // Tokens missing from `partOrder` (sanitizer dropped a part, or a
+        // producer predates the field) append in canonical order.
+        const keyed: Array<[string, UIPart]> = [];
+        (message.extraParts ?? []).forEach((extra, i) => {
+          keyed.push([`extra:${i}`, extra as unknown as UIPart]);
+        });
         for (const call of message.toolCalls ?? []) {
           const part = toolCallToPart(call, message.toolApprovals?.[call.id]);
           pendingToolParts.set(call.id, part);
-          parts.push(part as unknown as UIPart);
+          keyed.push([`tool:${call.id}`, part as unknown as UIPart]);
         }
         if (message.content) {
-          parts.push({ type: "text", text: message.content });
+          keyed.push([
+            "text",
+            {
+              type: "text",
+              text: message.content,
+              state: partState(message.partial),
+              ...(message.contentProviderMetadata !== undefined && {
+                providerMetadata: message.contentProviderMetadata
+              })
+            } as UIPart
+          ]);
+        }
+        if (message.partOrder) {
+          const byToken = new Map(keyed);
+          for (const token of message.partOrder) {
+            const part = byToken.get(token);
+            if (part === undefined) continue; // dangling token: tolerate
+            parts.push(part);
+            byToken.delete(token);
+          }
+          for (const [token, part] of keyed) {
+            if (byToken.has(token)) parts.push(part);
+          }
+        } else {
+          for (const [, part] of keyed) parts.push(part);
         }
         if (parts.length) {
-          ui.push({
+          const assistant = {
             id: message.id,
             role: "assistant",
             parts,
             ...(message.metadata !== undefined && {
               metadata: message.metadata
             })
-          } as UIMessage);
+          } as UIMessage;
+          for (const call of message.toolCalls ?? []) {
+            pendingToolOwners.set(call.id, assistant);
+          }
+          ui.push(assistant);
+          lastAssistant = assistant;
         }
         break;
       }
@@ -136,14 +213,40 @@ export function toUIMessages(messages: readonly AGUIMessage[]): UIMessage[] {
           part.state = "output-available";
           part.output = parseJSON(message.content);
         }
+        // Fold the tool row's compaction marker onto the owning assistant.
+        const compacted =
+          isObject(message.metadata) &&
+          Array.isArray(message.metadata.compactedToolOutputs)
+            ? (message.metadata.compactedToolOutputs as string[])
+            : undefined;
+        const owner = pendingToolOwners.get(message.toolCallId);
+        if (compacted && owner) {
+          const prior = isObject(owner.metadata)
+            ? (owner.metadata as Record<string, unknown>)
+            : {};
+          const existing = Array.isArray(prior.compactedToolOutputs)
+            ? (prior.compactedToolOutputs as string[])
+            : [];
+          owner.metadata = {
+            ...prior,
+            compactedToolOutputs: [...existing, ...compacted]
+          };
+        }
+        pendingToolOwners.delete(message.toolCallId);
         break;
       }
 
       case "reasoning": {
-        if (!message.content) break;
+        // Empty reasoning still projects when it carries providerMetadata
+        // (e.g. Anthropic redacted_thinking blocks round-trip).
+        if (!message.content && message.providerMetadata === undefined) break;
         pendingReasoning.push({
           id: message.id,
-          text: message.content,
+          text: message.content ?? "",
+          ...(message.partial && { partial: message.partial }),
+          ...(message.providerMetadata !== undefined && {
+            providerMetadata: message.providerMetadata
+          }),
           ...(message.metadata !== undefined && { metadata: message.metadata })
         });
         break;
@@ -167,7 +270,9 @@ function toolCallToPart(
     type: `tool-${call.function.name}`,
     toolCallId: call.id,
     toolName: call.function.name,
-    input: parseJSON(call.function.arguments)
+    input: parseJSON(call.function.arguments),
+    // Legacy tool-part fields with no AG-UI slot round-trip verbatim.
+    ...call.partExtras
   };
   if (!approval) return { ...base, state: "input-available" };
   const approvalField = {

@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import type { UIMessage as ChatMessage } from "ai";
 import { getAgentByName } from "agents";
+import { wrapLegacyWireWS } from "./test-utils";
 
 describe("Message Structural Validation", () => {
   async function setupAgent(room: string) {
@@ -10,7 +11,7 @@ describe("Message Structural Validation", () => {
       { headers: { Upgrade: "websocket" } }
     );
     expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
+    const ws = wrapLegacyWireWS(res.webSocket as WebSocket);
     ws.accept();
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
@@ -159,7 +160,8 @@ describe("Message Structural Validation", () => {
     const persisted = await getValidatedMessages(room);
     expect(persisted.length).toBe(1);
     expect(persisted[0].id).toBe("empty-parts");
-    expect(persisted[0].parts).toEqual([]);
+    // Post-cutover the row is served in AG-UI shape (no parts field).
+    expect(persisted[0].parts ?? []).toEqual([]);
 
     ws.close(1000);
   });

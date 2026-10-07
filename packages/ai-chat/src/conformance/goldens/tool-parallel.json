@@ -111,7 +111,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -121,7 +121,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-5",
+            "id": "part-1",
             "delta": "21C at 09:00"
           },
           "done": false,
@@ -132,7 +132,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-2",
@@ -171,9 +171,9 @@
   ],
   "persistedRows": [
     {
-      "id": "id-6",
+      "id": "id-5",
       "message": {
-        "id": "id-6",
+        "id": "id-5",
         "role": "user",
         "parts": [
           {
@@ -229,7 +229,7 @@
   ],
   "clientView": [
     {
-      "id": "id-6",
+      "id": "id-5",
       "role": "user",
       "parts": [
         {

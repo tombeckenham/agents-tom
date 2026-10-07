@@ -25,15 +25,28 @@ export type ChunkToEventProjectorOptions = {
   threadId?: string;
   /** Stable run id; defaults to a freshly generated one. */
   runId?: string;
+  /**
+   * Assistant message id to anchor the run on when the producer's `start`
+   * chunk carries none — a continuation turn passes the seed assistant's id
+   * so the streamed text extends that message instead of opening a new one.
+   */
+  messageId?: string;
+  /**
+   * When true, `messageId` outranks a producer-supplied `start.messageId`
+   * (#1229): a continuation must extend the seed assistant even when the
+   * provider mints a fresh message id, or the turn forks a duplicate.
+   */
+  messageIdAuthoritative?: boolean;
 };
 
 export class ChunkToEventProjector {
   private readonly threadId: string;
   private readonly runId: string;
   private runStarted = false;
-  // Assistant message id from the Vercel `start` chunk; carried onto tool
-  // calls as `parentMessageId` since AG-UI keeps no run-level message id.
-  private runMessageId: string | null = null;
+  // Assistant message id from the Vercel `start` chunk (or the caller's
+  // `messageId` option); carried onto tool calls as `parentMessageId` since
+  // AG-UI keeps no run-level message id. Generated at RUN_STARTED if absent.
+  private runMessageId: string | null;
   // Vercel text part id -> the AG-UI message id it maps to.
   private textPartMessageIds = new Map<string, string>();
   private runFinished = false;
@@ -42,6 +55,10 @@ export class ChunkToEventProjector {
   // when synthesizing `TEXT_MESSAGE_END` etc.
   private currentTextId: string | null = null;
   private currentReasoningId: string | null = null;
+  // Vercel reasoning part id -> the AG-UI message id it maps to. Reasoning
+  // ids are PART ids that producers reuse across turns; mapping them to a
+  // fresh per-run id keeps two turns from colliding on one persisted row.
+  private reasoningMessageIds = new Map<string, string>();
   // Vercel `tool-input-start` arrives without args; AG-UI emits a separate
   // `TOOL_CALL_START`. We track the toolName per id so tool-output frames
   // can include it on `TOOL_CALL_RESULT`.
@@ -54,20 +71,41 @@ export class ChunkToEventProjector {
   // any get their arguments synthesized from `tool-input-available.input`.
   private argsEmitted = new Set<string>();
 
+  private readonly runMessageIdLocked: boolean;
+
   constructor(options?: ChunkToEventProjectorOptions) {
     this.threadId = options?.threadId ?? nanoid();
     this.runId = options?.runId ?? nanoid();
+    this.runMessageId = options?.messageId ?? null;
+    this.runMessageIdLocked =
+      options?.messageIdAuthoritative === true && options?.messageId != null;
   }
 
   /** Project a single Vercel `UIMessageChunk` into zero or more `AGUIEvent`s. */
   project(chunk: UIMessageChunk): AGUIEvent[] {
     switch (chunk.type) {
-      case "start":
+      case "start": {
         // `RUN_STARTED` has no message id, so remember the one the Vercel
         // `start` carries and hand it to tool calls as `parentMessageId` —
         // the only id source a tool-first turn has. See `toolCallStart`.
-        if (chunk.messageId != null) this.runMessageId = chunk.messageId;
-        return this.emitRunStarted();
+        // An authoritative anchor (continuation seed, #1229) outranks it.
+        if (chunk.messageId != null && !this.runMessageIdLocked) {
+          this.runMessageId = chunk.messageId;
+        }
+        const events = this.emitRunStarted();
+        // A `start` can carry messageMetadata (the AI SDK writes it onto the
+        // message); forward it so the reducer attaches it to the assistant.
+        const startMetadata = (chunk as { messageMetadata?: unknown })
+          .messageMetadata;
+        if (startMetadata !== undefined) {
+          events.push({
+            type: "CUSTOM",
+            name: "cf.agents.message_metadata",
+            value: startMetadata
+          });
+        }
+        return events;
+      }
 
       case "start-step":
         return [{ type: "STEP_STARTED", stepName: "step" }];
@@ -77,7 +115,7 @@ export class ChunkToEventProjector {
 
       case "text-start": {
         const events = this.emitRunStarted();
-        const messageId = this.textMessageId(chunk.id);
+        const messageId = this.textMessageId(chunk.id ?? "__text");
         this.currentTextId = messageId;
         events.push({
           type: "TEXT_MESSAGE_START",
@@ -91,7 +129,7 @@ export class ChunkToEventProjector {
         return [
           {
             type: "TEXT_MESSAGE_CONTENT",
-            messageId: this.textMessageId(chunk.id),
+            messageId: this.textMessageId(chunk.id ?? "__text"),
             delta: chunk.delta
           }
         ];
@@ -99,32 +137,49 @@ export class ChunkToEventProjector {
       case "text-end":
         this.currentTextId = null;
         return [
-          { type: "TEXT_MESSAGE_END", messageId: this.textMessageId(chunk.id) }
+          {
+            type: "TEXT_MESSAGE_END",
+            messageId: this.textMessageId(chunk.id ?? "__text")
+          }
         ];
 
       case "reasoning-start": {
         const events = this.emitRunStarted();
-        this.currentReasoningId = chunk.id;
+        // Some producers omit the part id; AG-UI requires one — synthesize.
+        const reasoningId = this.reasoningMessageId(chunk.id);
+        this.currentReasoningId = reasoningId;
         events.push({
           type: "REASONING_MESSAGE_START",
-          messageId: chunk.id,
+          messageId: reasoningId,
           role: "reasoning"
         });
         return events;
       }
 
-      case "reasoning-delta":
+      case "reasoning-delta": {
+        const reasoningId =
+          chunk.id != null
+            ? this.reasoningMessageId(chunk.id)
+            : this.currentReasoningId;
+        if (reasoningId == null) return [];
         return [
           {
             type: "REASONING_MESSAGE_CONTENT",
-            messageId: chunk.id,
+            messageId: reasoningId,
             delta: chunk.delta
           }
         ];
+      }
 
-      case "reasoning-end":
+      case "reasoning-end": {
+        const reasoningId =
+          chunk.id != null
+            ? this.reasoningMessageId(chunk.id)
+            : this.currentReasoningId;
         this.currentReasoningId = null;
-        return [{ type: "REASONING_MESSAGE_END", messageId: chunk.id }];
+        if (reasoningId == null) return [];
+        return [{ type: "REASONING_MESSAGE_END", messageId: reasoningId }];
+      }
 
       case "tool-input-start": {
         const events = this.emitRunStarted();
@@ -151,14 +206,20 @@ export class ChunkToEventProjector {
         const events = this.emitRunStarted();
         if (!this.toolNamesById.has(chunk.toolCallId)) {
           this.toolNamesById.set(chunk.toolCallId, chunk.toolName);
-          events.push(this.toolCallStart(chunk.toolCallId, chunk.toolName));
+          events.push({
+            ...this.toolCallStart(chunk.toolCallId, chunk.toolName),
+            synthesized: true
+          } as AGUIEvent);
         }
         if (!this.argsEmitted.has(chunk.toolCallId)) {
           this.argsEmitted.add(chunk.toolCallId);
           events.push({
             type: "TOOL_CALL_ARGS",
             toolCallId: chunk.toolCallId,
-            delta: JSON.stringify(chunk.input ?? {})
+            delta: JSON.stringify(chunk.input ?? {}),
+            // The producer never streamed deltas; a client projection can
+            // skip re-emitting a delta chunk the producer never sent.
+            synthesized: true
           });
         }
         this.endedToolCalls.add(chunk.toolCallId);
@@ -308,7 +369,13 @@ export class ChunkToEventProjector {
   /** Emit a synthetic `RUN_FINISHED` if no `finish` chunk arrived. */
   flush(): AGUIEvent[] {
     if (this.runFinished || !this.runStarted) return [];
-    return this.emitRunFinished("stop");
+    // No finishReason: the producer never said why it stopped, and the
+    // legacy engine emitted a bare `finish` in that case. Marked
+    // synthesized so a chunk projection can skip re-inventing the finish
+    // chunk the producer never sent.
+    return this.emitRunFinished().map(
+      (event) => ({ ...event, synthesized: true }) as AGUIEvent
+    );
   }
 
   /**
@@ -328,12 +395,31 @@ export class ChunkToEventProjector {
   private textMessageId(partId: string): string {
     const known = this.textPartMessageIds.get(partId);
     if (known) return known;
+    // Later parts mint a fresh id rather than passing the part id through:
+    // AI SDK part ids are POSITIONAL ("0", "1", … reset per response), so a
+    // verbatim id collides with the previous turn's second text part and
+    // overwrites its persisted row. Same fix as `reasoningMessageId`. With
+    // no run anchor at all (a mid-stream fragment translated without its
+    // RUN_STARTED, e.g. resume replay) the part id passes through so frames
+    // stay correlated with the stream's earlier, untranslated frames.
     const messageId =
-      this.runMessageId != null && this.textPartMessageIds.size === 0
-        ? this.runMessageId
-        : partId;
+      this.runMessageId == null
+        ? partId
+        : this.textPartMessageIds.size === 0
+          ? this.runMessageId
+          : nanoid();
     this.textPartMessageIds.set(partId, messageId);
     return messageId;
+  }
+
+  private reasoningMessageId(partId: string | undefined): string {
+    if (partId == null) return nanoid();
+    let mapped = this.reasoningMessageIds.get(partId);
+    if (!mapped) {
+      mapped = nanoid();
+      this.reasoningMessageIds.set(partId, mapped);
+    }
+    return mapped;
   }
 
   private toolCallStart(toolCallId: string, toolCallName: string): AGUIEvent {
@@ -350,8 +436,24 @@ export class ChunkToEventProjector {
   private emitRunStarted(): AGUIEvent[] {
     if (this.runStarted) return [];
     this.runStarted = true;
+    // No message id from the producer (a bare `start` chunk, or none at
+    // all): generate one, exactly like the legacy engine generated an
+    // assistant id per turn. Without it, part ids leak into AG-UI message
+    // ids — two turns reusing a part id ("t-1") would collide on the same
+    // persisted assistant row, and a tool+text turn would split into two
+    // assistant messages.
+    this.runMessageId ??= nanoid();
+    // CF extension: carry the run's assistant id so a client projection can
+    // open its leading `start` chunk with the SAME id the server persists,
+    // even when the run's first content is not text (reasoning-first,
+    // metadata-first turns).
     return [
-      { type: "RUN_STARTED", threadId: this.threadId, runId: this.runId }
+      {
+        type: "RUN_STARTED",
+        threadId: this.threadId,
+        runId: this.runId,
+        messageId: this.runMessageId
+      }
     ];
   }
 
@@ -386,12 +488,22 @@ export class ChunkToEventProjector {
       );
       return [];
     }
-    const dataValue = (chunk as { data?: unknown }).data;
+    // Wrap so the part's `id`/`transient` round-trip (the reducer persists
+    // `id` on the extra part; `transient` parts are never persisted).
+    const { id, data, transient } = chunk as {
+      id?: string;
+      data?: unknown;
+      transient?: boolean;
+    };
     return [
       {
         type: "CUSTOM",
         name: `data.${typeName.slice("data-".length)}`,
-        value: dataValue
+        value: {
+          ...(id !== undefined && { id }),
+          data,
+          ...(transient !== undefined && { transient })
+        }
       }
     ];
   }
@@ -411,22 +523,28 @@ export function projectChunkStreamToAGUISSE(
   const reader = chunks.getReader();
 
   return new ReadableStream<Uint8Array>({
+    // Same contract as parseUIMessageSSE's pull: never resolve without
+    // enqueueing or closing, or a cross-context consumer can be stranded.
     async pull(controller) {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          for (const event of projector.flush()) {
+        let enqueued = false;
+        while (!enqueued) {
+          const { done, value } = await reader.read();
+          if (done) {
+            for (const event of projector.flush()) {
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+              );
+            }
+            controller.close();
+            return;
+          }
+          for (const event of projector.project(value)) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
             );
+            enqueued = true;
           }
-          controller.close();
-          return;
-        }
-        for (const event of projector.project(value)) {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
-          );
         }
       } catch (error) {
         controller.error(error);

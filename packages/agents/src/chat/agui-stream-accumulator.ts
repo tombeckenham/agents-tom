@@ -102,6 +102,11 @@ export class AGUIStreamAccumulator {
     return this._state.state;
   }
 
+  /** The most recent RUN_ERROR, if the stream carried one. */
+  get lastError(): { message: string; code?: string } | undefined {
+    return this._state.lastError;
+  }
+
   get pendingApprovals(): ReadonlyMap<string, CFToolApprovalRequestValue> {
     return this._state.pendingApprovals;
   }

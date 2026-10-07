@@ -125,7 +125,9 @@ describe("agui-migration", () => {
               arguments: JSON.stringify({ q: "agents" })
             }
           }
-        ]
+        ],
+        // Text preceded the tool part — non-canonical order is recorded.
+        partOrder: ["text", "tool:call_1"]
       },
       {
         id: "a2-tool-0",
@@ -390,6 +392,69 @@ describe("agui-migration", () => {
       expect(rows).toEqual([
         { id: "a1", role: "reasoning", content: "only thinking" }
       ]);
+    });
+
+    it("preserves interleaved part order via partOrder ([step-start, tool, step-start, text])", () => {
+      const transcript = [
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [
+            { type: "step-start" },
+            {
+              type: "tool-search",
+              toolCallId: "c-1",
+              state: "output-available",
+              input: { q: "x" },
+              output: { hits: 3 }
+            },
+            { type: "step-start" },
+            { type: "text", text: "answer" }
+          ]
+        }
+      ];
+      const rows = transcript.flatMap((m) => migrateUIMessageToAGUI(m));
+      const assistant = rows.find((r) => r.role === "assistant") as {
+        partOrder?: string[];
+      };
+      expect(assistant.partOrder).toEqual([
+        "extra:0",
+        "tool:c-1",
+        "extra:1",
+        "text"
+      ]);
+      const projected = toUIMessages(rows as AGUIMessage[]);
+      // Without partOrder the canonical order would hoist the second
+      // step-start ahead of the tool part — and convertToModelMessages
+      // splits on step-start, putting the answer before the tool result.
+      expect(projected[0].parts.map((p) => p.type)).toEqual([
+        "step-start",
+        "tool-search",
+        "step-start",
+        "text"
+      ]);
+      const second = projected.flatMap((m) => migrateUIMessageToAGUI(m));
+      expect(second).toEqual(rows);
+    });
+
+    it("omits partOrder when parts are already in canonical order", () => {
+      const rows = migrateUIMessageToAGUI({
+        id: "a1",
+        role: "assistant",
+        parts: [
+          { type: "step-start" },
+          {
+            type: "tool-search",
+            toolCallId: "c-1",
+            state: "output-available",
+            input: {},
+            output: {}
+          },
+          { type: "text", text: "answer" }
+        ]
+      });
+      const assistant = rows.find((r) => r.role === "assistant");
+      expect(assistant).not.toHaveProperty("partOrder");
     });
 
     it("holds for approval and error tool states", () => {

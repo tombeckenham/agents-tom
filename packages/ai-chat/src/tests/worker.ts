@@ -34,8 +34,74 @@ import type {
 import {
   CHAT_RECOVERY_TASK_NAME,
   ResumableStream,
-  chatRecoveryTaskRunOptions
+  chatRecoveryTaskRunOptions,
+  toUIMessages
 } from "agents/chat";
+import { ChunkToEventProjector } from "@cloudflare/ai-chat-vercel";
+
+/**
+ * Stateful translator: legacy AI SDK chunk bodies (often without part ids)
+ * → the AG-UI event bodies the engine stores. One instance per seeded
+ * stream; no flush, so an interrupted seed never gains a RUN_FINISHED it
+ * never had.
+ */
+type SeedTranslator = (body: string) => string[];
+
+function createSeedTranslator(anchorMessageId?: string): SeedTranslator {
+  // Anchoring mirrors the live path: the server-side chunk-to-event
+  // projection injects the allocated/seed assistant id when the producer's
+  // start chunk carries none.
+  const projector = new ChunkToEventProjector(
+    anchorMessageId !== undefined ? { messageId: anchorMessageId } : undefined
+  );
+  let counter = 0;
+  let currentTextId: string | undefined;
+  let currentReasoningId: string | undefined;
+  return (body) => {
+    let chunk: Record<string, unknown>;
+    try {
+      chunk = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return [body];
+    }
+    const type = chunk.type as string;
+    if (typeof type !== "string" || type === type.toUpperCase()) {
+      // Already an AG-UI event (or unknown) — store verbatim.
+      return [body];
+    }
+    if ((type === "text-start" || type === "reasoning-start") && !chunk.id) {
+      const id = `seed-part-${counter++}`;
+      if (type === "text-start") currentTextId = id;
+      else currentReasoningId = id;
+      chunk.id = id;
+    } else if ((type === "text-delta" || type === "text-end") && !chunk.id) {
+      chunk.id = currentTextId;
+    } else if (
+      (type === "reasoning-delta" || type === "reasoning-end") &&
+      !chunk.id
+    ) {
+      chunk.id = currentReasoningId;
+    }
+    const events = projector.project(chunk as never);
+    // Unknown/opaque bodies (storage-mechanics tests store `{"type":"text"}`
+    // payloads) keep their original bytes.
+    if (events.length === 0) return [body];
+    return events.map((event) => JSON.stringify(event));
+  };
+}
+
+/** One-shot translation for a whole seeded chunk list. */
+function toAGUISeedBodies(
+  chunks: Array<{ body: string; index: number }>,
+  anchorMessageId?: string
+): string[] {
+  const translate = createSeedTranslator(anchorMessageId);
+  const out: string[] = [];
+  for (const { body } of [...chunks].sort((a, b) => a.index - b.index)) {
+    out.push(...translate(body));
+  }
+  return out;
+}
 
 // Type helper for tool call parts - extracts from ChatMessage parts
 type TestToolCallPart = Extract<
@@ -43,10 +109,24 @@ type TestToolCallPart = Extract<
   { type: `tool-${string}` }
 >;
 
-/** The STORED rows, reassembled from their continuation rows. */
-async function persistedMessages(agent: AIChatAgent): Promise<ChatMessage[]> {
-  const history = await agent.sessions.session().getHistory();
-  return history as ChatMessage[];
+/**
+ * Legacy-AIChatAgent internals upstream's helpers reach for that the AG-UI
+ * engine does not have (yet). Going through this keeps those helpers compiled;
+ * the tests that depend on them fail at runtime and stay as the porting spec.
+ */
+type UnportedLegacyInternals = {
+  sessions: {
+    subscribe(listener: () => void): unknown;
+    session(): { clearMessages(): Promise<void> };
+  };
+  _agentToolTerminalOnlyRuns: Set<string>;
+  inspectAgentToolRun(
+    runId: string,
+    options?: { reconcile?: boolean }
+  ): Promise<AgentToolRunInspection | null>;
+};
+function unported(agent: object): UnportedLegacyInternals {
+  return agent as unknown as UnportedLegacyInternals;
 }
 
 const sessionChangeCounters = new WeakMap<AIChatAgent, { count: number }>();
@@ -60,14 +140,18 @@ function sessionChangeEventCount(agent: AIChatAgent): number {
   if (existing) return existing.count;
   const counter = { count: 0 };
   sessionChangeCounters.set(agent, counter);
-  agent.sessions.subscribe(() => {
+  unported(agent).sessions.subscribe(() => {
     counter.count++;
   });
   return counter.count;
 }
 
+// The engine persists its transcript in `cf_ai_chat_agent_messages`.
 async function persistedMessageCount(agent: AIChatAgent): Promise<number> {
-  return (await agent.sessions.session().getHistory()).length;
+  const rows = agent.sql<{ cnt: number }>`
+    select count(*) as cnt from cf_ai_chat_agent_messages
+  `;
+  return rows[0]?.cnt ?? 0;
 }
 
 function makeSSEChunkResponse(chunks: ReadonlyArray<Record<string, unknown>>) {
@@ -544,22 +628,28 @@ export class TestChatAgent extends AIChatAgent<Env> {
   // auto-continuation (issue #1404).
   async testApplyToolResult(
     toolCallId: string,
-    toolName: string,
+    _toolName: string,
     output: unknown,
     overrideState?: "output-error",
     errorText?: string
   ): Promise<boolean> {
+    // Engine signature: (toolCallId, output, errorText?) — the error branch
+    // is selected by a defined errorText.
     return (
       this as unknown as {
         _applyToolResult(
           toolCallId: string,
-          toolName: string,
           output: unknown,
-          overrideState?: "output-error",
           errorText?: string
         ): Promise<boolean>;
       }
-    )._applyToolResult(toolCallId, toolName, output, overrideState, errorText);
+    )._applyToolResult(
+      toolCallId,
+      output,
+      overrideState === "output-error"
+        ? (errorText ?? "Tool execution failed.")
+        : undefined
+    );
   }
 
   private _getChainedContinuationRegressionResponse(): Response | undefined {
@@ -709,13 +799,17 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   isChatTurnActiveForTest(): boolean {
-    return (
-      this as unknown as { isChatTurnActive(): boolean }
-    ).isChatTurnActive();
+    return (this as unknown as { _turnQueue: { isActive: boolean } })._turnQueue
+      .isActive;
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   getChatMessageCallCountForTest(): number {
@@ -751,8 +845,13 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return this._resumableStream.getAllStreamMetadata()[0]?.status ?? null;
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   async getMessagesForTest(): Promise<ChatMessage[]> {
@@ -780,7 +879,7 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   async clearSessionForTest(): Promise<void> {
-    await this.sessions.session().clearMessages();
+    await unported(this).sessions.session().clearMessages();
     this.messages = [];
   }
 
@@ -991,11 +1090,30 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return this._startStream(requestId, options);
   }
 
+  // Legacy chunk bodies handed by the tests are translated to the AG-UI
+  // events the engine stores; one stateful translator per stream.
+  private _seedTranslators = new Map<string, SeedTranslator>();
+
+  private _translateSeed(streamId: string, body: string): string[] {
+    let translate = this._seedTranslators.get(streamId);
+    if (!translate) {
+      translate = createSeedTranslator();
+      this._seedTranslators.set(streamId, translate);
+    }
+    return translate(body);
+  }
+
   async testStoreStreamChunk(
     streamId: string,
     body: string
   ): Promise<number | undefined> {
-    return this._storeStreamChunk(streamId, body);
+    let stored: number | undefined;
+    for (const eventBody of this._translateSeed(streamId, body)) {
+      stored = (await this._storeStreamChunk(streamId, eventBody)) as
+        | number
+        | undefined;
+    }
+    return stored;
   }
 
   async testBroadcastLiveChunk(
@@ -1003,21 +1121,23 @@ export class TestChatAgent extends AIChatAgent<Env> {
     streamId: string,
     body: string
   ): Promise<void> {
-    await this._storeStreamChunk(streamId, body);
-    const message: OutgoingMessage = {
-      body,
-      done: false,
-      id: requestId,
-      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
-    };
-    (
+    const broadcast = (
       this as unknown as {
         _broadcastChatMessage: (
           msg: OutgoingMessage,
           exclude?: string[]
         ) => void;
       }
-    )._broadcastChatMessage(message);
+    )._broadcastChatMessage.bind(this);
+    for (const eventBody of this._translateSeed(streamId, body)) {
+      await this._storeStreamChunk(streamId, eventBody);
+      broadcast({
+        body: eventBody,
+        done: false,
+        id: requestId,
+        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+      });
+    }
   }
 
   testFlushChunkBuffer(): void {
@@ -1161,7 +1281,13 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   testRestoreActiveStream(): void {
-    this._restoreActiveStream();
+    // The engine restores active-stream state in the ResumableStream
+    // constructor; recreating it re-runs that restore (what the legacy
+    // `_restoreActiveStream` did in place).
+    this._resumableStream = new ResumableStream(
+      this.streams,
+      this.sql.bind(this)
+    );
   }
 
   /** Reclaim leftover chat streams now, as the next stream start would. */
@@ -1182,6 +1308,11 @@ export class TestChatAgent extends AIChatAgent<Env> {
    * _activeStreamId, but _isLive remains false (no live LLM reader).
    * This mimics the DO constructor running after eviction.
    */
+  /** Drive the orphan reconstruction directly (idempotency coverage). */
+  async testPersistOrphanedStream(streamId: string): Promise<void> {
+    await this._persistOrphanedStream(streamId);
+  }
+
   testSimulateHibernationWake(): void {
     this._resumableStream = new ResumableStream(
       this.streams,
@@ -1194,18 +1325,9 @@ export class TestChatAgent extends AIChatAgent<Env> {
    * Used to test validation of malformed/corrupt messages.
    */
   async insertRawMessage(rowId: string, rawJson: string): Promise<void> {
-    const parentId =
-      (await this.sessions.session().getLatestLeaf())?.id ?? null;
     this.sql`
-      INSERT INTO cf_agents_session_messages
-        (id, session_id, seq, parent_id, role, content, token_estimate,
-         created_at)
-      VALUES (
-        ${rowId}, '',
-        (SELECT COALESCE(MAX(seq), 0) + 1
-         FROM cf_agents_session_messages WHERE session_id = ''),
-        ${parentId}, 'user', ${rawJson}, 0, ${Date.now()}
-      )
+      insert into cf_ai_chat_agent_messages (id, message)
+      values (${rowId}, ${rawJson})
     `;
   }
 
@@ -1285,8 +1407,13 @@ export class CustomSanitizeAgent extends AIChatAgent<Env> {
     };
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1422,8 +1549,13 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
     return [...this._startedRequestIds];
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getRequestStartTime(requestId: string): number | null {
@@ -1431,13 +1563,17 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
   }
 
   isChatTurnActiveForTest(): boolean {
-    return (
-      this as unknown as { isChatTurnActive(): boolean }
-    ).isChatTurnActive();
+    return (this as unknown as { _turnQueue: { isActive: boolean } })._turnQueue
+      .isActive;
   }
 
   async waitForIdleForTest(): Promise<boolean> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
     return true;
   }
 
@@ -1473,9 +1609,15 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
   }
 
   abortActiveTurnForTest(): boolean {
-    return (
-      this as unknown as { abortActiveTurn(): boolean }
-    ).abortActiveTurn();
+    // Engine shape: abort the active stream's request via the registry.
+    const internals = this as unknown as {
+      _activeRequestId: string | null;
+      _abortRegistry: { cancel(id: string): void };
+    };
+    const requestId = internals._activeRequestId;
+    if (!requestId) return false;
+    internals._abortRegistry.cancel(requestId);
+    return true;
   }
 
   resetTurnStateForTest(): void {
@@ -1857,11 +1999,21 @@ export class ResponseAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1904,8 +2056,13 @@ export class ResponseContinuationAgent extends AIChatAgent<Env> {
     this._failContinuation = value;
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1948,8 +2105,13 @@ export class ResponseThrowingAgent extends AIChatAgent<Env> {
     return this._streamCompleted;
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -1995,11 +2157,21 @@ export class ResponseSaveMessagesAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 }
 
@@ -2210,7 +2382,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
    */
   _simulateTransientErrorMessage: string | null = null;
 
-  protected override async _chatRecoveryContinueDetached(
+  override async _chatRecoveryContinue(
     ...args: Parameters<AIChatAgent<Env>["_chatRecoveryContinue"]>
   ): Promise<void> {
     if (this._simulateSupersededIsolate) {
@@ -2224,7 +2396,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
         { cause: new Error(this._simulateTransientErrorMessage) }
       );
     }
-    return super._chatRecoveryContinueDetached(...args);
+    return super._chatRecoveryContinue(...args);
   }
 
   setSimulateSupersededIsolateForTest(value: boolean): void {
@@ -2330,25 +2502,32 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
 
     const start = await read();
     const streamId = self._resumableStream.start("req-progress-immunity");
-    await self._storeStreamChunk(
-      streamId,
-      JSON.stringify({ type: "text-start", id: "t" })
-    );
+    // Post-cutover the engine stores AG-UI events; milestones credit progress.
     await self._storeStreamChunk(
       streamId,
       JSON.stringify({
-        type: "tool-input-available",
-        toolCallId: "tc1",
-        toolName: "x",
-        input: {}
+        type: "TEXT_MESSAGE_START",
+        messageId: "t",
+        role: "assistant"
       })
     );
     await self._storeStreamChunk(
       streamId,
       JSON.stringify({
-        type: "tool-output-available",
+        type: "TOOL_CALL_START",
         toolCallId: "tc1",
-        output: { ok: true }
+        toolCallName: "x",
+        parentMessageId: "t"
+      })
+    );
+    await self._storeStreamChunk(
+      streamId,
+      JSON.stringify({
+        type: "TOOL_CALL_RESULT",
+        messageId: "tool-tc1",
+        toolCallId: "tc1",
+        content: '{"ok":true}',
+        role: "tool"
       })
     );
     const afterFlush = await read();
@@ -2753,7 +2932,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   async runChatRecoveryContinueDirectForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await super._chatRecoveryContinueDetached(
+    await super._chatRecoveryContinue(
       data as Parameters<AIChatAgent<Env>["_chatRecoveryContinue"]>[0]
     );
   }
@@ -2761,7 +2940,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   async runChatRecoveryRetryDirectForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await super._chatRecoveryRetryDetached(
+    await super._chatRecoveryRetry(
       data as Parameters<AIChatAgent<Env>["_chatRecoveryRetry"]>[0]
     );
   }
@@ -3200,8 +3379,13 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     this.messages = this.messages.filter((m) => m.role !== "assistant");
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getPartialText(streamId?: string) {
@@ -3228,7 +3412,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     lastBody?: Record<string, unknown>;
     lastClientTools?: ClientToolSchema[];
   }): Promise<void> {
-    await this._chatRecoveryRetryDetached(options);
+    await this._chatRecoveryRetry(options);
   }
 
   private async _runQueuedRecoveryTaskForTest(
@@ -3260,7 +3444,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       WHERE id = ${`task:${runId}`}
     `;
     await this.alarm();
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    await this.waitForIdleForTest();
     return true;
   }
 
@@ -3300,10 +3484,10 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       LIMIT 1
     `;
     if (!rows[0]) {
-      await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+      await this.waitForIdleForTest();
       return;
     }
-    await this._chatRecoveryRetryDetached(
+    await this._chatRecoveryRetry(
       JSON.parse(rows[0].payload) as {
         targetUserId?: string;
         lastBody?: Record<string, unknown>;
@@ -3323,10 +3507,10 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       LIMIT 1
     `;
     if (!rows[0]) {
-      await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+      await this.waitForIdleForTest();
       return;
     }
-    await this._chatRecoveryContinueDetached(
+    await this._chatRecoveryContinue(
       JSON.parse(rows[0].payload) as {
         targetAssistantId?: string;
         lastBody?: Record<string, unknown> | null;
@@ -3465,7 +3649,12 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   async triggerInterruptedStreamCheck(): Promise<void> {
@@ -3553,18 +3742,21 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     // metadata, simulating a stream row written before message-id tracking.
     const streamMetadata: Record<string, unknown> = { cfChat: 1 };
     if (metadata?.messageId) streamMetadata.messageId = metadata.messageId;
+    // Seeds predate the cutover and carry AI SDK chunk bodies; the engine
+    // stores AG-UI events — translate at insertion.
+    const bodies = toAGUISeedBodies(chunks, metadata?.messageId);
     this.sql`
       insert into cf_agents_streams
         (stream_id, state, tag, metadata, chunk_count, created_at, updated_at)
       values (${streamId}, 'streaming', ${requestId}, ${JSON.stringify(streamMetadata)},
-              ${chunks.length}, ${createdAt}, ${createdAt})
+              ${bodies.length}, ${createdAt}, ${createdAt})
     `;
-    if (chunks.length > 0) {
-      const body = chunks.map((c) => JSON.stringify(c.body)).join(",");
+    if (bodies.length > 0) {
+      const body = bodies.map((b) => JSON.stringify(b)).join(",");
       this.sql`
         insert into cf_agents_stream_blocks
           (stream_id, block, seq_from, seq_to, body, created_at, updated_at)
-        values (${streamId}, 0, ${chunks[0].index}, ${chunks[chunks.length - 1].index + 1},
+        values (${streamId}, 0, 0, ${bodies.length},
                 ${body}, ${createdAt}, ${createdAt})
       `;
     }
@@ -3679,8 +3871,13 @@ export class NonChatRecoveryTestAgent extends AIChatAgent<Env> {
     return this.recoveryContexts;
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getOnChatMessageCallCount(): number {
@@ -3706,7 +3903,12 @@ export class NonChatRecoveryTestAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 }
 
@@ -3738,8 +3940,13 @@ export class RecoveryThrowingAgent extends AIChatAgent<Env> {
     return this.onChatMessageCallCount;
   }
 
-  getPersistedMessages(): Promise<ChatMessage[]> {
-    return persistedMessages(this);
+  getPersistedMessages(): ChatMessage[] {
+    // Rows are AG-UI post-cutover; assertions target the projected contract.
+    const rows = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+    return toUIMessages(rows) as ChatMessage[];
   }
 
   getActiveFibers(): Array<{ id: string; name: string }> {
@@ -3759,7 +3966,12 @@ export class RecoveryThrowingAgent extends AIChatAgent<Env> {
   }
 
   async waitForIdleForTest(): Promise<void> {
-    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
+    // Legacy waitForIdle semantics: drain turns/continuations but do NOT
+    // wait out a human-pending interaction (client tool / approval).
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 }
 
@@ -4662,7 +4874,7 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
       insert into cf_ai_chat_agent_tool_runs (run_id, status, input_json, started_at)
       values (${runId}, 'running', '{}', ${Date.now()})
     `;
-    const inspection = await this.inspectAgentToolRun(runId, {
+    const inspection = await unported(this).inspectAgentToolRun(runId, {
       reconcile: false
     });
     return {
@@ -4726,7 +4938,7 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
       this["_agentToolAbortControllers"].delete(runId);
       this["_agentToolLastErrors"].delete(runId);
       this["_agentToolLiveSequences"].delete(runId);
-      this["_agentToolPreTurnAssistantIds"].delete(runId);
+      this["_agentToolPreTurnMessageIds"].delete(runId);
       this["_agentToolRunsByRequestId"].clear();
       const before = this._readChildRunStatusForTest(runId);
       const assistantText = this.messages
@@ -4757,11 +4969,11 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
       values (${runId}, 'old-req', 'running', '{}', ${Date.now()}, 'terminal')
     `;
     this["_rebindAgentToolChildRunRequestId"]("recovery-req");
-    const afterRebind = this["_agentToolTerminalOnlyRuns"].has(runId);
+    const afterRebind = unported(this)._agentToolTerminalOnlyRuns.has(runId);
     this["_closeAgentToolTailers"](runId);
     return {
       afterRebind,
-      afterClose: this["_agentToolTerminalOnlyRuns"].has(runId)
+      afterClose: unported(this)._agentToolTerminalOnlyRuns.has(runId)
     };
   }
 
@@ -4967,21 +5179,19 @@ export class AIChatAgentToolChild extends AIChatAgent<Env> {
     `;
     const before = this._readChildRunStatusForTest(runId);
     const recovery = this as unknown as {
-      _chatRecoveryContinueDetached(d?: {
-        targetAssistantId?: string;
-      }): Promise<void>;
-      _chatRecoveryRetryDetached(d?: Record<string, never>): Promise<void>;
+      _chatRecoveryContinue(d?: { targetAssistantId?: string }): Promise<void>;
+      _chatRecoveryRetry(d?: Record<string, never>): Promise<void>;
     };
     if (path === "continue") {
       // A non-leaf `targetAssistantId` → benign "conversation_changed" skip
       // that still reaches the `finally`.
-      await recovery._chatRecoveryContinueDetached({
+      await recovery._chatRecoveryContinue({
         targetAssistantId: "no-such-leaf"
       });
     } else {
       // A non-user leaf (or empty transcript) → benign "no_unanswered_user_
       // message" skip that still reaches the `finally`.
-      await recovery._chatRecoveryRetryDetached({});
+      await recovery._chatRecoveryRetry({});
     }
     return { before, after: this._readChildRunStatusForTest(runId) };
   }

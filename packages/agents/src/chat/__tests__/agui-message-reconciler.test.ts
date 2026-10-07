@@ -60,14 +60,46 @@ describe("reconcileMessages", () => {
     expect(result).not.toBe(incoming);
   });
 
-  it("uses server assistant version when ids match (fresh toolCalls/content)", () => {
+  it("keeps the incoming assistant version when ids match (legacy parity)", () => {
+    // Clients may legitimately update a message's content; the server's
+    // authority is over ids and tool results, not assistant content.
     const server: AGUIMessage[] = [
       assistant("a1", "final text", [toolCall("tc1", "calc", '{"x":1}')])
     ];
     const incoming: AGUIMessage[] = [assistant("a1", "partial")];
     const result = reconcileMessages(incoming, server);
-    expect(result[0]).toEqual(server[0]);
-    expect(result[0]).not.toBe(server[0]);
+    expect(result[0]).toEqual(incoming[0]);
+  });
+
+  it("server approval state survives an exact-id write-back from a stale client", () => {
+    // Approval decisions are recorded server-side; a second tab that never
+    // saw the denial must not erase it (that would re-open the approval
+    // modal and defeat the denied-call guard).
+    const server: AGUIMessage[] = [
+      {
+        ...assistant("a1", "", [toolCall("tc1", "risky", '{"level":9}')]),
+        toolApprovals: { tc1: { approvalId: "ap-1", approved: false } }
+      }
+    ];
+    const incoming: AGUIMessage[] = [
+      assistant("a1", "", [toolCall("tc1", "risky", '{"level":9}')])
+    ];
+    const result = reconcileMessages(incoming, server);
+    expect((result[0] as AssistantMessage).toolApprovals).toEqual({
+      tc1: { approvalId: "ap-1", approved: false }
+    });
+    // Incoming approval entries for calls the server has no record of are kept.
+    const incomingWithOther: AGUIMessage[] = [
+      {
+        ...assistant("a1", "", [toolCall("tc1", "risky", "{}")]),
+        toolApprovals: { tcOther: { approvalId: "ap-2" } }
+      }
+    ];
+    const merged = reconcileMessages(incomingWithOther, server);
+    expect((merged[0] as AssistantMessage).toolApprovals).toEqual({
+      tcOther: { approvalId: "ap-2" },
+      tc1: { approvalId: "ap-1", approved: false }
+    });
   });
 
   it("server tool result wins over stale incoming tool result with same toolCallId", () => {

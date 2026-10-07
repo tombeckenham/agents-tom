@@ -665,6 +665,23 @@ export class ResumableStream {
     this.ops.setMetadata(streamId, { ...chat, outcome });
   }
 
+  /** The request id a stream row was created for; null when the row is gone. */
+  getStreamRequestId(streamId: string): string | null {
+    return this.ops.getStream(streamId)?.tag ?? null;
+  }
+
+  /**
+   * Backfill the assistant message id once the stream reveals it (#1691) —
+   * the AG-UI engine learns the id from the first message-start event, after
+   * `start()` has already written the metadata row.
+   */
+  setMessageId(streamId: string, messageId: string): void {
+    const row = this.ops.getStream(streamId);
+    const chat = row ? parseChatMetadata(row) : null;
+    if (!chat) return;
+    this.ops.setMetadata(streamId, { ...chat, messageId });
+  }
+
   /**
    * Mark a stream as completed and flush any pending chunks.
    * @param streamId - The stream to mark as completed

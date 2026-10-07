@@ -42,7 +42,7 @@
         {
           "body": {
             "type": "text-start",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-4",
@@ -52,7 +52,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-5",
+            "id": "part-1",
             "delta": "before-gate "
           },
           "done": false,
@@ -63,7 +63,7 @@
         {
           "body": {
             "type": "text-delta",
-            "id": "id-5",
+            "id": "part-1",
             "delta": "after-gate"
           },
           "done": false,
@@ -74,7 +74,7 @@
         {
           "body": {
             "type": "text-end",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
           "id": "id-4",
@@ -102,7 +102,7 @@
         {
           "body": "",
           "done": true,
-          "id": "id-6",
+          "id": "id-5",
           "type": "cf_agent_use_chat_response",
           "outcome": "skipped",
           "messageIds": [
@@ -113,52 +113,52 @@
         {
           "body": {
             "type": "start",
-            "messageId": "id-7"
+            "messageId": "id-6"
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 0
         },
         {
           "body": {
             "type": "text-start",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 1
         },
         {
           "body": {
             "type": "text-delta",
-            "id": "id-5",
+            "id": "part-1",
             "delta": "before-gate "
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 2
         },
         {
           "body": {
             "type": "text-delta",
-            "id": "id-5",
+            "id": "part-1",
             "delta": "after-gate"
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 3
         },
         {
           "body": {
             "type": "text-end",
-            "id": "id-5"
+            "id": "part-1"
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 4
         },
@@ -167,14 +167,14 @@
             "type": "finish"
           },
           "done": false,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "seq": 5
         },
         {
           "body": "",
           "done": true,
-          "id": "id-8",
+          "id": "id-7",
           "type": "cf_agent_use_chat_response",
           "messageIds": [
             "u-a",
@@ -195,10 +195,10 @@
     },
     {
       "hook": "onChatResponse",
-      "requestId": "id-8",
+      "requestId": "id-7",
       "status": "completed",
       "continuation": false,
-      "messageId": "id-7"
+      "messageId": "id-6"
     }
   ],
   "persistedRows": [
@@ -246,9 +246,9 @@
       "created_at": "TS"
     },
     {
-      "id": "id-7",
+      "id": "id-6",
       "message": {
-        "id": "id-7",
+        "id": "id-6",
         "role": "assistant",
         "parts": [
           {
@@ -294,7 +294,7 @@
       ]
     },
     {
-      "id": "id-7",
+      "id": "id-6",
       "role": "assistant",
       "parts": [
         {

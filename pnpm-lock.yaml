@@ -4764,13 +4764,13 @@ importers:
       '@ai-sdk/react':
         specifier: ^3.0.0 || ^4.0.0
         version: 4.0.19(react@19.2.7)(zod@4.5.4)
+      '@cloudflare/ai-chat-vercel':
+        specifier: workspace:*
+        version: link:../ai-chat-vercel
       nanoid:
         specifier: ^5.1.16
         version: 5.1.16
     devDependencies:
-      '@cloudflare/ai-chat-vercel':
-        specifier: workspace:*
-        version: link:../ai-chat-vercel
       '@playwright/test':
         specifier: ^1.61.1
         version: 1.61.1

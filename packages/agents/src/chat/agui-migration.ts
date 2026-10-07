@@ -80,8 +80,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 export function isPersistedAGUIMessage(value: unknown): boolean {
   if (!isObject(value)) return false;
   if (value._v !== PERSISTED_MESSAGE_SCHEMA_VERSION) return false;
-  if (typeof value.id !== "string") return false;
-  if (typeof value.role !== "string") return false;
+  if (typeof value.id !== "string" || value.id.length === 0) return false;
+  // Validate the role like the sibling guards: a `_v` row with a bogus role
+  // would pass the /get-messages filter and then vanish silently inside
+  // `toUIMessages` — and a dropped assistant orphans its tool rows.
+  if (typeof value.role !== "string" || !AGUI_ROLES.has(value.role as AGUIRole))
+    return false;
   return true;
 }
 
@@ -90,10 +94,14 @@ export function isPersistedAGUIMessage(value: unknown): boolean {
  * `{ id: string, role: string, parts: unknown[] }`. Matches the
  * existing `isUIMessage` guard in `ai-chat-v5-migration.ts`.
  */
+const LEGACY_UI_ROLES = new Set(["user", "assistant", "system"]);
+
 export function isLegacyUIMessage(value: unknown): boolean {
   if (!isObject(value)) return false;
-  if (typeof value.id !== "string") return false;
-  if (typeof value.role !== "string") return false;
+  if (typeof value.id !== "string" || value.id.length === 0) return false;
+  if (typeof value.role !== "string" || !LEGACY_UI_ROLES.has(value.role)) {
+    return false;
+  }
   if (!Array.isArray(value.parts)) return false;
   return true;
 }
@@ -107,10 +115,12 @@ export function isLegacyUIMessage(value: unknown): boolean {
  */
 export function isCleanAGUIMessage(value: unknown): boolean {
   if (!isObject(value)) return false;
-  if (typeof value.id !== "string") return false;
+  if (typeof value.id !== "string" || value.id.length === 0) return false;
   if (typeof value.role !== "string") return false;
   if (!AGUI_ROLES.has(value.role as AGUIRole)) return false;
-  if (Array.isArray(value.parts)) return false;
+  // A clean AG-UI row never carries `parts` — a non-array `parts` is a
+  // corrupted legacy row, not an AG-UI message.
+  if ("parts" in value) return false;
   return true;
 }
 
@@ -178,11 +188,15 @@ type LegacyMessage = {
 type LegacyTextPart = {
   type: "text";
   text?: string;
+  state?: string;
+  providerMetadata?: unknown;
 };
 
 type LegacyReasoningPart = {
   type: "reasoning";
   text?: string;
+  state?: string;
+  providerMetadata?: unknown;
 };
 
 type LegacyFilePart = {
@@ -392,7 +406,13 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     const r: ReasoningMessage = {
       id: msg.id,
       role: "reasoning",
-      content: reasoningParts[0].text ?? ""
+      content: reasoningParts[0].text ?? "",
+      ...(reasoningParts[0].state === "streaming" && {
+        partial: true as const
+      }),
+      ...(reasoningParts[0].providerMetadata !== undefined && {
+        providerMetadata: reasoningParts[0].providerMetadata
+      })
     };
     return [r];
   }
@@ -401,7 +421,11 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     const r: ReasoningMessage = {
       id: `${msg.id}-reasoning-${reasoningIndex++}`,
       role: "reasoning",
-      content: part.text ?? ""
+      content: part.text ?? "",
+      ...(part.state === "streaming" && { partial: true as const }),
+      ...(part.providerMetadata !== undefined && {
+        providerMetadata: part.providerMetadata
+      })
     };
     out.push(r);
   }
@@ -415,7 +439,7 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
   const toolApprovals: Record<string, ToolApprovalState> = {};
   let toolResultIndex = 0;
   for (const toolPart of toolParts) {
-    const toolName = toolNameFromType(toolPart.type);
+    const toolName = toolNameFromPart(toolPart);
     if (!toolName) continue;
     const toolCallId = toolPart.toolCallId;
     if (typeof toolCallId !== "string") {
@@ -425,14 +449,42 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
       );
       continue;
     }
-    toolCalls.push({
-      id: toolCallId,
-      type: "function",
-      function: {
-        name: toolName,
-        arguments: JSON.stringify(toolPart.input ?? {})
-      }
-    });
+    // Legacy histories can carry duplicate parts for one toolCallId; the
+    // AG-UI shape keys a call by id, so duplicates collapse — the first
+    // TERMINAL duplicate's result wins below (a ToolMessage is only emitted
+    // once per call id).
+    const isDuplicateCall = toolCalls.some((call) => call.id === toolCallId);
+    const partExtras: Record<string, unknown> = {};
+    for (const key of [
+      "providerExecuted",
+      "callProviderMetadata",
+      "providerMetadata",
+      "preliminary"
+    ]) {
+      const value = (toolPart as Record<string, unknown>)[key];
+      if (value !== undefined) partExtras[key] = value;
+    }
+    // A dynamic-tool part keeps its original type/toolName on projection
+    // (partExtras spread overrides the synthesized `tool-${name}` type).
+    if (toolPart.type === "dynamic-tool") {
+      partExtras.type = "dynamic-tool";
+      partExtras.toolName = toolName;
+    }
+    if (!isDuplicateCall) {
+      toolCalls.push({
+        id: toolCallId,
+        type: "function",
+        function: {
+          name: toolName,
+          arguments: JSON.stringify(toolPart.input ?? {})
+        },
+        ...(Object.keys(partExtras).length > 0 && { partExtras })
+      });
+    }
+    const hasResultRow = toolMessages.some(
+      (tm) => tm.toolCallId === toolCallId
+    );
+    if (isDuplicateCall && hasResultRow) continue;
     // Approval state rides the CF `toolApprovals` extension so
     // approval-requested / approval-responded / output-denied survive the
     // row shape and project back.
@@ -449,11 +501,18 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     // Undecided / denied approvals carry no result row — `toolApprovals`
     // is their durable record.
     if (toolPart.state === "output-available") {
+      // Provider-executed payloads are truncatable by the sanitizer; web
+      // tools are excluded because their outputs replay on later turns.
+      const providerExecuted =
+        (toolPart as Record<string, unknown>).providerExecuted === true &&
+        toolName !== "web_search" &&
+        toolName !== "web_fetch";
       toolMessages.push({
         id: `${msg.id}-tool-${toolResultIndex++}`,
         role: "tool",
         toolCallId,
-        content: JSON.stringify(toolPart.output ?? null)
+        content: JSON.stringify(toolPart.output ?? null),
+        ...(providerExecuted && { providerExecuted: true as const })
       });
     } else if (toolPart.state === "output-error") {
       const errorText = toolPart.errorText ?? "Tool execution failed.";
@@ -490,6 +549,58 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     }
   }
 
+  // Record the original part order when it differs from the canonical
+  // projection order (extras → tools → text) so `toUIMessages` can restore
+  // interleavings like [step-start, tool, step-start, text]. Token indices
+  // follow the walk order used to build `extraParts`/`toolCalls` above.
+  const partOrder: string[] = [];
+  let extraIndex = 0;
+  const seenToolIds = new Set<string>();
+  let textSeen = false;
+  for (const part of msg.parts) {
+    if (isTextPart(part)) {
+      if (!textSeen && textContent) {
+        partOrder.push("text");
+        textSeen = true;
+      }
+      continue;
+    }
+    if (isToolPart(part)) {
+      const toolCallId = part.toolCallId;
+      if (
+        typeof toolCallId === "string" &&
+        !seenToolIds.has(toolCallId) &&
+        toolCalls.some((call) => call.id === toolCallId)
+      ) {
+        seenToolIds.add(toolCallId);
+        partOrder.push(`tool:${toolCallId}`);
+      }
+      continue;
+    }
+    if (
+      (isDataPart(part) && part.type !== "data-cf.activity") ||
+      isExtraAssistantPart(part)
+    ) {
+      partOrder.push(`extra:${extraIndex++}`);
+    }
+  }
+  const canonicalOrder = [
+    ...extraParts.map((_, i) => `extra:${i}`),
+    ...toolCalls.map((call) => `tool:${call.id}`),
+    ...(textContent ? ["text"] : [])
+  ];
+  const orderDiffers =
+    partOrder.length !== canonicalOrder.length ||
+    partOrder.some((token, i) => token !== canonicalOrder[i]);
+
+  const streamingText = msg.parts.some(
+    (part) => isTextPart(part) && part.state === "streaming"
+  );
+  const contentProviderMetadata = (
+    msg.parts.find(
+      (part) => isTextPart(part) && part.providerMetadata !== undefined
+    ) as LegacyTextPart | undefined
+  )?.providerMetadata;
   const assistant: AssistantMessage = {
     id: msg.id,
     role: "assistant",
@@ -497,6 +608,9 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(Object.keys(toolApprovals).length ? { toolApprovals } : {}),
     ...(extraParts.length ? { extraParts } : {}),
+    ...(orderDiffers ? { partOrder } : {}),
+    ...(streamingText && { partial: true as const }),
+    ...(contentProviderMetadata !== undefined && { contentProviderMetadata }),
     ...(msg.metadata !== undefined && { metadata: msg.metadata })
   };
   out.push(assistant);
@@ -508,7 +622,11 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
 /** Assistant parts with no AG-UI slot that ride `extraParts` verbatim. */
 function isExtraAssistantPart(value: unknown): boolean {
   if (!isObject(value) || typeof value.type !== "string") return false;
-  return value.type === "file" || value.type.startsWith("source-");
+  return (
+    value.type === "file" ||
+    value.type.startsWith("source-") ||
+    value.type === "step-start"
+  );
 }
 
 // ----------------------------------------------------------------------------
@@ -531,7 +649,7 @@ function isToolPart(value: unknown): value is LegacyToolPart {
   return (
     isObject(value) &&
     typeof value.type === "string" &&
-    value.type.startsWith("tool-")
+    (value.type.startsWith("tool-") || value.type === "dynamic-tool")
   );
 }
 
@@ -547,6 +665,16 @@ function toolNameFromType(type: string): string | undefined {
   if (!type.startsWith("tool-")) return undefined;
   const name = type.slice("tool-".length);
   return name.length > 0 ? name : undefined;
+}
+
+/** Tool name for a legacy tool part: `tool-${name}` type, or the
+ * `toolName` field of a `dynamic-tool` part. */
+function toolNameFromPart(part: LegacyToolPart): string | undefined {
+  if (part.type === "dynamic-tool") {
+    const name = (part as { toolName?: unknown }).toolName;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  }
+  return toolNameFromType(part.type);
 }
 
 function collectText(parts: unknown[]): string {

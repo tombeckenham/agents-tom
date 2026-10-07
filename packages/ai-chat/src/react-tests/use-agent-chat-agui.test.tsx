@@ -8,7 +8,7 @@
  */
 
 import { StrictMode, Suspense, act } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 import type { UIMessage } from "ai";
 import { useAgentChat } from "../react-agui";
@@ -203,5 +203,94 @@ describe("useAgentChat CF_AGENT_MESSAGE_UPDATED (AG-UI tool row)", () => {
     });
 
     await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+  });
+});
+
+describe("useAgentChat initial-message hydration (AG-UI /get-messages)", () => {
+  it("projects AG-UI rows from the default /get-messages fetch into UIMessages", async () => {
+    // Byte-for-byte what `AGUIChatAgent` serves on /get-messages: persisted
+    // AG-UI rows, verbatim, including the `_v` schema marker — a user row,
+    // a reasoning row, an assistant row with a tool call, and its tool
+    // result row. (Pinned against the server by the workers-pool
+    // get-messages tests; this leg pins the CLIENT side of the contract.)
+    const serverRows = [
+      { _v: "v6_agui_message", id: "u-1", role: "user", content: "hi" },
+      {
+        _v: "v6_agui_message",
+        id: "r-1",
+        role: "reasoning",
+        content: "thinking"
+      },
+      {
+        _v: "v6_agui_message",
+        id: "a-1",
+        role: "assistant",
+        content: "It is 21C",
+        toolCalls: [
+          {
+            id: "tc-1",
+            type: "function",
+            function: { name: "getWeather", arguments: '{"city":"Sydney"}' }
+          }
+        ]
+      },
+      {
+        _v: "v6_agui_message",
+        id: "tool-1",
+        role: "tool",
+        toolCallId: "tc-1",
+        content: '{"temp":21}'
+      }
+    ];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(serverRows), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    try {
+      const { agent } = createAgentWithTarget("thread-agui-hydration");
+
+      let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+      const TestComponent = () => {
+        const chat = useAgentChat({ agent });
+        chatInstance = chat;
+        return (
+          <div data-testid="messages">{JSON.stringify(chat.messages)}</div>
+        );
+      };
+
+      const screen = await act(async () =>
+        render(<TestComponent />, {
+          wrapper: ({ children }) => (
+            <StrictMode>
+              <Suspense fallback="Loading...">{children}</Suspense>
+            </StrictMode>
+          )
+        })
+      );
+      await expect
+        .element(screen.getByTestId("messages"))
+        .toHaveTextContent("It is 21C");
+
+      const messages = chatInstance!.messages as UIMessage[];
+      expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+      expect(messages[0].parts).toEqual([{ type: "text", text: "hi" }]);
+      // Reasoning folds onto the assistant; the tool row folds onto its part.
+      expect(messages[1].parts).toEqual([
+        { type: "reasoning", text: "thinking", state: "done" },
+        {
+          type: "tool-getWeather",
+          toolCallId: "tc-1",
+          toolName: "getWeather",
+          input: { city: "Sydney" },
+          state: "output-available",
+          output: { temp: 21 }
+        },
+        { type: "text", text: "It is 21C", state: "done" }
+      ]);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

@@ -1,4 +1,5 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="vite/client" />
 
 type _WorkerEnv = import("./worker").Env;
 

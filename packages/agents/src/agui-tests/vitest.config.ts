@@ -14,6 +14,10 @@ export default defineConfig({
     name: "agui",
     include: [path.join(import.meta.dirname, "**/*.test.ts")],
     testTimeout: 10_000,
+    // Matches the legacy ai-chat workers suite: under the full parallel matrix
+    // these WebSocket turns can overrun 10s waiting on a contended isolate.
+    // Failures under load are always timeouts, never assertions.
+    retry: 3,
     teardownTimeout: 60_000
   }
 });

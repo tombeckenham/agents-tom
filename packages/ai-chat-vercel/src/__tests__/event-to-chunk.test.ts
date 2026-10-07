@@ -51,12 +51,21 @@ describe("EventToChunkProjector — lifecycle", () => {
     expect(chunks).toEqual([{ type: "error", errorText: "boom" }]);
   });
 
-  it("STEP_STARTED / FINISHED → start-step / finish-step", () => {
+  it("STEP_STARTED buffers until the leading start; STEP_FINISHED passes", () => {
+    // Legacy chunk order is `start` then `start-step`, so a STEP_STARTED
+    // arriving before the run's message id is known is held and flushed
+    // right after the leading start.
     const chunks = project([
       { type: "STEP_STARTED", stepName: "x" },
+      { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant" },
       { type: "STEP_FINISHED", stepName: "x" }
     ]);
-    expect(chunks).toEqual([{ type: "start-step" }, { type: "finish-step" }]);
+    expect(chunks).toEqual([
+      { type: "start", messageId: "m1" },
+      { type: "start-step" },
+      { type: "text-start", id: "m1" },
+      { type: "finish-step" }
+    ]);
   });
 });
 

@@ -33,7 +33,10 @@ describe("ChunkToEventProjector — lifecycle", () => {
     expect(events[0]).toEqual({
       type: "RUN_STARTED",
       threadId: "thread-1",
-      runId: "run-1"
+      runId: "run-1",
+      // CF extension: the run's assistant id rides RUN_STARTED so the
+      // client projection opens `start` with the id the server persists.
+      messageId: "m1"
     });
     expect(events[1]).toEqual({
       type: "TEXT_MESSAGE_START",
@@ -105,6 +108,49 @@ describe("ChunkToEventProjector — text", () => {
       "RUN_FINISHED"
     ]);
   });
+
+  it("later text parts mint fresh message ids (positional part ids must not collide across turns)", () => {
+    // AI SDK text part ids are positional ("0", "1", … reset per response):
+    // a text→tool→text turn's second part is "1" in EVERY turn, so passing
+    // it through verbatim overwrites the previous turn's row on persist.
+    const events = project([
+      { type: "start", messageId: "assistant-1" },
+      { type: "text-start", id: "0" },
+      { type: "text-end", id: "0" },
+      { type: "tool-input-start", toolCallId: "tc-1", toolName: "t" },
+      {
+        type: "tool-input-available",
+        toolCallId: "tc-1",
+        toolName: "t",
+        input: {}
+      },
+      { type: "text-start", id: "1" },
+      { type: "text-delta", id: "1", delta: "after tool" },
+      { type: "text-end", id: "1" }
+    ] as UIMessageChunk[]);
+    const textStarts = events.filter((e) => e.type === "TEXT_MESSAGE_START");
+    expect(textStarts).toHaveLength(2);
+    const [first, second] = textStarts as Array<{ messageId: string }>;
+    expect(first.messageId).toBe("assistant-1");
+    expect(second.messageId).not.toBe("1");
+    expect(second.messageId).not.toBe(first.messageId);
+    // Deltas follow their part's minted id.
+    const delta = events.find((e) => e.type === "TEXT_MESSAGE_CONTENT") as {
+      messageId: string;
+    };
+    expect(delta.messageId).toBe(second.messageId);
+  });
+
+  it("RUN_STARTED carries the run message id (CF extension)", () => {
+    const events = project([
+      { type: "start", messageId: "assistant-1" },
+      { type: "text-start", id: "0" }
+    ] as UIMessageChunk[]);
+    const runStarted = events.find((e) => e.type === "RUN_STARTED") as {
+      messageId?: string;
+    };
+    expect(runStarted.messageId).toBe("assistant-1");
+  });
 });
 
 describe("ChunkToEventProjector — reasoning", () => {
@@ -114,19 +160,22 @@ describe("ChunkToEventProjector — reasoning", () => {
       { type: "reasoning-delta", id: "r1", delta: "thinking" },
       { type: "reasoning-end", id: "r1" }
     ]);
-    expect(events).toContainEqual({
-      type: "REASONING_MESSAGE_START",
-      messageId: "r1",
-      role: "reasoning"
-    });
+    // Reasoning part ids are remapped to a fresh per-run message id (part
+    // ids are reused across turns by producers); the id is opaque but
+    // consistent across the lifecycle.
+    const start = events.find((e) => e.type === "REASONING_MESSAGE_START") as {
+      messageId: string;
+    };
+    expect(start).toMatchObject({ role: "reasoning" });
+    expect(typeof start.messageId).toBe("string");
     expect(events).toContainEqual({
       type: "REASONING_MESSAGE_CONTENT",
-      messageId: "r1",
+      messageId: start.messageId,
       delta: "thinking"
     });
     expect(events).toContainEqual({
       type: "REASONING_MESSAGE_END",
-      messageId: "r1"
+      messageId: start.messageId
     });
   });
 });
@@ -277,10 +326,11 @@ describe("ChunkToEventProjector — data chunks and metadata", () => {
     const events = project([
       { type: "data-foo", data: { hello: "world" } } as UIMessageChunk
     ]);
+    // The value is wrapped so the part id / transient flag round-trip.
     expect(events[0]).toMatchObject({
       type: "CUSTOM",
       name: "data.foo",
-      value: { hello: "world" }
+      value: { data: { hello: "world" } }
     });
   });
 
