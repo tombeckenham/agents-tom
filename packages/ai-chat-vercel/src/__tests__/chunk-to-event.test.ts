@@ -191,7 +191,8 @@ describe("ChunkToEventProjector — tool calls (single)", () => {
         messageId: "tool_tc1",
         toolCallId: "tc1",
         content: JSON.stringify({ error: "nope" }),
-        role: "tool"
+        role: "tool",
+        error: "nope"
       }
     ]);
   });

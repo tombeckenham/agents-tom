@@ -27,11 +27,13 @@ import {
   type AGUIInputContentSource,
   type AGUIMessage,
   type AGUIRole,
+  type AssistantExtraPart,
   type AssistantMessage,
   type DeveloperMessage,
   PERSISTED_MESSAGE_SCHEMA_VERSION,
   type ReasoningMessage,
   type SystemMessage,
+  type ToolApprovalState,
   type ToolCall,
   type ToolMessage,
   type UserMessage
@@ -196,6 +198,8 @@ type LegacyToolPart = {
   state?: string;
   input?: unknown;
   output?: unknown;
+  errorText?: string;
+  approval?: { id?: string; approved?: boolean };
 };
 
 type LegacyDataPart = {
@@ -256,7 +260,8 @@ function migrateUserMessage(msg: LegacyMessage): AGUIMessage[] {
     const user: UserMessage = {
       id: msg.id,
       role: "user",
-      content: textParts[0].text ?? ""
+      content: textParts[0].text ?? "",
+      ...(msg.metadata !== undefined && { metadata: msg.metadata })
     };
     return [user];
   }
@@ -282,7 +287,8 @@ function migrateUserMessage(msg: LegacyMessage): AGUIMessage[] {
   const user: UserMessage = {
     id: msg.id,
     role: "user",
-    content
+    content,
+    ...(msg.metadata !== undefined && { metadata: msg.metadata })
   };
   return [user];
 }
@@ -332,22 +338,34 @@ function parseDataUrl(
 function migrateSystemMessage(msg: LegacyMessage): AGUIMessage[] {
   const text = collectText(msg.parts);
   const aguiRole = readAguiRole(msg.metadata);
+  // The aguiRole key is a routing marker, not user data — strip it from the
+  // carried metadata so the round-trip is stable.
+  const metadata = stripAguiRole(msg.metadata);
   // WHY: discovery doc — UIMessage has no `developer` role; the
   // round-trip carrier is `metadata.aguiRole === "developer"`.
   if (aguiRole === "developer") {
     const dev: DeveloperMessage = {
       id: msg.id,
       role: "developer",
-      content: text
+      content: text,
+      ...(metadata !== undefined && { metadata })
     };
     return [dev];
   }
   const sys: SystemMessage = {
     id: msg.id,
     role: "system",
-    content: text
+    content: text,
+    ...(metadata !== undefined && { metadata })
   };
   return [sys];
+}
+
+function stripAguiRole(metadata: unknown): unknown {
+  if (!isObject(metadata)) return metadata ?? undefined;
+  if (!("aguiRole" in metadata)) return metadata;
+  const { aguiRole: _aguiRole, ...rest } = metadata;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 function readAguiRole(metadata: unknown): string | undefined {
@@ -361,11 +379,25 @@ function readAguiRole(metadata: unknown): string | undefined {
 function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
   const out: AGUIMessage[] = [];
 
-  // WHY: discovery doc — reasoning messages precede the assistant
-  // they relate to in the AG-UI list.
+  const reasoningParts = msg.parts.filter(isReasoningPart);
+  const reasoningOnly =
+    reasoningParts.length > 0 && reasoningParts.length === msg.parts.length;
+
+  // WHY: discovery doc — reasoning messages precede the assistant they
+  // relate to in the AG-UI list. A reasoning-only UIMessage (produced by
+  // the projection's standalone-reasoning fallback) keeps its id verbatim
+  // so migrate→project→migrate is a fixed point — no `-reasoning-N`
+  // re-suffixing, no fabricated empty assistant row.
+  if (reasoningOnly && reasoningParts.length === 1) {
+    const r: ReasoningMessage = {
+      id: msg.id,
+      role: "reasoning",
+      content: reasoningParts[0].text ?? ""
+    };
+    return [r];
+  }
   let reasoningIndex = 0;
-  for (const part of msg.parts) {
-    if (!isReasoningPart(part)) continue;
+  for (const part of reasoningParts) {
     const r: ReasoningMessage = {
       id: `${msg.id}-reasoning-${reasoningIndex++}`,
       role: "reasoning",
@@ -373,12 +405,14 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     };
     out.push(r);
   }
+  if (reasoningOnly) return out;
 
   const textContent = collectText(msg.parts);
   const toolParts = msg.parts.filter(isToolPart);
 
   const toolCalls: ToolCall[] = [];
   const toolMessages: ToolMessage[] = [];
+  const toolApprovals: Record<string, ToolApprovalState> = {};
   let toolResultIndex = 0;
   for (const toolPart of toolParts) {
     const toolName = toolNameFromType(toolPart.type);
@@ -399,12 +433,21 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
         arguments: JSON.stringify(toolPart.input ?? {})
       }
     });
-    // WHY: discovery doc — only tool parts in `output-available`
-    // emit a `ToolMessage`. Intermediate states (input-streaming,
-    // input-available, approval-requested, output-denied,
-    // output-error) live in the event stream, not the persisted
-    // message. Migration produces rows, not events, so they are
-    // lossy here by design.
+    // Approval state rides the CF `toolApprovals` extension so
+    // approval-requested / approval-responded / output-denied survive the
+    // row shape and project back.
+    if (typeof toolPart.approval?.id === "string") {
+      toolApprovals[toolCallId] = {
+        approvalId: toolPart.approval.id,
+        ...(typeof toolPart.approval.approved === "boolean" && {
+          approved: toolPart.approval.approved
+        })
+      };
+    }
+    // WHY: discovery doc — settled results emit a `ToolMessage`
+    // (`output-available`, and `output-error` via the `error` field).
+    // Undecided / denied approvals carry no result row — `toolApprovals`
+    // is their durable record.
     if (toolPart.state === "output-available") {
       toolMessages.push({
         id: `${msg.id}-tool-${toolResultIndex++}`,
@@ -412,27 +455,38 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
         toolCallId,
         content: JSON.stringify(toolPart.output ?? null)
       });
+    } else if (toolPart.state === "output-error") {
+      const errorText = toolPart.errorText ?? "Tool execution failed.";
+      toolMessages.push({
+        id: `${msg.id}-tool-${toolResultIndex++}`,
+        role: "tool",
+        toolCallId,
+        content: JSON.stringify({ error: errorText }),
+        error: errorText
+      });
     }
   }
 
   const activityMessages: AGUIMessage[] = [];
+  const extraParts: AssistantExtraPart[] = [];
   for (const part of msg.parts) {
-    if (!isDataPart(part)) continue;
-    // WHY: discovery doc — `data-cf.activity` parts round-trip
-    // as `ActivityMessage`. Other `data-*` parts have no AG-UI
-    // equivalent and are dropped (with a warning) rather than
-    // fabricated into an opaque slot.
-    if (part.type === "data-cf.activity") {
-      activityMessages.push({
-        id: part.id ?? `${msg.id}-activity-${activityMessages.length}`,
-        role: "activity",
-        content: part.data
-      });
-    } else {
-      console.warn(
-        "[agents/chat/agui-migration] Dropping unsupported assistant data part",
-        part.type
-      );
+    if (isDataPart(part)) {
+      // WHY: discovery doc — `data-cf.activity` parts round-trip as
+      // `ActivityMessage`. Other `data-*` parts ride the `extraParts`
+      // CF extension verbatim (as do file/source parts below).
+      if (part.type === "data-cf.activity") {
+        activityMessages.push({
+          id: part.id ?? `${msg.id}-activity-${activityMessages.length}`,
+          role: "activity",
+          content: part.data
+        });
+      } else {
+        extraParts.push(part as AssistantExtraPart);
+      }
+      continue;
+    }
+    if (isExtraAssistantPart(part)) {
+      extraParts.push(part as AssistantExtraPart);
     }
   }
 
@@ -440,12 +494,21 @@ function migrateAssistantMessage(msg: LegacyMessage): AGUIMessage[] {
     id: msg.id,
     role: "assistant",
     ...(textContent ? { content: textContent } : {}),
-    ...(toolCalls.length ? { toolCalls } : {})
+    ...(toolCalls.length ? { toolCalls } : {}),
+    ...(Object.keys(toolApprovals).length ? { toolApprovals } : {}),
+    ...(extraParts.length ? { extraParts } : {}),
+    ...(msg.metadata !== undefined && { metadata: msg.metadata })
   };
   out.push(assistant);
   for (const tm of toolMessages) out.push(tm);
   for (const am of activityMessages) out.push(am);
   return out;
+}
+
+/** Assistant parts with no AG-UI slot that ride `extraParts` verbatim. */
+function isExtraAssistantPart(value: unknown): boolean {
+  if (!isObject(value) || typeof value.type !== "string") return false;
+  return value.type === "file" || value.type.startsWith("source-");
 }
 
 // ----------------------------------------------------------------------------

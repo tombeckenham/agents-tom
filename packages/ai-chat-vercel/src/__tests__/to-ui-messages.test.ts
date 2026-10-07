@@ -49,13 +49,15 @@ describe("toUIMessages", () => {
 
     expect(ui).toHaveLength(1);
     const parts = partsOf(ui[0]);
-    expect(parts[0]).toEqual({ type: "text", text: "checking" });
-    expect(parts[1]).toMatchObject({
+    // Tool parts precede text — matching the legacy persisted part order.
+    expect(parts[0]).toMatchObject({
       type: "tool-getWeather",
       toolCallId: "call-1",
+      toolName: "getWeather",
       state: "input-available",
       input: { city: "Sydney" }
     });
+    expect(parts[1]).toEqual({ type: "text", text: "checking" });
   });
 
   it("emits a tool-only assistant turn with no text part", () => {
@@ -230,7 +232,26 @@ describe("toUIMessages", () => {
     });
   });
 
-  it("projects reasoning messages as an assistant reasoning part", () => {
+  it("folds a reasoning row onto the following assistant message", () => {
+    const ui = toUIMessages([
+      { id: "r1", role: "reasoning", content: "thinking" },
+      { id: "a1", role: "assistant", content: "answer" }
+    ] satisfies AGUIMessage[]);
+
+    // Legacy shape: ONE assistant message with [reasoning, text] parts.
+    expect(ui).toEqual([
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "thinking" },
+          { type: "text", text: "answer" }
+        ]
+      }
+    ]);
+  });
+
+  it("falls back to a standalone part for reasoning with no following assistant", () => {
     const ui = toUIMessages([
       { id: "r1", role: "reasoning", content: "thinking" }
     ] satisfies AGUIMessage[]);
@@ -240,6 +261,102 @@ describe("toUIMessages", () => {
       role: "assistant",
       parts: [{ type: "reasoning", text: "thinking" }]
     });
+  });
+
+  it("does not fold reasoning across a user boundary", () => {
+    const ui = toUIMessages([
+      { id: "r1", role: "reasoning", content: "thinking" },
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "hello" }
+    ] satisfies AGUIMessage[]);
+
+    expect(ui.map((m) => m.id)).toEqual(["r1", "u1", "a1"]);
+  });
+
+  it("projects tool approval states from the toolApprovals extension", () => {
+    const call = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "riskyTool", arguments: '{"level":9}' }
+    });
+    const ui = toUIMessages([
+      {
+        id: "a1",
+        role: "assistant",
+        toolCalls: [call("c-req"), call("c-yes"), call("c-no")],
+        toolApprovals: {
+          "c-req": { approvalId: "ap-1" },
+          "c-yes": { approvalId: "ap-2", approved: true },
+          "c-no": { approvalId: "ap-3", approved: false }
+        }
+      }
+    ] satisfies AGUIMessage[]);
+
+    const parts = partsOf(ui[0]);
+    expect(parts[0]).toMatchObject({
+      state: "approval-requested",
+      approval: { id: "ap-1" }
+    });
+    expect(parts[1]).toMatchObject({
+      state: "approval-responded",
+      approval: { id: "ap-2", approved: true }
+    });
+    expect(parts[2]).toMatchObject({
+      state: "output-denied",
+      approval: { id: "ap-3", approved: false }
+    });
+  });
+
+  it("keeps the approval field when an approved call's output lands", () => {
+    const ui = toUIMessages([
+      {
+        id: "a1",
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "c-1",
+            type: "function",
+            function: { name: "riskyTool", arguments: "{}" }
+          }
+        ],
+        toolApprovals: { "c-1": { approvalId: "ap-1", approved: true } }
+      },
+      { id: "t1", role: "tool", toolCallId: "c-1", content: '{"ran":true}' }
+    ] satisfies AGUIMessage[]);
+
+    expect(partsOf(ui[0])[0]).toMatchObject({
+      state: "output-available",
+      output: { ran: true },
+      approval: { id: "ap-1", approved: true }
+    });
+  });
+
+  it("emits extraParts and metadata verbatim", () => {
+    const ui = toUIMessages([
+      {
+        id: "a1",
+        role: "assistant",
+        content: "with extras",
+        metadata: { model: "fixture-model" },
+        extraParts: [
+          { type: "data-weather", data: { temp: 21 } },
+          {
+            type: "file",
+            mediaType: "text/plain",
+            url: "data:text/plain;base64,aGk="
+          },
+          { type: "source-url", sourceId: "s1", url: "https://x", title: "Doc" }
+        ]
+      }
+    ] satisfies AGUIMessage[]);
+
+    expect(ui[0].metadata).toEqual({ model: "fixture-model" });
+    expect(partsOf(ui[0]).map((p) => p.type)).toEqual([
+      "data-weather",
+      "file",
+      "source-url",
+      "text"
+    ]);
   });
 
   it("drops activity messages, which have no UIMessage counterpart", () => {

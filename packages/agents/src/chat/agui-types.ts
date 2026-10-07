@@ -126,7 +126,29 @@ export type BaseMessage = {
   readonly id: string;
   readonly role: AGUIRole;
   readonly name?: string;
+  /**
+   * Open per-message metadata bag (CF extension). Carries the legacy
+   * `UIMessage.metadata` / `message-metadata` chunk payload across the
+   * AG-UI row shape so projection round-trips are lossless.
+   */
+  metadata?: unknown;
 };
+
+/**
+ * Legacy-shaped assistant part with no AG-UI slot (`file`, `source-url`,
+ * `source-document`, `data-*`), persisted verbatim on the assistant row so
+ * the AI SDK projection can reproduce it (CF extension).
+ */
+export type AssistantExtraPart = { type: string } & Record<string, unknown>;
+
+/**
+ * Durable tool-approval state keyed by `toolCallId` (CF extension). AG-UI
+ * carries approvals as CUSTOM events; this is the row-level record so
+ * approval state survives reload and projects back to the legacy
+ * `approval-requested` / `approval-responded` / `output-denied` part states.
+ * `approved` is absent while the request is undecided.
+ */
+export type ToolApprovalState = { approvalId: string; approved?: boolean };
 
 /**
  * End-user input. Mirrors AG-UI's `UserMessage`. `content` is either a
@@ -168,6 +190,10 @@ export type AssistantMessage = BaseMessage & {
   readonly role: "assistant";
   content?: string;
   toolCalls?: ToolCall[];
+  /** CF extension: see {@link AssistantExtraPart}. */
+  extraParts?: AssistantExtraPart[];
+  /** CF extension: see {@link ToolApprovalState}. */
+  toolApprovals?: Record<string, ToolApprovalState>;
 };
 
 /**
@@ -438,6 +464,9 @@ export type ToolCallResultEvent = BaseAGUIEvent & {
   readonly toolCallId: string;
   readonly content: string;
   readonly role?: "tool";
+  /** CF extension: error text when the execution failed (drives the legacy
+   * `output-error` projection). */
+  readonly error?: string;
 };
 
 // ============================================================================
@@ -645,6 +674,15 @@ export const CF_NAMESPACE_PREFIX = "cf.agents." as const;
  */
 export const CF_TOOL_APPROVAL_REQUEST =
   "cf.agents.tool_approval.request" as const;
+
+/** `CUSTOM.name` for a streamed file attachment (folds onto the assistant row). */
+export const CF_FILE = "cf.agents.file" as const;
+
+/** `CUSTOM.name` for a streamed source reference (folds onto the assistant row). */
+export const CF_SOURCE = "cf.agents.source" as const;
+
+/** `CUSTOM.name` for message metadata (folds onto the assistant row). */
+export const CF_MESSAGE_METADATA = "cf.agents.message_metadata" as const;
 
 /**
  * `CUSTOM.name` for an out-of-band tool-approval decision (granted or

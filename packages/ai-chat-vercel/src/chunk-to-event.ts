@@ -45,6 +45,9 @@ export class ChunkToEventProjector {
   // later `tool-output-available` can synthesize a `TOOL_CALL_RESULT`
   // without re-emitting `TOOL_CALL_END`.
   private endedToolCalls = new Set<string>();
+  // Tool calls that streamed at least one `tool-input-delta`; calls without
+  // any get their arguments synthesized from `tool-input-available.input`.
+  private argsEmitted = new Set<string>();
 
   constructor(options?: ChunkToEventProjectorOptions) {
     this.threadId = options?.threadId ?? nanoid();
@@ -123,6 +126,7 @@ export class ChunkToEventProjector {
       }
 
       case "tool-input-delta":
+        this.argsEmitted.add(chunk.toolCallId);
         return [
           {
             type: "TOOL_CALL_ARGS",
@@ -131,9 +135,32 @@ export class ChunkToEventProjector {
           }
         ];
 
-      case "tool-input-available":
+      case "tool-input-available": {
+        // Producers may emit `tool-input-available` with no prior
+        // `tool-input-start` (non-streamed calls) and/or no `tool-input-delta`
+        // stream. Synthesize the missing START/ARGS so the call — and its
+        // arguments — are not lost.
+        const events = this.emitRunStarted();
+        if (!this.toolNamesById.has(chunk.toolCallId)) {
+          this.toolNamesById.set(chunk.toolCallId, chunk.toolName);
+          events.push({
+            type: "TOOL_CALL_START",
+            toolCallId: chunk.toolCallId,
+            toolCallName: chunk.toolName
+          });
+        }
+        if (!this.argsEmitted.has(chunk.toolCallId)) {
+          this.argsEmitted.add(chunk.toolCallId);
+          events.push({
+            type: "TOOL_CALL_ARGS",
+            toolCallId: chunk.toolCallId,
+            delta: JSON.stringify(chunk.input ?? {})
+          });
+        }
         this.endedToolCalls.add(chunk.toolCallId);
-        return [{ type: "TOOL_CALL_END", toolCallId: chunk.toolCallId }];
+        events.push({ type: "TOOL_CALL_END", toolCallId: chunk.toolCallId });
+        return events;
+      }
 
       case "tool-input-error": {
         const events: AGUIEvent[] = [];
@@ -146,7 +173,8 @@ export class ChunkToEventProjector {
           messageId: `tool_${chunk.toolCallId}`,
           toolCallId: chunk.toolCallId,
           content: JSON.stringify({ error: chunk.errorText }),
-          role: "tool"
+          role: "tool",
+          error: chunk.errorText
         });
         return events;
       }
@@ -172,7 +200,8 @@ export class ChunkToEventProjector {
             messageId: `tool_${chunk.toolCallId}`,
             toolCallId: chunk.toolCallId,
             content: JSON.stringify({ error: chunk.errorText }),
-            role: "tool"
+            role: "tool",
+            error: chunk.errorText
           }
         ];
 
@@ -309,6 +338,12 @@ export class ChunkToEventProjector {
     // Vercel union for `DataUIMessageChunk` is open.
     const typeName = (chunk as { type: unknown }).type;
     if (typeof typeName !== "string" || !typeName.startsWith("data-")) {
+      // e.g. an already-AG-UI stream piped in by mistake — surface it rather
+      // than yielding a well-formed empty stream.
+      console.warn(
+        "[ai-chat-vercel] ChunkToEventProjector: dropping unrecognized chunk type",
+        typeName
+      );
       return [];
     }
     const dataValue = (chunk as { data?: unknown }).data;
