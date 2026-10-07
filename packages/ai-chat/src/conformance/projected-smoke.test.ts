@@ -348,4 +348,35 @@ describe("projected AIChatAgent (Phase 3 smoke)", () => {
 
     client.close();
   });
+
+  it("agent-tool child turn does not strip projection-invisible fields (encryptedValue)", async () => {
+    // The child lifecycle persists via the AG-UI-native `_saveAGUIMessages`;
+    // if it went through the projected `saveMessages` instead, the history
+    // would round-trip AG-UI→UIMessage→AG-UI and `toUIMessages` would drop
+    // `encryptedValue` from the pre-existing reasoning row, which the rebuilt
+    // rows then overwrite in place.
+    const runId = crypto.randomUUID();
+    const parent = await getAgentByName(
+      env.ProjectedToolParent,
+      crypto.randomUUID()
+    );
+
+    await parent.seedChildEncryptedRowForTest(runId);
+    const result = await parent.runChild({ prompt: "do the thing" }, runId);
+    expect(result).toMatchObject({
+      runId,
+      status: "completed",
+      output: "child says hi"
+    });
+
+    const rows = (await parent.childRawRows(runId)) as Array<
+      Record<string, unknown>
+    >;
+    const reasoning = rows.find((row) => row.id === "seed-reasoning");
+    expect(reasoning).toMatchObject({
+      role: "reasoning",
+      content: "seeded chain of thought",
+      encryptedValue: "SECRET-ENCRYPTED-BLOB"
+    });
+  });
 });

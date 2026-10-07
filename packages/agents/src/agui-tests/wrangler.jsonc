@@ -36,6 +36,12 @@
       {
         "name": "AutoContinueAguiAgent",
         "class_name": "AutoContinueAguiAgent"
+      },
+      { "name": "AguiAgentToolChild", "class_name": "AguiAgentToolChild" },
+      { "name": "AguiAgentToolParent", "class_name": "AguiAgentToolParent" },
+      {
+        "name": "DetachedNotifyAguiAgent",
+        "class_name": "DetachedNotifyAguiAgent"
       }
     ]
   },
@@ -55,7 +61,10 @@
         "RecoveryAguiAgent",
         "PreStreamAguiAgent",
         "PreStreamLatestAguiAgent",
-        "AutoContinueAguiAgent"
+        "AutoContinueAguiAgent",
+        "AguiAgentToolChild",
+        "AguiAgentToolParent",
+        "DetachedNotifyAguiAgent"
       ]
     }
   ]
