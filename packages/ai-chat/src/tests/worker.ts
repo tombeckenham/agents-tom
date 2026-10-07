@@ -1245,13 +1245,16 @@ export class TestChatAgent extends AIChatAgent<Env> {
   // The engine learns the assistant id from the stream's first message-start
   // event and backfills the metadata row, so the capture is refreshed when
   // the producer finishes, before the cutover discards the row.
-  protected override _finishStream(streamId: string): void {
+  protected override _finishStream(
+    ...args: Parameters<AIChatAgent["_finishStream"]>
+  ): void {
+    const [streamId] = args;
     for (const started of this._startedStreams.values()) {
       if (started.id === streamId) {
         started.message_id = this._resumableStream.getStreamMessageId(streamId);
       }
     }
-    super._finishStream(streamId);
+    super._finishStream(...args);
   }
 
   getStartedStreamMetadata(

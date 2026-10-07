@@ -3307,9 +3307,12 @@ export class AGUIChatAgent<
    * turn's messages ({@link _persistFinishedTurn}), which also settles the
    * stream when no persist follows.
    */
-  protected _finishStream(streamId: string) {
+  protected _finishStream(
+    streamId: string,
+    outcome?: Parameters<ResumableStream["finish"]>[1]
+  ) {
     const finishedRequestId = this._resumableStream.activeRequestId;
-    this._resumableStream.finish(streamId);
+    this._resumableStream.finish(streamId, outcome);
     this._pendingResumeConnections.clear();
     if (finishedRequestId === this._continuation.activeRequestId) {
       this._continuation.activeRequestId = null;
