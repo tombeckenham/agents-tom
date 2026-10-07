@@ -8,7 +8,10 @@
           "body": "",
           "done": true,
           "id": "id-1",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
         }
       ]
     }
