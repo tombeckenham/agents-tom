@@ -21,7 +21,7 @@
  *   likewise owned by `chat/__tests__/recovery-incident.test.ts` and, for the
  *   AG-UI chunk vocabulary, `chat/__tests__/agui-recovery-codec.test.ts`.
  *   The DO-level N9 sub-agent stream-progress crediting legs ARE ported here
- *   (they drive the real `_forwardAgentToolStream` → `_bumpChatRecoveryProgress`
+ *   (they drive the real `_forwardAgentToolStream` → `creditProgress`
  *   wiring on the agent).
  * - Assertions written against `UIMessage` parts (`input-streaming` /
  *   `output-available` tool-part states, `persist: false` part skipping,

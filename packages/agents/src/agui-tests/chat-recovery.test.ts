@@ -73,7 +73,9 @@ interface RecoveryStub {
     status: string;
     firstSeenAt: number;
     lastAttemptAt: number;
+    progress?: number;
   }): Promise<void>;
+  readProgressMarkerForTest(): Promise<number>;
   getChatRecoveryIncidentsForTest(): Promise<unknown[]>;
   saveSyntheticUserMessage(
     text: string
@@ -361,7 +363,10 @@ describe("chatRecovery (AG-UI)", () => {
         maxAttempts: 1,
         status: "scheduled",
         firstSeenAt: Date.now() - 60_000,
-        lastAttemptAt: Date.now() - 60_000
+        lastAttemptAt: Date.now() - 60_000,
+        // The marker is derived from the stream log, so the seeded stream's
+        // segments already count: this wake must see no NEW content.
+        progress: await stub.readProgressMarkerForTest()
       });
 
       await stub.triggerFiberRecovery();
@@ -457,7 +462,9 @@ describe("chatRecovery (AG-UI)", () => {
       maxAttempts: 1,
       status: "scheduled",
       firstSeenAt: Date.now() - 60_000,
-      lastAttemptAt: Date.now() - 60_000
+      lastAttemptAt: Date.now() - 60_000,
+      // Derived marker: the seeded stream's segments already count.
+      progress: await stub.readProgressMarkerForTest()
     });
 
     await stub.triggerFiberRecovery();

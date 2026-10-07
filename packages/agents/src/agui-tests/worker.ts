@@ -25,6 +25,10 @@ import {
   type OnChatMessageOptions
 } from "../agui-chat-agent";
 import { CHAT_MESSAGE_TYPES } from "../chat/protocol";
+import {
+  CHAT_RECOVERY_TASK_NAME,
+  chatRecoveryTaskRunOptions
+} from "../chat/recovery-task";
 import type {
   ChatRecoveryConfig,
   ChatRecoveryExhaustedContext,
@@ -917,11 +921,19 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   }
 
   getScheduleCountForCallback(callback: string): number {
-    const rows = this.sql<{ count: number }>`
+    // Recovery attempts are Task runs; a schedule row from an earlier
+    // version still counts.
+    const scheduled = this.sql<{ count: number }>`
       SELECT COUNT(*) as count FROM cf_agents_jobs
       WHERE capability = 'scheduler' AND fn = ${callback}
     `;
-    return rows[0]?.count ?? 0;
+    const tasks = this.sql<{ count: number }>`
+      SELECT COUNT(*) AS count FROM cf_agents_task_runs
+      WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+        AND state IN ('pending', 'running', 'waiting')
+        AND json_extract(metadata, '$.callback') = ${callback}
+    `;
+    return (scheduled[0]?.count ?? 0) + (tasks[0]?.count ?? 0);
   }
 
   getPartialText(streamId?: string): { text: string; parts: unknown[] } {
@@ -984,48 +996,82 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   async runChatRecoveryContinueDirectForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await this._chatRecoveryContinue(data);
+    await this._chatRecoveryContinueDetached(data);
   }
 
   async runChatRecoveryRetryDirectForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await this._chatRecoveryRetry(data);
+    await this._chatRecoveryRetryDetached(data);
   }
 
-  /** Simulate the not-yet-deleted one-shot row `alarm()` is executing. */
+  /** Simulate the not-yet-settled recovery Task currently dispatching. */
+  private async _preScheduleRecoveryForTest(
+    callback: "_chatRecoveryContinue" | "_chatRecoveryRetry",
+    data: Record<string, unknown>
+  ): Promise<void> {
+    const input = { callback, data, delaySeconds: 60 };
+    await this.tasks.__DO_NOT_USE_WILL_BREAK__enqueue(
+      CHAT_RECOVERY_TASK_NAME,
+      input,
+      chatRecoveryTaskRunOptions(input, "redefer")
+    );
+  }
+
   async preScheduleRecoveryContinueForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await this.schedule(60, "_chatRecoveryContinue", data, {
-      idempotent: false
-    });
+    await this._preScheduleRecoveryForTest("_chatRecoveryContinue", data);
   }
 
   async preScheduleRecoveryRetryForTest(
     data: Record<string, unknown>
   ): Promise<void> {
-    await this.schedule(60, "_chatRecoveryRetry", data, { idempotent: false });
+    await this._preScheduleRecoveryForTest("_chatRecoveryRetry", data);
+  }
+
+  /** Make the oldest queued recovery Task for `callback` due and run it. */
+  private async _runQueuedRecoveryTaskForTest(
+    callback: "_chatRecoveryContinue" | "_chatRecoveryRetry"
+  ): Promise<void> {
+    const rows = this.sql<{ run_id: string }>`
+      SELECT run_id FROM cf_agents_task_runs
+      WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+        AND state IN ('pending', 'running', 'waiting')
+        AND json_extract(metadata, '$.callback') = ${callback}
+      ORDER BY created_at ASC
+      LIMIT 1
+    `;
+    const runId = rows[0]?.run_id;
+    if (!runId) return;
+    const past = Date.now() - 1_000;
+    this.sql`
+      UPDATE cf_agents_task_runs
+      SET next_at = ${past},
+          input = json_set(input, '$.delaySeconds', 0)
+      WHERE run_id = ${runId}
+    `;
+    this.sql`
+      UPDATE cf_agents_task_steps SET next_at = ${past}
+      WHERE run_id = ${runId} AND kind = 'sleep'
+    `;
+    this.sql`
+      UPDATE cf_agents_jobs SET time = ${past}
+      WHERE id = ${`task:${runId}`}
+    `;
+    await this.alarm();
+    await this.waitUntilStable({
+      timeout: 10_000,
+      pendingInteraction: () => false
+    });
   }
 
   async runScheduledRecoveryContinueForTest(): Promise<void> {
-    const rows = this.sql<{ payload: string }>`
-      SELECT json_extract(payload, '$.payload') AS payload FROM cf_agents_jobs
-      WHERE capability = 'scheduler' AND fn = '_chatRecoveryContinue'
-      ORDER BY time ASC LIMIT 1
-    `;
-    if (!rows[0]) return;
-    await this._chatRecoveryContinue(JSON.parse(rows[0].payload));
+    await this._runQueuedRecoveryTaskForTest("_chatRecoveryContinue");
   }
 
   async runScheduledRecoveryRetryForTest(): Promise<void> {
-    const rows = this.sql<{ payload: string }>`
-      SELECT json_extract(payload, '$.payload') AS payload FROM cf_agents_jobs
-      WHERE capability = 'scheduler' AND fn = '_chatRecoveryRetry'
-      ORDER BY time ASC LIMIT 1
-    `;
-    if (!rows[0]) return;
-    await this._chatRecoveryRetry(JSON.parse(rows[0].payload));
+    await this._runQueuedRecoveryTaskForTest("_chatRecoveryRetry");
   }
 
   // ── Incident / progress / terminal storage probes ──────────────────
@@ -1086,6 +1132,11 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
     );
   }
 
+  /** The recovery progress marker as the engine would read it now. */
+  async readProgressMarkerForTest(): Promise<number> {
+    return this._resumableStream.progressMarker();
+  }
+
   async getChatRecoveryIncidentsForTest(): Promise<unknown[]> {
     const entries = await this.ctx.storage.list({
       prefix: "cf:chat-recovery:incident:"
@@ -1129,9 +1180,9 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
   }
 
   async bumpRecoveryProgressForTest(): Promise<void> {
-    await (
-      this as unknown as { _bumpChatRecoveryProgress(): Promise<void> }
-    )._bumpChatRecoveryProgress();
+    // One explicit credit — the same unit a flushed segment adds to the
+    // derived marker.
+    this._resumableStream.creditProgress();
   }
 
   /** Stream content, then re-persist the same orphan, reading the progress
@@ -1147,7 +1198,7 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
       _persistOrphanedStream(streamId: string): Promise<void>;
     };
     const read = async (): Promise<number> =>
-      (await this.ctx.storage.get<number>("cf:chat-recovery:progress")) ?? 0;
+      this._resumableStream.progressMarker();
 
     const start = await read();
     const streamId = self._resumableStream.start("req-progress-immunity");
@@ -1415,7 +1466,7 @@ export class RecoveryAguiAgent extends AGUIChatAgent<Env> {
     };
     self._agentToolStreamProgress._lastBumpAt = 0;
     const read = async (): Promise<number> =>
-      (await this.ctx.storage.get<number>("cf:chat-recovery:progress")) ?? 0;
+      this._resumableStream.progressMarker();
     const start = await read();
     const bodies = Array.from({ length: chunks }, (_, i) => ({
       body: `chunk-${i}`
@@ -1970,13 +2021,13 @@ export class AguiAgentToolChild extends AGUIChatAgent<Env> {
     if (path === "continue") {
       // A non-leaf `targetAssistantId` → benign "conversation_changed" skip
       // that still reaches the `finally`.
-      await this._chatRecoveryContinue({
+      await this._chatRecoveryContinueDetached({
         targetAssistantId: "no-such-leaf"
       });
     } else {
       // A non-user leaf (or empty transcript) → benign
       // "no_unanswered_user_message" skip that still reaches the `finally`.
-      await this._chatRecoveryRetry({});
+      await this._chatRecoveryRetryDetached({});
     }
     return { before, after: this._readChildRunStatusForTest(runId) };
   }
