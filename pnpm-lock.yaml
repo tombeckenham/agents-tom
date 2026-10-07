@@ -482,9 +482,9 @@ importers:
       '@ai-sdk/react':
         specifier: ^4.0.0
         version: 4.0.19(react@19.2.8)(zod@4.5.4)
-      '@cloudflare/ai-chat-vercel':
+      '@cloudflare/ai-chat':
         specifier: '*'
-        version: link:../../packages/ai-chat-vercel
+        version: link:../../packages/ai-chat
       agents:
         specifier: '*'
         version: link:../../packages/agents
@@ -4764,9 +4764,6 @@ importers:
       '@ai-sdk/react':
         specifier: ^3.0.0 || ^4.0.0
         version: 4.0.19(react@19.2.7)(zod@4.5.4)
-      '@cloudflare/ai-chat-vercel':
-        specifier: workspace:*
-        version: link:../ai-chat-vercel
       nanoid:
         specifier: ^5.1.16
         version: 5.1.16
@@ -4808,31 +4805,6 @@ importers:
       '@types/react':
         specifier: ^19.2.17
         version: 19.2.17
-      react:
-        specifier: ^19.2.7
-        version: 19.2.8
-      zod:
-        specifier: ^4.5.4
-        version: 4.5.4
-
-  packages/ai-chat-vercel:
-    dependencies:
-      '@ai-sdk/react':
-        specifier: ^3.0.0 || ^4.0.0
-        version: 4.0.19(react@19.2.8)(zod@4.5.4)
-      agents:
-        specifier: '>=0.17.1 <1.0.0'
-        version: link:../agents
-      nanoid:
-        specifier: ^5.1.16
-        version: 5.1.16
-    devDependencies:
-      '@types/react':
-        specifier: ^19.2.17
-        version: 19.2.17
-      ai:
-        specifier: ^7.0.0
-        version: 7.0.18(zod@4.5.4)
       react:
         specifier: ^19.2.7
         version: 19.2.8

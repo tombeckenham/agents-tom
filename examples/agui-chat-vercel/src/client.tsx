@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgent } from "agents/react";
-import { useAgentChat } from "@cloudflare/ai-chat-vercel/react";
+import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { getToolName, isToolUIPart } from "ai";
 
 /**
- * The only change from the legacy `@cloudflare/ai-chat/react` client is the
- * import above — the hook's surface is deliberately identical, so an app
- * migrating to AG-UI changes one line here and two on the server.
+ * Identical to the `examples/ai-chat` client: `useAgentChat` speaks AG-UI on
+ * the wire regardless of whether the server extends `AIChatAgent` or
+ * `AGUIChatAgent`, so an app migrating to AG-UI changes nothing here and two
+ * lines on the server.
  */
 export default function App() {
   const [input, setInput] = useState("");

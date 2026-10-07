@@ -8,7 +8,7 @@
  * {@link import("agents/agui-chat-agent").AGUIChatAgent} `onChatMessage`
  * override can return it directly.
  *
- * Mirrors the shape of `toAGUIResponse()` in `@cloudflare/ai-chat-vercel`,
+ * Mirrors the shape of `toAGUIResponse()` in `@cloudflare/ai-chat`,
  * minus the `UIMessageChunk → AGUIEvent` projection layer.
  */
 

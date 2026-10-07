@@ -1,7 +1,7 @@
 /**
  * AG-UI `Message[]` → TanStack `ModelMessage[]`.
  *
- * Symmetric with `toUIMessages()` in `@cloudflare/ai-chat-vercel`, and a
+ * Symmetric with `toUIMessages()` in `@cloudflare/ai-chat`, and a
  * good measure of how close the two formats are: TanStack's `ModelMessage`
  * already carries `role` / `content` / `toolCalls` / `toolCallId` with the
  * same meanings AG-UI gives them, and its multimodal `ContentPart` union is

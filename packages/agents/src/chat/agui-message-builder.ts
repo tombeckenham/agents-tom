@@ -697,7 +697,7 @@ function handleCustom(
 /**
  * Returns `true` if `event` would be a no-op replay against `state` — i.e.
  * an upstream is re-emitting events for a stream the reducer has already
- * advanced past. Mirrors `isReplayChunk` semantics for the AG-UI surface.
+ * advanced past.
  *
  * Conditions:
  * - `TEXT_MESSAGE_START` for a `messageId` that already has a closed

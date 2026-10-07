@@ -1,6 +1,6 @@
 import { exports } from "cloudflare:workers";
 import { expect } from "vitest";
-import { EventToChunkProjector } from "@cloudflare/ai-chat-vercel";
+import { EventToChunkProjector } from "../event-to-chunk";
 import { toUIMessages } from "agents/chat";
 import type { AGUIEvent, AGUIMessage } from "agents/chat/agui-types";
 import { MessageType, type OutgoingMessage } from "../types";

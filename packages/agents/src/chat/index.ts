@@ -2,7 +2,6 @@ export {
   applyChunkToParts,
   applyLateToolInput,
   isLateToolInputChunk,
-  isReplayChunk,
   lateToolInputForwardChunks,
   normalizeToolInput,
   type MessageParts,
@@ -47,8 +46,7 @@ export {
 export {
   transition as broadcastTransition,
   type BroadcastStreamState,
-  type BroadcastStreamEvent,
-  type TransitionResult as BroadcastTransitionResult
+  type BroadcastStreamEvent
 } from "./broadcast-state";
 
 export {
@@ -168,11 +166,7 @@ export {
 
 export { parseProtocolMessage, type ChatProtocolEvent } from "./parse-protocol";
 
-export {
-  reconcileMessages,
-  resolveToolMergeId,
-  reconcileOrphanPartial
-} from "./message-reconciler";
+export { reconcileMessages, resolveToolMergeId } from "./message-reconciler";
 
 /**
  * @internal Shared transcript-repair primitive — flips interrupted tool calls

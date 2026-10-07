@@ -48,7 +48,7 @@ import {
   type SaveMessagesOptions,
   type SaveMessagesResult
 } from "agents/chat";
-import { toAGUIResponse } from "@cloudflare/ai-chat-vercel";
+import { toAGUIResponse } from "./to-agui-response";
 
 export type ChatMessage = UIMessage;
 export type { OnChatMessageOptions };

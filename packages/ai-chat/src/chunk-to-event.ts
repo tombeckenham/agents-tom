@@ -483,7 +483,7 @@ export class ChunkToEventProjector {
       // e.g. an already-AG-UI stream piped in by mistake — surface it rather
       // than yielding a well-formed empty stream.
       console.warn(
-        "[ai-chat-vercel] ChunkToEventProjector: dropping unrecognized chunk type",
+        "[ai-chat] ChunkToEventProjector: dropping unrecognized chunk type",
         typeName
       );
       return [];

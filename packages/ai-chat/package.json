@@ -19,7 +19,6 @@
     "url": "https://github.com/cloudflare/agents/issues"
   },
   "dependencies": {
-    "@cloudflare/ai-chat-vercel": "workspace:*",
     "nanoid": "^5.1.16"
   },
   "devDependencies": {
