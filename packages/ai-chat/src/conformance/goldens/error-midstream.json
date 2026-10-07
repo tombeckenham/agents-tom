@@ -11,7 +11,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 0
         },
         {
           "body": {
@@ -20,7 +21,8 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 1
         },
         {
           "body": {
@@ -30,20 +32,28 @@
           },
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "seq": 2
         },
         {
           "error": true,
           "body": "scripted mid-stream failure",
           "done": false,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "messageIds": [
+            "u-1"
+          ]
         },
         {
           "body": "",
           "done": true,
           "id": "id-2",
-          "type": "cf_agent_use_chat_response"
+          "type": "cf_agent_use_chat_response",
+          "outcome": "error",
+          "messageIds": [
+            "u-1"
+          ]
         }
       ]
     }

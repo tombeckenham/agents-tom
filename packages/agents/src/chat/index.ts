@@ -1,5 +1,8 @@
 export {
   applyChunkToParts,
+  applyLateToolInput,
+  isLateToolInputChunk,
+  lateToolInputForwardChunks,
   normalizeToolInput,
   type MessageParts,
   type MessagePart,
@@ -22,6 +25,8 @@ export {
 } from "./stream-accumulator";
 
 export { TurnQueue, type TurnResult, type EnqueueOptions } from "./turn-queue";
+
+export { originMessageIds, withOriginMessageIds } from "./origin-message-ids";
 
 /**
  * @internal Shared text-segment separator for sibling streaming packages.
@@ -46,12 +51,32 @@ export {
 
 export {
   ResumableStream,
-  cleanupStreamBuffers,
-  STREAM_CLEANUP_DELAY_SECONDS,
+  createChatStreams,
   type SqlTaggedTemplate
 } from "./resumable-stream";
+export {
+  createChatTurnTaskDefinition,
+  type ChatTurnClosureEntry,
+  type ChatTurnTaskHooks
+} from "./turn-task";
+export {
+  CHAT_RECOVERY_TASK_NAME,
+  chatRecoveryTaskRunOptions,
+  createChatRecoveryTaskDefinition,
+  dispatchChatRecoveryToHandoff,
+  type ChatRecoveryHandoff,
+  type ChatRecoveryTaskHooks,
+  type ChatRecoveryTaskInput,
+  type ChatRecoveryTaskReason
+} from "./recovery-task";
 
 export { MAX_BOUND_PARAMS, buildInClauseStrings } from "./sql-batch";
+
+/**
+ * @internal Platform-failure classifier shared with the chat hosts'
+ * queue-dispatch deferral (#1730); sibling-package support, not a public API.
+ */
+export { isPlatformFailure, isDurableObjectResetError } from "../retries";
 
 export {
   createToolsFromClientSchemas,
@@ -66,12 +91,17 @@ export {
 } from "./protocol";
 
 export { MessageType } from "./wire-types";
-export type { OutgoingMessage, IncomingMessage } from "./wire-types";
+export type {
+  ChatTurnOutcome,
+  OutgoingMessage,
+  IncomingMessage
+} from "./wire-types";
 
 export {
   applyAgentToolEvent,
   createAgentToolEventState,
   interceptAgentToolBroadcast,
+  isPositionlessAgentToolChunk,
   AgentToolProgressEmitter,
   type AgentToolProgressEmitHooks,
   type AgentToolProgressEmitResult,
@@ -186,6 +216,7 @@ export {
  */
 export {
   aiSdkRecoveryCodec,
+  partialHasSettledToolResults,
   shouldCreditStreamProgress,
   type ChatRecoveryCodec,
   type ProgressCreditThrottle
@@ -237,9 +268,11 @@ export {
 } from "./recovery-incident";
 
 export {
-  chatRecoverySchedulePolicy,
   ChatRecoveryEngine,
   runChatRecoveryExhaustion,
+  chatRecoveryBackoffSeconds,
+  retryAfterSeconds,
+  CHAT_RECOVERY_CANCELLED_REASON,
   type ChatRecoveryScheduleReason,
   type ChatRecoveryScheduleCallback,
   type ChatRecoveryAdapter,
@@ -273,6 +306,16 @@ export type {
   SaveMessagesOptions,
   SaveMessagesResult
 } from "./lifecycle";
+export {
+  truncateOlderMessages,
+  truncateOlderToolResults,
+  type TruncateOptions,
+  type TruncateToolResultsOptions
+} from "./truncate-older-messages";
+
+// Shared with the AG-UI-based `useAgentChat` in `@cloudflare/ai-chat`, which
+// forwards the same throttle defaults to `useChat`.
+export { chatThrottleOptions } from "./chat-throttle";
 
 // AG-UI shape helpers used by the AI SDK projection layer
 // (`@cloudflare/ai-chat`): row migration/normalization, the UIMessage

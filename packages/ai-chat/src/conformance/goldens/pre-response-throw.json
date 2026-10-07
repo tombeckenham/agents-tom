@@ -10,6 +10,10 @@
     {
       "hook": "onError",
       "error": "Error: boom before response"
+    },
+    {
+      "hook": "onError",
+      "error": "Error: boom before response"
     }
   ],
   "persistedRows": [
