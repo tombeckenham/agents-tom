@@ -206,6 +206,135 @@ describe("useAgentChat CF_AGENT_MESSAGE_UPDATED (AG-UI tool row)", () => {
   });
 });
 
+describe("useAgentChat onTurnEnd (AG-UI frames)", () => {
+  // The shared suite's version of this test builds each turn from a bare
+  // `start` + `finish`, which carries no content on the AG-UI wire and so
+  // materializes no assistant message. This one streams real content.
+  it("lets onTurnEnd send the next message once the turn has settled", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { agent, target, sentMessages } =
+      createAgentWithTarget("on-turn-end-send");
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+    const turnEnds: unknown[] = [];
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[],
+        resume: false,
+        onTurnEnd: (event) => {
+          turnEnds.push(event);
+          if (turnEnds.length === 1) {
+            void chatInstance!.sendMessage({ text: "Follow up" });
+          }
+        }
+      });
+      chatInstance = chat;
+      return <div data-testid="status">{chat.status}</div>;
+    };
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+    const requests = () =>
+      sentMessages
+        .map((message) => JSON.parse(message) as { type: string; id: string })
+        .filter((message) => message.type === "cf_agent_use_chat_request");
+    const streamTurn = (id: string, messageId: string, userId: string) => {
+      const events = [
+        { type: "RUN_STARTED", threadId: "t", runId: id, messageId },
+        { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
+        { type: "TEXT_MESSAGE_CONTENT", messageId, delta: "Hi" },
+        { type: "TEXT_MESSAGE_END", messageId },
+        { type: "RUN_FINISHED", threadId: "t", runId: id }
+      ];
+      for (const [seq, event] of events.entries()) {
+        dispatch(target, {
+          type: "cf_agent_use_chat_response",
+          id,
+          body: JSON.stringify(event),
+          done: false,
+          seq
+        });
+      }
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id,
+        body: "",
+        done: true,
+        messageIds: [userId],
+        outcome: "completed"
+      });
+    };
+
+    await act(async () => {
+      void chatInstance!.sendMessage({ text: "First" });
+      await sleep(10);
+    });
+    const first = requests()[0];
+    await act(async () => {
+      streamTurn(first.id, "a1", "u1");
+      await sleep(30);
+    });
+
+    // The callback ran after the first turn settled, so its send went out as
+    // a second request instead of overlapping the first.
+    expect(requests()).toHaveLength(2);
+    await expect
+      .element(screen.getByTestId("status"))
+      .toHaveTextContent("submitted");
+
+    const second = requests()[1];
+    await act(async () => {
+      streamTurn(second.id, "a2", "u2");
+      await sleep(30);
+    });
+    await expect
+      .element(screen.getByTestId("status"))
+      .toHaveTextContent("ready");
+    expect(chatInstance!.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant"
+    ]);
+    expect(turnEnds).toEqual([
+      {
+        requestId: first.id,
+        messageIds: ["u1"],
+        outcome: "completed",
+        replay: false
+      },
+      {
+        requestId: second.id,
+        messageIds: ["u2"],
+        outcome: "completed",
+        replay: false
+      }
+    ]);
+    // An overlapping send trips the AI SDK's single `activeResponse` (#1837).
+    expect(
+      consoleErrorSpy.mock.calls.some((args) =>
+        args.some((arg) =>
+          String(arg instanceof Error ? arg.message : arg).includes(
+            "Cannot read properties of undefined"
+          )
+        )
+      )
+    ).toBe(false);
+    consoleErrorSpy.mockRestore();
+  });
+});
+
 describe("useAgentChat initial-message hydration (AG-UI /get-messages)", () => {
   it("projects AG-UI rows from the default /get-messages fetch into UIMessages", async () => {
     // Byte-for-byte what `AGUIChatAgent` serves on /get-messages: persisted
